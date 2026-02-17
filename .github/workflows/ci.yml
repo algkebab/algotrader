@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install service dependencies
+        run: |
+          for f in services/*/requirements.txt; do
+            if [ -f "$f" ]; then
+              pip install -r "$f" || true
+            fi
+          done
+
+      - name: Install ruff and pytest
+        run: |
+          pip install ruff pytest
+
+      - name: Run ruff check
+        run: ruff check .
+
+      - name: Run ruff format check
+        run: ruff format --check .
+
+      - name: Run pytest
+        run: pytest

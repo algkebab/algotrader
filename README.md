@@ -74,3 +74,43 @@ python main.py
 ```
 
 Use the shared logger via the parent path or install the project in editable mode so `shared` is on `PYTHONPATH`.
+
+## Development
+
+### Code quality (Ruff)
+
+Lint and format are configured in `pyproject.toml` (Ruff, Python 3.10+). Run locally to match CI:
+
+```bash
+# Lint: report issues
+ruff check .
+
+# Format: fix style
+ruff format .
+```
+
+Fix auto-fixable lint issues:
+
+```bash
+ruff check . --fix
+```
+
+### Pre-commit hooks
+
+Install [pre-commit](https://pre-commit.com/) and run Ruff + YAML checks before each commit:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+After that, `git commit` will run `check-yaml` and `ruff` (with `--fix`) automatically.
+
+### CI/CD
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request to `main`:
+
+- Ruff check and format check
+- Pytest (placeholder until tests are added)
+
+Keep the build green by running `ruff check .` and `ruff format .` (or pre-commit) before pushing.
