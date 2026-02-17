@@ -4,22 +4,28 @@ services:
     ports:
       - "6379:6379"
     restart: always
-    
+
   scout:
     build:
       context: .
       dockerfile: services/scout/Dockerfile
     depends_on:
       - redis
-    env_file: .env
-    restart: unless-stopped
+    environment:
+      - REDIS_HOST=redis
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET=${BINANCE_SECRET}
+    restart: always
 
   filter:
     build:
       context: .
       dockerfile: services/filter/Dockerfile
-    env_file: .env
-    restart: unless-stopped
+    restart: always
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
 
   brain:
     build:
