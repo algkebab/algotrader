@@ -1,7 +1,10 @@
 """Scout service: data collection from exchanges."""
-import ccxt.async_support as ccxt
 import asyncio
+import json
 import os
+
+import ccxt.async_support as ccxt
+import redis
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -15,6 +18,18 @@ class Scout:
             'secret': os.getenv('BINANCE_SECRET'),
             'enableRateLimit': True,
         })
+        redis_host = os.getenv('REDIS_HOST', 'localhost')
+        self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
+
+    async def save_to_redis(self, data):
+        """
+        Saves normalized market data to Redis as a JSON string.
+        """
+        try:
+            self.db.set('market_data', json.dumps(data))
+            print("💾 Scout: Data saved to Redis.")
+        except Exception as e:
+            print(f"❌ Redis Error: {e}")
 
     async def fetch_market_data(self):
         """
@@ -52,7 +67,8 @@ async def main():
     
     # Test output: sort by volume and show top 3
     if data:
-        top_volume = sorted(data.values(), key=lambda x: x['volume_24h'], reverse=True)[:3]
+        await scout.save_to_redis(data)
+        top_volume = sorted(data.values(), key=lambda x: x['volume_24h'], reverse=True)
         print(f"📊 Top 3 by Volume: {top_volume}")
     else:
         print("⚠️ No data received.")
