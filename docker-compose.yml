@@ -1,0 +1,42 @@
+services:
+  scout:
+    build:
+      context: .
+      dockerfile: services/scout/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+
+  filter:
+    build:
+      context: .
+      dockerfile: services/filter/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+
+  brain:
+    build:
+      context: .
+      dockerfile: services/brain/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+
+  risk-manager:
+    build:
+      context: .
+      dockerfile: services/risk-manager/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+
+  messenger:
+    build:
+      context: .
+      dockerfile: services/messenger/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+
+  executor:
+    build:
+      context: .
+      dockerfile: services/executor/Dockerfile
+    env_file: .env
+    restart: unless-stopped
