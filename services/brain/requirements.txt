@@ -1,1 +1,3 @@
-# Add dependencies as needed (e.g. openai)
+redis
+python-dotenv
+openai

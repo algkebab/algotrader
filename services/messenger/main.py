@@ -51,29 +51,23 @@ class Messenger:
         while True:
             try:
                 # Get filtered candidates from the Filter service
-                data = self.db.get('filtered_candidates')
+                data = self.db.get('ai_signals')
                 
                 if data:
-                    candidates = json.loads(data)
-                    current_time = time.time()
-                    
-                    for asset in candidates:
-                        symbol = asset['symbol']
-                        
-                        # Check if we already alerted about this symbol recently
-                        if symbol not in self.sent_alerts:
-                            message = (
-                                f"🚀 *New Trading Signal Found!*\n\n"
-                                f"💎 *Asset:* `{symbol}`\n"
-                                f"📈 *24h Change:* `{asset['change_24h']}%`\n"
-                                f"💰 *Price:* `${asset['last_price']}`\n"
-                                f"📊 *24h Volume:* `${asset['volume_24h']:,.0f}`\n\n"
-                                f"🔗 [View on Binance](https://www.binance.com/en/trade/{symbol.replace('/', '_')})"
-                            )
-                            
-                            await self.send_telegram_msg(message)
-                            self.sent_alerts[symbol] = current_time
-                            print(f"📩 Alert sent for {symbol}")
+                    signals = json.loads(data)
+                    for signal in signals:
+                        # Add AI analysis to the message
+                        message = (
+                            f"🚀 *New Trading Signal Found!*\n\n"
+                            f"💎 *Asset:* `{signal['symbol']}`\n"
+                            f"📈 *Change:* `{signal['change_24h']}%`\n"
+                            f"🤖 *AI Opinion:* {signal['ai_analysis']}\n\n" # New field!
+                            f"🔗 [Trade](https://www.binance.com/en/trade/{signal['symbol'].replace('/', '_')})"
+                        )
+                        await self.send_telegram_msg(message)
+                        # Clear the key so we don't send the same AI msg again
+                        self.db.delete('ai_signals')
+                        print(f"📩 Alert sent for {symbol}")
 
                 self.clean_old_alerts()
                 
