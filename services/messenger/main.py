@@ -1,20 +1,28 @@
-import redis
+import asyncio
 import json
 import os
-import asyncio
+import redis
+import threading
 import time
-from telegram import Bot
-from dotenv import load_dotenv
+from datetime import datetime
 
-# Load credentials from .env
+from dotenv import load_dotenv
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CallbackQueryHandler
+
 load_dotenv()
+
+
+def _ts():
+    return datetime.utcnow().strftime("%H:%M:%S")
 
 class Messenger:
     def __init__(self):
         # Redis setup: connects to 'redis' container in Docker or 'localhost' locally
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
-        
+        self.db.ping()
+        print(f"[{_ts()}] Messenger: Connected to Redis at {redis_host}:6379")
         # Telegram setup
         self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
@@ -23,18 +31,58 @@ class Messenger:
             raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in environment variables")
             
         self.bot = Bot(token=self.bot_token)
-        
+        print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id})")
         # Memory to avoid duplicate alerts for the same symbol in a short period
-        self.sent_alerts = {} 
-        self.alert_expiry = 3600 # Do not repeat the same asset for 1 hour
+        self.sent_alerts = {}
+        self.alert_expiry = 3600  # Do not repeat the same asset for 1 hour
 
-    async def send_telegram_msg(self, text):
-        """Sends a formatted Markdown message to Telegram"""
+    def run_bot_polling(self):
+        """Runs the Telegram bot (blocking). Call this from a separate thread."""
+        print(f"[{_ts()}] Messenger: Building Application and starting polling...")
+        application = Application.builder().token(self.bot_token).build()
+        application.add_handler(CallbackQueryHandler(self.handle_callback))
+        print(f"[{_ts()}] Messenger: CallbackQueryHandler registered, run_polling() starting")
+        application.run_polling()
+
+    async def handle_callback(self, update, context):
+        """Handles button clicks from Telegram."""
+        query = update.callback_query
+        print(f"[{_ts()}] Messenger: Callback received, data={query.data!r}")
+        await query.answer()
+
+        if query.data.startswith("buy:"):
+            symbol = query.data.split(":")[1]
+            command = {"symbol": symbol, "amount": 10}
+            self.db.rpush("trade_commands", json.dumps(command))
+            print(f"[{_ts()}] Messenger: Pushed trade_commands to Redis: {symbol}, 10 USDT")
+            try:
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n✅ **Command sent: Buy 10 USDT of {symbol}**",
+                    parse_mode="Markdown",
+                )
+                print(f"[{_ts()}] Messenger: Message edited for {symbol}")
+            except Exception as e:
+                print(f"[{_ts()}] Messenger: edit_message_text error: {e}")
+        else:
+            print(f"[{_ts()}] Messenger: Ignored callback (not buy:): {query.data!r}")
+
+    async def send_telegram_msg(self, text, symbol=None):
         try:
+            reply_markup = None
+            if symbol:
+                # Add a button that sends a callback when clicked
+                keyboard = [[InlineKeyboardButton(f"🚀 Buy 10 USDT of {symbol}", callback_data=f"buy:{symbol}")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                print(f"[{_ts()}] Messenger: Sending alert with Buy button for {symbol}")
             async with self.bot:
-                await self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode='Markdown')
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup,
+                )
         except Exception as e:
-            print(f"❌ Telegram API Error: {e}")
+            print(f"[{_ts()}] Messenger: Telegram API Error: {e}")
 
     def clean_old_alerts(self):
         """Removes expired alerts from local memory"""
@@ -46,8 +94,11 @@ class Messenger:
 
     async def run(self):
         """Main loop: monitors Redis and sends alerts with AI and Charts"""
-        print("📱 Messenger: Service is up and monitoring 'ai_signals'...")
-        
+        # Start bot polling in a background thread (handles button clicks)
+        bot_thread = threading.Thread(target=self.run_bot_polling, daemon=True)
+        bot_thread.start()
+        print(f"[{_ts()}] Messenger: Bot polling thread started, monitoring 'ai_signals' every 10s...")
+
         while True:
             try:
                 data = self.db.get('ai_signals')
@@ -79,7 +130,7 @@ class Messenger:
                             f"📊 [TradingView]({tv_url}) | 🔗 [Binance]({binance_url})"
                         )
                         
-                        await self.send_telegram_msg(message)
+                        await self.send_telegram_msg(message, symbol)
                         
                         # Remember in Redis for 1 hour (3600 seconds)
                         self.db.set(alert_key, "sent", ex=3600)

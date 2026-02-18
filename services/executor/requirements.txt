@@ -1,1 +1,3 @@
-# Add dependencies as needed (e.g. ccxt for execution)
+ccxt==4.2.42
+redis==5.0.1
+python-dotenv==1.0.1

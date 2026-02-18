@@ -66,5 +66,11 @@ services:
     build:
       context: .
       dockerfile: services/executor/Dockerfile
-    env_file: .env
-    restart: unless-stopped
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET=${BINANCE_SECRET}
+    depends_on:
+      - redis

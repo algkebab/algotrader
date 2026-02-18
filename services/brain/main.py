@@ -27,6 +27,7 @@ class Brain:
 
     async def analyze_with_ai(self, asset_data):
         """Sends asset data to GPT-4o for a quick trading opinion"""
+        return "This is mock AI analysis. Made to save mmoney until everything works"
         symbol = asset_data['symbol']
         change = asset_data['change_24h']
         vol = asset_data['volume_24h']
