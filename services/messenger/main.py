@@ -36,13 +36,8 @@ class Messenger:
         self.sent_alerts = {}
         self.alert_expiry = 3600  # Do not repeat the same asset for 1 hour
 
-    def run_bot_polling(self):
-        """Runs the Telegram bot (blocking). Call this from a separate thread."""
-        print(f"[{_ts()}] Messenger: Building Application and starting polling...")
-        application = Application.builder().token(self.bot_token).build()
-        application.add_handler(CallbackQueryHandler(self.handle_callback))
-        print(f"[{_ts()}] Messenger: CallbackQueryHandler registered, run_polling() starting")
-        application.run_polling()
+        self.application = Application.builder().token(self.bot_token).build()
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
 
     async def handle_callback(self, update, context):
         """Handles button clicks from Telegram."""
@@ -95,8 +90,9 @@ class Messenger:
     async def run(self):
         """Main loop: monitors Redis and sends alerts with AI and Charts"""
         # Start bot polling in a background thread (handles button clicks)
-        bot_thread = threading.Thread(target=self.run_bot_polling, daemon=True)
-        bot_thread.start()
+        await self.application.initialize()
+        await self.application.start()
+        await self.application.updater.start_polling()
         print(f"[{_ts()}] Messenger: Bot polling thread started, monitoring 'ai_signals' every 10s...")
 
         while True:
