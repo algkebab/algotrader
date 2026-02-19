@@ -31,6 +31,9 @@ class Scout:
         })
         print(f"[{_ts()}] Scout: Binance client initialized (rate limit enabled)")
 
+        # Symbols to monitor (can be expanded)
+        self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'AVAX/USDT']
+
     async def save_to_redis(self, data):
         """
         Saves normalized market data to Redis as a JSON string.
@@ -43,34 +46,45 @@ class Scout:
         except Exception as e:
             print(f"[{_ts()}] Scout: Redis error: {e}")
 
-    async def run(self):
-        print(f"[{_ts()}] Scout: Starting continuous data collection (interval: 60s)...")
+    async def fetch_ohlcv_data(self, symbol, timeframe='1h', limit=24):
+        """Fetches historical candlestick data from the exchange"""
         try:
-            loop_count = 0
-            while True:
-                loop_count += 1
-                print(f"[{_ts()}] Scout: Fetching tickers from Binance (cycle #{loop_count})...")
-                tickers = await self.exchange.fetch_tickers()
-                usdt_pairs = {
-                    symbol: {
-                        'symbol': symbol,
-                        'last_price': data['last'],
-                        'change_24h': data['percentage'],
-                        'volume_24h': data['quoteVolume'],
-                    }
-                    for symbol, data in tickers.items()
-                    if symbol.endswith('/USDT')
-                }
-                print(f"[{_ts()}] Scout: Received {len(tickers)} tickers, {len(usdt_pairs)} USDT pairs")
-                await self.save_to_redis(usdt_pairs)
-                print(f"[{_ts()}] Scout: Sleeping 60s until next fetch...")
-                await asyncio.sleep(60)
+            # Fetch OHLCV: timestamp, open, high, low, close, volume
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            return ohlcv
         except Exception as e:
-            print(f"[{_ts()}] Scout: Loop error: {e}")
-        finally:
-            await self.exchange.close()
-            print(f"[{_ts()}] Scout: Exchange client closed")
+            print(f"Error fetching candles for {symbol}: {e}")
+            return []
 
+    async def run(self):
+        print("🔭 Scout: Starting advanced market monitoring...")
+        
+        while True:
+            market_summary = {}
+            
+            for symbol in self.symbols:
+                try:
+                    # 1. Get current ticker
+                    ticker = await self.exchange.fetch_ticker(symbol)
+                    
+                    # 2. Get historical candles (last 24 hours)
+                    candles = await self.fetch_ohlcv_data(symbol)
+                    
+                    market_summary[symbol] = {
+                        'last_price': ticker['last'],
+                        'change_24h': ticker['percentage'],
+                        'volume_24h': ticker['quoteVolume'],
+                        'candles': candles  # Nested candle data for AI/Filter analysis
+                    }
+                    print(f"✅ Data updated: {symbol}")
+                    
+                except Exception as e:
+                    print(f"❌ Error updating {symbol}: {e}")
+            
+            # Save the enriched data to Redis
+            self.db.set('market_data', json.dumps(market_summary))
+            await asyncio.sleep(60)
+            
 if __name__ == "__main__":
     scout = Scout()
     asyncio.run(scout.run())

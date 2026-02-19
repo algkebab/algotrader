@@ -2,11 +2,12 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
 
 import redis
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import OpenAI
 
 load_dotenv()
 
@@ -17,75 +18,90 @@ def _ts():
 
 class Brain:
     def __init__(self):
+        # Redis setup
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
-        self.db.ping()
-        print(f"[{_ts()}] Brain: Connected to Redis at {redis_host}:6379")
-        self.client = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        print(f"[{_ts()}] Brain: OpenAI client initialized (model: gpt-4o)")
-        self.analyzed_symbols = set()
+        
+        # AI setup
+        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-    async def analyze_with_ai(self, asset_data):
-        """Sends asset data to GPT-4o for a quick trading opinion"""
-        return "This is mock AI analysis. Made to save mmoney until everything works"
-        symbol = asset_data['symbol']
-        change = asset_data['change_24h']
-        vol = asset_data['volume_24h']
-        price = asset_data['last_price']
+    def get_ai_verdict(self, symbol, price, rsi, rvol, candles):
+        """
+        Sends technical data to GPT for a high-level trading verdict
+        """
+        # Prepare a concise summary of the last 5 candles for the AI
+        candle_summary = [f"Close: {c[4]}, Vol: {c[5]}" for c in candles[-5:]]
+        
+        prompt = f"""
+        Analyze this crypto trade setup for {symbol}:
+        - Current Price: {price}
+        - RSI (14): {rsi}
+        - Relative Volume (RVOL): {rvol}
+        - Recent Price Action (Last 5h): {', '.join(candle_summary)}
 
-        prompt = (
-            f"As a crypto analyst, look at this: {symbol} is up {change}% in 24h. "
-            f"Current price: ${price}. 24h Volume: ${vol:,.0f}. "
-            f"Give me a 1-sentence summary: Is this a pump-and-dump or a solid move? "
-            f"Keep it professional and concise."
-        )
+        Provide a verdict in JSON format:
+        {{
+            "verdict": "BUY" or "WAIT",
+            "reason": "Short technical explanation",
+            "confidence": "0-100%"
+        }}
+        """
 
         try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=60,
+            response = self.client.chat.completions.create(
+                model="gpt-4o", # Using the latest model for better reasoning
+                messages=[
+                    {"role": "system", "content": "You are an expert crypto day-trader. Be conservative and look for high-probability setups."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={ "type": "json_object" } # Ensures we get clean JSON
             )
-            content = response.choices[0].message.content
-            print(f"[{_ts()}] Brain: GPT response for {symbol} ({len(content)} chars)")
-            return content
+            return json.loads(response.choices[0].message.content)
         except Exception as e:
-            print(f"[{_ts()}] Brain: OpenAI error for {symbol}: {e}")
-            return f"AI Analysis unavailable: {str(e)}"
+            print(f"AI Error: {e}")
+            return {"verdict": "WAIT", "reason": "AI Analysis failed", "confidence": "0%"}
 
-    async def run(self):
-        print(f"[{_ts()}] Brain: AI analyst online, polling filtered_candidates every 5s...")
-        cycle = 0
+    def run(self):
+        print("🧠 Brain: AI Technical Analyst is online...")
+        
         while True:
-            cycle += 1
-            data = self.db.get('filtered_candidates')
-            if not data:
-                if cycle == 1 or cycle % 12 == 0:
-                    print(f"[{_ts()}] Brain: No filtered_candidates in Redis (cycle #{cycle})")
-                await asyncio.sleep(5)
+            # Get candidates from the Filter service
+            raw_data = self.db.get('filtered_candidates')
+            if not raw_data:
+                time.sleep(5)
                 continue
 
-            candidates = json.loads(data)
-            new_count = sum(1 for a in candidates if a['symbol'] not in self.analyzed_symbols)
-            if new_count == 0:
-                if cycle == 1 or cycle % 12 == 0:
-                    print(f"[{_ts()}] Brain: {len(candidates)} candidates, all already analyzed (cycle #{cycle})")
-                await asyncio.sleep(5)
-                continue
-
-            print(f"[{_ts()}] Brain: {len(candidates)} candidates, {new_count} new to analyze (cycle #{cycle})")
-            for asset in candidates:
-                symbol = asset['symbol']
-                if symbol in self.analyzed_symbols:
+            candidates = json.loads(raw_data)
+            
+            for item in candidates:
+                symbol = item['symbol']
+                
+                # Prevent analyzing the same coin too often
+                if self.db.exists(f"analyzed:{symbol}"):
                     continue
-                print(f"[{_ts()}] Brain: Analyzing {symbol} (change={asset.get('change_24h')}%, vol=${asset.get('volume_24h', 0):,.0f})...")
-                ai_opinion = await self.analyze_with_ai(asset)
-                asset['ai_analysis'] = ai_opinion
-                self.db.set('ai_signals', json.dumps([asset]))
-                self.analyzed_symbols.add(symbol)
-                print(f"[{_ts()}] Brain: Wrote ai_signals for {symbol} to Redis")
 
-            await asyncio.sleep(5)
+                print(f"🔍 Analyzing {symbol} with AI...")
+                
+                analysis = self.get_ai_verdict(
+                    symbol, 
+                    item['last_price'], 
+                    item['rsi'], 
+                    item['rvol'], 
+                    item.get('candles', [])
+                )
+
+                # Merge AI verdict with market data
+                final_signal = {**item, **analysis}
+                
+                # Push to messenger queue
+                self.db.rpush('signals', json.dumps(final_signal))
+                
+                # Mark as analyzed for 30 minutes
+                self.db.set(f"analyzed:{symbol}", "1", ex=1800)
+
+            # Clear candidates after processing
+            self.db.delete('filtered_candidates')
+            time.sleep(5)
 
 if __name__ == "__main__":
     brain = Brain()

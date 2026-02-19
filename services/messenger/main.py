@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import redis
-import threading
 import time
 from datetime import datetime
 
@@ -12,8 +11,8 @@ from telegram.ext import Application, CallbackQueryHandler
 
 load_dotenv()
 
-
 def _ts():
+    """Returns current UTC timestamp for logging."""
     return datetime.utcnow().strftime("%H:%M:%S")
 
 class Messenger:
@@ -23,6 +22,7 @@ class Messenger:
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
         self.db.ping()
         print(f"[{_ts()}] Messenger: Connected to Redis at {redis_host}:6379")
+        
         # Telegram setup
         self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
@@ -30,68 +30,54 @@ class Messenger:
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in environment variables")
             
+        # Bot instance for manual sending
         self.bot = Bot(token=self.bot_token)
         print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id})")
-        # Memory to avoid duplicate alerts for the same symbol in a short period
-        self.sent_alerts = {}
-        self.alert_expiry = 3600  # Do not repeat the same asset for 1 hour
 
+        # Initialize Telegram Application for Callback Handling
         self.application = Application.builder().token(self.bot_token).build()
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
 
     async def handle_callback(self, update, context):
-        """Handles button clicks from Telegram."""
+        """Handles button clicks (Buy commands) from Telegram UI."""
         query = update.callback_query
         print(f"[{_ts()}] Messenger: Callback received, data={query.data!r}")
         await query.answer()
 
         if query.data.startswith("buy:"):
             symbol = query.data.split(":")[1]
+            # Payload for the Executor service
             command = {"symbol": symbol, "amount": 10}
             self.db.rpush("trade_commands", json.dumps(command))
-            print(f"[{_ts()}] Messenger: Pushed trade_commands to Redis: {symbol}, 10 USDT")
+            
+            print(f"[{_ts()}] Messenger: Pushed trade_command to Redis: {symbol}")
             try:
                 await query.edit_message_text(
-                    text=f"{query.message.text}\n\n✅ **Command sent: Buy 10 USDT of {symbol}**",
+                    text=f"{query.message.text}\n\n⏳ **Command sent to Executor...**",
                     parse_mode="Markdown",
                 )
-                print(f"[{_ts()}] Messenger: Message edited for {symbol}")
             except Exception as e:
                 print(f"[{_ts()}] Messenger: edit_message_text error: {e}")
-        else:
-            print(f"[{_ts()}] Messenger: Ignored callback (not buy:): {query.data!r}")
 
-    async def send_telegram_msg(self, text, symbol=None):
+    async def send_telegram_msg(self, text, symbol=None, keyboard=None):
+        """Helper to send Markdown messages with optional keyboards."""
         try:
-            reply_markup = None
-            if symbol:
-                # Add a button that sends a callback when clicked
-                keyboard = [[InlineKeyboardButton(f"🚀 Buy 10 USDT of {symbol}", callback_data=f"buy:{symbol}")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                print(f"[{_ts()}] Messenger: Sending alert with Buy button for {symbol}")
             async with self.bot:
                 await self.bot.send_message(
                     chat_id=self.chat_id,
                     text=text,
                     parse_mode="Markdown",
-                    reply_markup=reply_markup,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True
                 )
         except Exception as e:
             print(f"[{_ts()}] Messenger: Telegram API Error: {e}")
 
-    def clean_old_alerts(self):
-        """Removes expired alerts from local memory"""
-        current_time = time.time()
-        self.sent_alerts = {
-            symbol: timestamp for symbol, timestamp in self.sent_alerts.items() 
-            if current_time - timestamp < self.alert_expiry
-        }
-
     async def listen_for_notifications(self):
-        """Listens for execution results and notifies the user"""
-        print("📱 Messenger: Notification listener started...")
+        """Background task: Listens for trade execution results from Executor."""
+        print(f"[{_ts()}] Messenger: Notification listener started (waiting for Executor updates)")
         while True:
-            # Витягуємо підтвердження торгівлі
+            # BLPOP blocks until a notification appears in the queue
             notification = self.db.blpop('notifications', timeout=5)
             if notification:
                 _, payload = notification
@@ -104,67 +90,68 @@ class Messenger:
                         f"💰 Entry: `{d['entry']}`\n"
                         f"🎯 Take Profit: `{d['tp']}`\n"
                         f"🛑 Stop Loss: `{d['sl']}`\n"
-                        f"⚖️ Risk/Reward: `1:2.5`"
+                        f"📊 Status: `Active` (Orders placed on exchange)"
                     )
                     await self.send_telegram_msg(msg)
             
             await asyncio.sleep(1)
 
     async def run(self):
-        """Main loop: monitors Redis and sends alerts with AI and Charts"""
-        # Start bot polling in a background thread (handles button clicks)
+        """Main loop: Monitors signals from Brain and handles UI."""
+        # Start the Telegram Application for callback listening
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling()
-        print(f"[{_ts()}] Messenger: Bot polling thread started, monitoring 'ai_signals' every 10s...")
-
+        
+        # Start background listener for Executor notifications
         asyncio.create_task(self.listen_for_notifications())
+        
+        print(f"[{_ts()}] Messenger: Monitoring 'signals' from Brain every 5s...")
 
         while True:
             try:
-                data = self.db.get('ai_signals')
+                # Get signals produced by Brain service
+                signal_data = self.db.blpop('signals', timeout=10)
                 
-                if data:
-                    signals = json.loads(data)
-                    for signal in signals:
-                        symbol = signal['symbol']
-                        
-                        # Check in Redis: have we already sent this?
-                        alert_key = f"sent_alert:{symbol}"
-                        if self.db.exists(alert_key):
-                            continue  # Skip if we already sent this symbol recently
+                if signal_data:
+                    _, payload = signal_data
+                    data = json.loads(payload)
+                    
+                    symbol = data['symbol']
+                    
+                    # Formatting external links
+                    clean_symbol = symbol.replace('/', '')
+                    tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{clean_symbol}"
+                    binance_url = f"https://www.binance.com/en/trade/{symbol.replace('/', '_')}"
 
-                        # Build chart/trade links
-                        clean_symbol = symbol.replace('/', '')
-                        tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{clean_symbol}"
-                        binance_url = f"https://www.binance.com/en/trade/{symbol.replace('/', '_')}"
-
-                        rvol = signal.get('rvol', 'N/A')
-                        ai_opinion = signal.get('ai_analysis', 'No AI analysis provided.')
-
-                        message = (
-                            f"🚀 *VOLUMETRIC SPIKE: {symbol}*\n\n"
-                            f"📈 *24h Change:* `{signal.get('change_24h')}%`\n"
-                            f"🔥 *RVOL:* `{rvol}x` (Relative Volume)\n"
-                            f"💰 *Price:* `${signal.get('last_price', '0')}`\n\n"
-                            f"🤖 *AI Opinion:* \n_{ai_opinion}_\n\n"
-                            f"📊 [TradingView]({tv_url}) | 🔗 [Binance]({binance_url})"
-                        )
-                        
-                        await self.send_telegram_msg(message, symbol)
-                        
-                        # Remember in Redis for 1 hour (3600 seconds)
-                        self.db.set(alert_key, "sent", ex=3600)
-                        
-                        print(f"📩 Smart alert sent for {symbol}")
-
-                    # Clear the signal so other instances (if any) don't send duplicates
-                    self.db.delete('ai_signals')
+                    # AI Verdict handling
+                    verdict = data.get('verdict', 'WAIT')
+                    emoji = "🚀" if verdict == "BUY" else "⚠️"
+                    
+                    message = (
+                        f"{emoji} **SIGNAL: {symbol}**\n\n"
+                        f"🤖 **AI Verdict:** `{verdict}` ({data.get('confidence', 'N/A')})\n"
+                        f"📝 **Reason:** _{data.get('reason', 'N/A')}_\n\n"
+                        f"📊 **Technical Stats:**\n"
+                        f"• Price: `${data.get('last_price')}`\n"
+                        f"• RSI: `{data.get('rsi')}`\n"
+                        f"• RVOL: `{data.get('rvol')}x`\n\n"
+                        f"🔗 [TradingView]({tv_url}) | [Binance]({binance_url})"
+                    )
+                    
+                    # Prepare keyboard only if AI gives a BUY verdict
+                    keyboard = None
+                    if verdict == "BUY":
+                        kb = [[InlineKeyboardButton(f"🚀 Buy 10 USDT", callback_data=f"buy:{symbol}")]]
+                        keyboard = InlineKeyboardMarkup(kb)
+                    
+                    await self.send_telegram_msg(message, symbol, keyboard)
+                    print(f"[{_ts()}] Messenger: Signal alert sent for {symbol} (Verdict: {verdict})")
 
             except Exception as e:
-                print(f"❌ Messenger Loop Error: {e}")
+                print(f"[{_ts()}] Messenger Loop Error: {e}")
             
-            await asyncio.sleep(10)
+            await asyncio.sleep(1)
 
 if __name__ == "__main__":
     messenger = Messenger()
