@@ -3,78 +3,113 @@ import json
 import os
 import ccxt
 import time
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
+def _ts():
+    """Returns current timestamp for logging."""
+    return datetime.utcnow().strftime("%H:%M:%S")
+
 class Executor:
     def __init__(self):
+        # Redis setup
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
         
+        # Binance API setup
         self.exchange = ccxt.binance({
             'apiKey': os.getenv('BINANCE_API_KEY'),
             'secret': os.getenv('BINANCE_SECRET'),
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
+        
+        # Default strategy settings
+        self.tp_percent = 1.05  # +5%
+        self.sl_percent = 0.98  # -2%
+
+    def get_precision_amount(self, symbol, amount):
+        """Adjusts the coin amount to the exchange's required precision."""
+        market = self.exchange.market(symbol)
+        return self.exchange.amount_to_precision(symbol, amount)
+
+    def get_precision_price(self, symbol, price):
+        """Adjusts the price to the exchange's required precision."""
+        return self.exchange.price_to_precision(symbol, price)
 
     def place_smart_order(self, symbol, amount_usdt=10):
-        """Places a market buy and then sets TP/SL orders"""
+        """
+        Executes a market buy and prepares SL/TP data.
+        Note: Real orders are commented out for safety during testing.
+        """
         try:
-            print(f"🛒 Executing SMART order for {symbol}...")
+            print(f"[{_ts()}] 🛒 Executor: Processing SMART order for {symbol}")
             
-            # 1. Отримуємо поточну ціну (щоб знати, де ставити SL/TP)
+            # 1. Load markets to get precision rules
+            self.exchange.load_markets()
+            
+            # 2. Get current market price
             ticker = self.exchange.fetch_ticker(symbol)
             entry_price = ticker['last']
             
-            # 2. Розраховуємо цілі
-            tp_price = entry_price * 1.05  # +5%
-            sl_price = entry_price * 0.98  # -2%
+            # 3. Calculate target prices
+            tp_price = self.get_precision_price(symbol, entry_price * self.tp_percent)
+            sl_price = self.get_precision_price(symbol, entry_price * self.sl_percent)
+            
+            # 4. Calculate quantity of coins to buy
+            raw_qty = amount_usdt / entry_price
+            qty = self.get_precision_amount(symbol, raw_qty)
 
-            # --- РЕАЛЬНА ТОРГІВЛЯ (закоментовано для тесту) ---
-            # buy_order = self.exchange.create_market_buy_order(symbol, amount_usdt)
-            # print(f"✅ Market Buy executed at {entry_price}")
+            print(f"[{_ts()}] 📊 Planned: Buy {qty} {symbol} @ {entry_price}")
+            print(f"[{_ts()}] 🎯 Targets: TP: {tp_price} | SL: {sl_price}")
+
+            # --- SIMULATION MODE ---
+            # In a real scenario, you would uncomment these lines:
+            # buy_order = self.exchange.create_market_buy_order(symbol, qty)
+            # print(f"[{_ts()}] ✅ Real Market Buy executed")
             
-            # В реальності тут треба розрахувати кількість монет (amount_usdt / entry_price)
-            # sell_qty = buy_order['amount']
-            
-            # 3. Виставляємо лімітний ордер на продаж (Take Profit)
-            # self.exchange.create_limit_sell_order(symbol, sell_qty, tp_price)
-            
-            # 4. Виставляємо стоп-лосс (це складніше, зазвичай через stop_loss_limit)
-            # self.exchange.create_order(symbol, 'stop_loss_limit', 'sell', sell_qty, sl_price, {'stopPrice': sl_price})
-            
+            # 5. Prepare result notification
             result = {
                 "status": "success",
+                "symbol": symbol,
                 "entry": entry_price,
-                "tp": round(tp_price, 4),
-                "sl": round(sl_price, 4),
-                "msg": f"Bought {symbol} at {entry_price}. TP: {tp_price}, SL: {sl_price}"
+                "qty": qty,
+                "tp": tp_price,
+                "sl": sl_price
             }
+            
+            # Notify Messenger through Redis queue
+            self.db.rpush('notifications', json.dumps({
+                "type": "trade_confirmed",
+                "data": result
+            }))
+            
             return result
 
         except Exception as e:
-            print(f"❌ Smart Order Error: {e}")
-            return {"status": "error", "msg": str(e)}
+            print(f"[{_ts()}] ❌ Executor Error: {e}")
+            return {"status": "error", "message": str(e)}
 
     def run(self):
-        print("⚡ Executor: High-speed trade monitoring active...")
+        print(f"[{_ts()}] ⚡ Executor: Waiting for trade commands from Redis...")
+        
         while True:
-            command = self.db.blpop('trade_commands', timeout=10)
-            if command:
-                _, payload = command
-                data = json.loads(payload)
-                
-                result = self.place_smart_order(data['symbol'], data['amount'])
-                
-                # Повертаємо результат у Messenger
-                self.db.set(f"trade_result:{data['symbol']}", json.dumps(result), ex=60)
-                # Також кинемо повідомлення в чергу для Telegram
-                self.db.rpush('notifications', json.dumps({
-                    "type": "trade_confirmed",
-                    "data": result
-                }))
+            # Listen for 'trade_commands' queue
+            command_data = self.db.blpop('trade_commands', timeout=10)
+            
+            if command_data:
+                _, payload = command_data
+                try:
+                    data = json.loads(payload)
+                    symbol = data.get('symbol')
+                    amount = data.get('amount', 10)
+                    
+                    self.place_smart_order(symbol, amount)
+                    
+                except Exception as e:
+                    print(f"[{_ts()}] ❌ Error parsing command: {e}")
 
 if __name__ == "__main__":
     executor = Executor()

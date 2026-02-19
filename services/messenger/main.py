@@ -34,15 +34,25 @@ class Messenger:
         self.bot = Bot(token=self.bot_token)
         print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id})")
 
-        # Initialize Telegram Application for Callback Handling
-        self.application = Application.builder().token(self.bot_token).build()
+        # Initialize Telegram Application with longer timeouts (avoids TimedOut from slow networks)
+        self.application = (
+            Application.builder()
+            .token(self.bot_token)
+            .connect_timeout(30)
+            .read_timeout(30)
+            .write_timeout(30)
+            .build()
+        )
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
 
     async def handle_callback(self, update, context):
         """Handles button clicks (Buy commands) from Telegram UI."""
         query = update.callback_query
         print(f"[{_ts()}] Messenger: Callback received, data={query.data!r}")
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception as e:
+            print(f"[{_ts()}] Messenger: query.answer() failed (continuing): {e}")
 
         if query.data.startswith("buy:"):
             symbol = query.data.split(":")[1]
@@ -110,8 +120,8 @@ class Messenger:
 
         while True:
             try:
-                # Get signals produced by Brain service
-                signal_data = self.db.blpop('signals', timeout=10)
+                # Run blocking blpop in thread so event loop can process Telegram callbacks
+                signal_data = await asyncio.to_thread(self.db.blpop, "signals", 10)
                 
                 if signal_data:
                     _, payload = signal_data
