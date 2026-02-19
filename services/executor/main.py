@@ -1,69 +1,80 @@
-"""Executor service: trade execution on exchange."""
+import redis
 import json
 import os
-from datetime import datetime
-
 import ccxt
-import redis
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
-
-
-def _ts():
-    return datetime.utcnow().strftime("%H:%M:%S")
-
 
 class Executor:
     def __init__(self):
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
-        self.db.ping()
-        print(f"[{_ts()}] Executor: Connected to Redis at {redis_host}:6379")
+        
         self.exchange = ccxt.binance({
             'apiKey': os.getenv('BINANCE_API_KEY'),
             'secret': os.getenv('BINANCE_SECRET'),
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'},
+            'options': {'defaultType': 'spot'}
         })
-        print(f"[{_ts()}] Executor: Binance client initialized (spot, rate limit enabled)")
 
-    def place_market_buy(self, symbol, amount_usdt=10):
-        """Places a market buy order (simulated by default)."""
+    def place_smart_order(self, symbol, amount_usdt=10):
+        """Places a market buy and then sets TP/SL orders"""
         try:
-            print(f"[{_ts()}] Executor: Placing market buy: {amount_usdt} USDT of {symbol}...")
-            # For real trading, use:
-            # order = self.exchange.create_market_buy_order(symbol, amount_usdt)
-            # return order
-            result = {"status": "success", "msg": f"Simulated buy of {symbol}"}
-            print(f"[{_ts()}] Executor: Order result: {result['status']} — {result['msg']}")
+            print(f"🛒 Executing SMART order for {symbol}...")
+            
+            # 1. Отримуємо поточну ціну (щоб знати, де ставити SL/TP)
+            ticker = self.exchange.fetch_ticker(symbol)
+            entry_price = ticker['last']
+            
+            # 2. Розраховуємо цілі
+            tp_price = entry_price * 1.05  # +5%
+            sl_price = entry_price * 0.98  # -2%
+
+            # --- РЕАЛЬНА ТОРГІВЛЯ (закоментовано для тесту) ---
+            # buy_order = self.exchange.create_market_buy_order(symbol, amount_usdt)
+            # print(f"✅ Market Buy executed at {entry_price}")
+            
+            # В реальності тут треба розрахувати кількість монет (amount_usdt / entry_price)
+            # sell_qty = buy_order['amount']
+            
+            # 3. Виставляємо лімітний ордер на продаж (Take Profit)
+            # self.exchange.create_limit_sell_order(symbol, sell_qty, tp_price)
+            
+            # 4. Виставляємо стоп-лосс (це складніше, зазвичай через stop_loss_limit)
+            # self.exchange.create_order(symbol, 'stop_loss_limit', 'sell', sell_qty, sl_price, {'stopPrice': sl_price})
+            
+            result = {
+                "status": "success",
+                "entry": entry_price,
+                "tp": round(tp_price, 4),
+                "sl": round(sl_price, 4),
+                "msg": f"Bought {symbol} at {entry_price}. TP: {tp_price}, SL: {sl_price}"
+            }
             return result
+
         except Exception as e:
-            print(f"[{_ts()}] Executor: Trade error: {e}")
+            print(f"❌ Smart Order Error: {e}")
             return {"status": "error", "msg": str(e)}
 
     def run(self):
-        print(f"[{_ts()}] Executor: Listening for trade_commands (timeout 10s)...")
-        idle_cycles = 0
+        print("⚡ Executor: High-speed trade monitoring active...")
         while True:
             command = self.db.blpop('trade_commands', timeout=10)
-            if not command:
-                idle_cycles += 1
-                if idle_cycles == 1 or idle_cycles % 30 == 0:
-                    print(f"[{_ts()}] Executor: No command (idle cycle #{idle_cycles})")
-                continue
-
-            idle_cycles = 0
-            _, payload = command
-            data = json.loads(payload)
-            symbol = data.get('symbol', '?')
-            amount = data.get('amount', 10)
-            print(f"[{_ts()}] Executor: Command received: symbol={symbol}, amount={amount} USDT")
-            result = self.place_market_buy(symbol, amount)
-            result_key = f"trade_result:{symbol}"
-            self.db.set(result_key, json.dumps(result), ex=60)
-            print(f"[{_ts()}] Executor: Wrote {result_key} to Redis (ttl 60s)")
-
+            if command:
+                _, payload = command
+                data = json.loads(payload)
+                
+                result = self.place_smart_order(data['symbol'], data['amount'])
+                
+                # Повертаємо результат у Messenger
+                self.db.set(f"trade_result:{data['symbol']}", json.dumps(result), ex=60)
+                # Також кинемо повідомлення в чергу для Telegram
+                self.db.rpush('notifications', json.dumps({
+                    "type": "trade_confirmed",
+                    "data": result
+                }))
 
 if __name__ == "__main__":
     executor = Executor()

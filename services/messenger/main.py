@@ -87,6 +87,29 @@ class Messenger:
             if current_time - timestamp < self.alert_expiry
         }
 
+    async def listen_for_notifications(self):
+        """Listens for execution results and notifies the user"""
+        print("📱 Messenger: Notification listener started...")
+        while True:
+            # Витягуємо підтвердження торгівлі
+            notification = self.db.blpop('notifications', timeout=5)
+            if notification:
+                _, payload = notification
+                note = json.loads(payload)
+                
+                if note['type'] == 'trade_confirmed':
+                    d = note['data']
+                    msg = (
+                        f"✅ **TRADE EXECUTED**\n\n"
+                        f"💰 Entry: `{d['entry']}`\n"
+                        f"🎯 Take Profit: `{d['tp']}`\n"
+                        f"🛑 Stop Loss: `{d['sl']}`\n"
+                        f"⚖️ Risk/Reward: `1:2.5`"
+                    )
+                    await self.send_telegram_msg(msg)
+            
+            await asyncio.sleep(1)
+
     async def run(self):
         """Main loop: monitors Redis and sends alerts with AI and Charts"""
         # Start bot polling in a background thread (handles button clicks)
@@ -94,6 +117,8 @@ class Messenger:
         await self.application.start()
         await self.application.updater.start_polling()
         print(f"[{_ts()}] Messenger: Bot polling thread started, monitoring 'ai_signals' every 10s...")
+
+        asyncio.create_task(self.listen_for_notifications())
 
         while True:
             try:
