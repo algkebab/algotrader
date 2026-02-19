@@ -39,13 +39,51 @@ class Executor:
         """Adjusts the price to the exchange's required precision."""
         return self.exchange.price_to_precision(symbol, price)
 
-    def place_smart_order(self, symbol, amount_usdt=10):
+    def get_free_usdt_balance(self):
+        """Checks the available USDT balance on the Binance Spot account."""
+        try:
+            balance = self.exchange.fetch_balance()
+            return float(balance['total'].get('USDT', 0))
+        except Exception as e:
+            print(f"[{_ts()}] ❌ Error fetching balance: {e}")
+            return 0.0
+
+    def can_open_position(self, symbol):
+        """Checks if we already have an open position for this symbol."""
+        try:
+            balance = self.exchange.fetch_balance()
+            # Extract the coin symbol (e.g., 'BTC' from 'BTC/USDT')
+            coin = symbol.split('/')[0]
+            amount = float(balance['total'].get(coin, 0))
+            
+            # If we have more than a tiny dust amount, assume position is open
+            return amount < 0.0001 
+        except Exception as e:
+            print(f"[{_ts()}] ❌ Error checking positions: {e}")
+            return False
+
+    def place_smart_order(self, symbol, amount_usdt=10, risk_percent=0.02):
         """
         Executes a market buy and prepares SL/TP data.
         Note: Real orders are commented out for safety during testing.
         """
         try:
             print(f"[{_ts()}] 🛒 Executor: Processing SMART order for {symbol}")
+
+            # 1. Check if we already hold this coin
+            if not self.can_open_position(symbol):
+                return {"status": "error", "msg": f"Already holding {symbol}"}
+
+            # 2. Get available balance
+            total_usdt = self.get_free_usdt_balance()
+            amount_usdt = total_usdt * risk_percent
+            
+            # Set a minimum threshold, e.g., 10 USDT (Binance minimum)
+            if amount_usdt < 10:
+                amount_usdt = 10
+            
+            if amount_usdt > total_usdt:
+                 return {"status": "error", "msg": "Insufficient funds"}
             
             # 1. Load markets to get precision rules
             self.exchange.load_markets()
@@ -69,6 +107,8 @@ class Executor:
             # In a real scenario, you would uncomment these lines:
             # buy_order = self.exchange.create_market_buy_order(symbol, qty)
             # print(f"[{_ts()}] ✅ Real Market Buy executed")
+
+            self.db.hset('active_trades', symbol, json.dumps(result))
             
             # 5. Prepare result notification
             result = {

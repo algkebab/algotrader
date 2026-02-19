@@ -103,6 +103,24 @@ class Messenger:
                         f"📊 Status: `Active` (Orders placed on exchange)"
                     )
                     await self.send_telegram_msg(msg)
+
+                # Handling Trade Closing (Exit)
+                elif note['type'] == 'trade_closed':
+                    d = note['data']
+                    # Choose emoji based on profit or loss
+                    result_emoji = "💰" if d['pnl_usdt'] >= 0 else "📉"
+                    pnl_sign = "+" if d['pnl_usdt'] >= 0 else ""
+                    
+                    msg = (
+                        f"{result_emoji} **TRADE CLOSED**\n\n"
+                        f"Symbol: #{d['symbol'].replace('/', '')}\n"
+                        f"Reason: {d['reason']}\n\n"
+                        f"💵 PnL USDT: `{pnl_sign}{d['pnl_usdt']} USDT`\n"
+                        f"📈 PnL %: `{pnl_sign}{d['pnl_percent']}%`\n\n"
+                        f"📥 Entry: `{d['entry']}`\n"
+                        f"📤 Exit: `{d['exit']}`"
+                    )
+                    await self.send_telegram_msg(msg)
             
             await asyncio.sleep(1)
 

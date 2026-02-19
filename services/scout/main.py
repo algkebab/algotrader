@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
 
 import ccxt.async_support as ccxt
@@ -31,8 +32,28 @@ class Scout:
         })
         print(f"[{_ts()}] Scout: Binance client initialized (rate limit enabled)")
 
-        # Symbols to monitor (can be expanded)
-        self.symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'AVAX/USDT']
+        self.max_symbols = 30
+
+    async def get_top_active_symbols(self):
+        """Fetches TOP coins by 24h volume to ensure we track volatile assets."""
+        try:
+            print(f"[{_ts()}] 🔄 Scout: Refreshing TOP {self.max_symbols} assets by volume...")
+            tickers = await self.exchange.fetch_tickers()
+            
+            # Filter only USDT pairs that are currently active
+            usdt_pairs = [
+                {'symbol': s, 'volume': t['quoteVolume']} 
+                for s, t in tickers.items() 
+                if s.endswith('/USDT') and t['quoteVolume'] is not None
+            ]
+            
+            # Sort by volume descending and take the top ones
+            sorted_pairs = sorted(usdt_pairs, key=lambda x: x['volume'], reverse=True)
+            return [p['symbol'] for p in sorted_pairs[:self.max_symbols]]
+            
+        except Exception as e:
+            print(f"[{_ts()}] ❌ Error fetching symbols: {e}")
+            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT'] # Emergency fallback
 
     async def save_to_redis(self, data):
         """
@@ -61,8 +82,11 @@ class Scout:
         
         while True:
             market_summary = {}
+            active_symbols = await self.get_top_active_symbols()
             
-            for symbol in self.symbols:
+            print(f"[{_ts()}] 🛰️ Scanning {len(active_symbols)} symbols for opportunities...")
+
+            for symbol in active_symbols:
                 try:
                     # 1. Get current ticker
                     ticker = await self.exchange.fetch_ticker(symbol)
@@ -77,13 +101,18 @@ class Scout:
                         'candles': candles  # Nested candle data for AI/Filter analysis
                     }
                     print(f"✅ Data updated: {symbol}")
+
+                    # Small delay to keep API weight usage low
+                    time.sleep(0.1)
                     
                 except Exception as e:
                     print(f"❌ Error updating {symbol}: {e}")
             
             # Save the enriched data to Redis
             self.db.set('market_data', json.dumps(market_summary))
-            await asyncio.sleep(60)
+            print(f"[{_ts()}] ✅ Scan complete. Analyzing {len(market_summary)} candidates.")
+
+            await asyncio.sleep(120)
             
 if __name__ == "__main__":
     scout = Scout()

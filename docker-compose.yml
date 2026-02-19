@@ -74,3 +74,14 @@ services:
       - BINANCE_SECRET=${BINANCE_SECRET}
     depends_on:
       - redis
+
+  monitor:
+    build:
+      context: .
+      dockerfile: services/monitor/Dockerfile
+    env_file: .env
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+    restart: always
