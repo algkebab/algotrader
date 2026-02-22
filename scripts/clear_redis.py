@@ -16,7 +16,7 @@ ALGOTRADER_KEYS = [
     "active_trades",
     "notifications",
 ]
-PATTERNS = ["analyzed:*", "last_vol:*"]
+PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
 
 def delete_pattern(db, pattern):

@@ -20,6 +20,40 @@ class Monitor:
             'options': {'defaultType': 'spot'}
         })
 
+    # services/monitor/main.py
+
+    def check_trades(self):
+        trades = self.db.hgetall('active_trades')
+        for symbol, data in trades.items():
+            trade = json.loads(data)
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            pnl_pct = ((current_price / trade['entry']) - 1) * 100
+            pnl_usdt = (current_price - trade['entry']) * trade['qty']
+
+            # Logic for closing
+            reason = None
+            if current_price >= trade['tp']: reason = "TAKE-PROFIT 🟢"
+            elif current_price <= trade['sl']: reason = "STOP-LOSS 🔴"
+
+            if reason:
+                self.close_trade(symbol, trade, current_price, pnl_pct, pnl_usdt, reason)
+
+    def close_trade(self, symbol, trade, price, pct, usdt, reason):
+        notification = {
+            "type": "trade_closed",
+            "data": {
+                "symbol": symbol,
+                "pnl_percent": round(pct, 2),
+                "pnl_usdt": round(usdt, 2),
+                "exit_price": price,
+                "reason": reason
+            }
+        }
+        self.db.rpush('notifications', json.dumps(notification))
+        self.db.hdel('active_trades', symbol)
+
     def run(self):
         print(f"[{_ts()}] 🛰️ Monitor: Tracking active positions...")
         
@@ -44,7 +78,7 @@ class Monitor:
                     sl_price = trade['sl']
                     tp_price = trade['tp']
                     
-                    print(f"[{_ts()}] 📊 Monitoring {symbol}: Now: {current_price} | SL: {sl_price} | TP: {tp_price}")
+                    # print(f"[{_ts()}] 📊 Monitoring {symbol}: Now: {current_price} | SL: {sl_price} | TP: {tp_price}")
 
                     # 3. Check Stop-Loss
                     if current_price <= sl_price:

@@ -11,10 +11,8 @@ from openai import OpenAI
 
 load_dotenv()
 
-
 def _ts():
     return datetime.utcnow().strftime("%H:%M:%S")
-
 
 class Brain:
     def __init__(self):
@@ -24,12 +22,31 @@ class Brain:
         
         # AI setup
         self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        
+        # Sensitivity setting: 0.005 = 0.5%
+        self.price_change_threshold = 0.005 
+
+    def should_analyze(self, symbol, current_price):
+        """
+        Implements smart caching to save money.
+        Returns True if price moved significantly or cache expired.
+        """
+        cache_data = self.db.get(f"cache:brain_price:{symbol}")
+        
+        if cache_data:
+            last_price = float(cache_data)
+            price_diff = abs(current_price - last_price) / last_price
+            
+            if price_diff < self.price_change_threshold:
+                print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (Price change {price_diff:.2%} < {self.price_change_threshold:.2%})")
+                return False
+        
+        # If no cache or price moved enough, we update and proceed
+        self.db.set(f"cache:brain_price:{symbol}", current_price, ex=1800)
+        return True
 
     def get_ai_verdict(self, symbol, price, rsi, rvol, candles):
-        """
-        Sends technical data to GPT for a high-level trading verdict
-        """
-        # Prepare a concise summary of the last 5 candles for the AI
+        """Sends technical data to GPT for a high-level trading verdict"""
         candle_summary = [f"Close: {c[4]}, Vol: {c[5]}" for c in candles[-5:]]
         
         prompt = f"""
@@ -49,23 +66,22 @@ class Brain:
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o", # Using the latest model for better reasoning
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": "You are an expert crypto day-trader. Be conservative and look for high-probability setups."},
                     {"role": "user", "content": prompt}
                 ],
-                response_format={ "type": "json_object" } # Ensures we get clean JSON
+                response_format={ "type": "json_object" }
             )
             return json.loads(response.choices[0].message.content)
         except Exception as e:
-            print(f"AI Error: {e}")
+            print(f"[{_ts()}] ❌ AI Error: {e}")
             return {"verdict": "WAIT", "reason": "AI Analysis failed", "confidence": "0%"}
 
     def run(self):
-        print("🧠 Brain: AI Technical Analyst is online...")
+        print(f"[{_ts()}] 🧠 Brain: AI Technical Analyst is online with Smart Cache...")
         
         while True:
-            # Get candidates from the Filter service
             raw_data = self.db.get('filtered_candidates')
             if not raw_data:
                 time.sleep(5)
@@ -75,16 +91,18 @@ class Brain:
             
             for item in candidates:
                 symbol = item['symbol']
+                current_price = item['last_price']
                 
-                # Prevent analyzing the same coin too often
-                if self.db.exists(f"analyzed:{symbol}"):
+                # --- SMART CACHE START ---
+                if not self.should_analyze(symbol, current_price):
                     continue
+                # --- SMART CACHE END ---
 
-                print(f"🔍 Analyzing {symbol} with AI...")
+                print(f"[{_ts()}] 🔍 Analyzing {symbol} with AI...")
                 
                 analysis = self.get_ai_verdict(
                     symbol, 
-                    item['last_price'], 
+                    current_price, 
                     item['rsi'], 
                     item['rvol'], 
                     item.get('candles', [])
@@ -93,11 +111,8 @@ class Brain:
                 # Merge AI verdict with market data
                 final_signal = {**item, **analysis}
                 
-                # Push to messenger queue
+                # Push to signals queue (for Messenger)
                 self.db.rpush('signals', json.dumps(final_signal))
-                
-                # Mark as analyzed for 30 minutes
-                self.db.set(f"analyzed:{symbol}", "1", ex=1800)
 
             # Clear candidates after processing
             self.db.delete('filtered_candidates')
@@ -105,4 +120,5 @@ class Brain:
 
 if __name__ == "__main__":
     brain = Brain()
-    asyncio.run(brain.run())
+    # Fixed: run is not an async function, using standard loop or calling directly
+    brain.run()

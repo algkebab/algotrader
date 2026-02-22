@@ -92,6 +92,16 @@ class Messenger:
             if notification:
                 _, payload = notification
                 note = json.loads(payload)
+
+                if note['type'] == 'trade_closed':
+                    d = note['data']
+                    msg = (
+                        f"🏁 **TRADE CLOSED**\n"
+                        f"Asset: {d['symbol']}\n"
+                        f"Result: `{d['pnl_usdt']} USDT` ({d['pnl_percent']}%)\n"
+                        f"Reason: {d['reason']}"
+                    )
+                    await self.send_telegram_msg(msg)
                 
                 if note['type'] == 'trade_confirmed':
                     d = note['data']
