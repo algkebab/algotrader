@@ -28,7 +28,7 @@ Microservices-based algorithmic trading system.
 
 2. Edit `.env` and set:
 
-   - `BINANCE_API_KEY` / `BINANCE_SECRET` — for scout and executor
+   - `BINANCE_API_KEY` / `BINANCE_SECRET` — for executor (and monitor). Scout uses public API only.
    - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` — for messenger
 
 3. Run all services:
@@ -65,11 +65,18 @@ Each service has its own `main.py`, `requirements.txt`, and `Dockerfile`.
 
 ## Local development
 
-From the project root, run a single service:
+Use a **virtual environment** (required on macOS with Homebrew Python — see [PEP 668](https://peps.python.org/pep-0668/)):
 
 ```bash
+# From project root: create and activate venv once
+python3 -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+
+# Install dependencies for the service you want to run (example: scout)
+pip install -r services/scout/requirements.txt
+
+# Run the service (from root so shared/ is on path, or set PYTHONPATH)
 cd services/scout
-pip install -r requirements.txt
 python main.py
 ```
 
