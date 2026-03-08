@@ -43,6 +43,22 @@ To run in the background:
 docker compose up --build -d
 ```
 
+### Stop and clear Redis data
+
+To bring everything down **and** remove all Redis data (volume), use `-v`:
+
+```bash
+docker compose down -v
+```
+
+This stops and removes containers and deletes the `redis_data` volume, so the next `docker compose up` starts with an empty Redis.
+
+To stop without clearing Redis (data persists for next run):
+
+```bash
+docker compose down
+```
+
 ## Project layout
 
 ```

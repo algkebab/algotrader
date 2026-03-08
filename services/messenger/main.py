@@ -7,9 +7,19 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import TimedOut
 from telegram.ext import Application, CallbackQueryHandler
+from telegram.request import HTTPXRequest
 
 load_dotenv()
+
+# Longer timeouts for Telegram API (default is 5s; avoids TimedOut on slow networks)
+TELEGRAM_READ_TIMEOUT = 30.0
+TELEGRAM_WRITE_TIMEOUT = 30.0
+TELEGRAM_CONNECT_TIMEOUT = 30.0
+TELEGRAM_POOL_TIMEOUT = 10.0
+SEND_MESSAGE_RETRIES = 2
+SEND_MESSAGE_RETRY_DELAY = 2.0
 
 def _ts():
     """Returns current UTC timestamp for logging."""
@@ -29,18 +39,22 @@ class Messenger:
         
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in environment variables")
-            
-        # Bot instance for manual sending
-        self.bot = Bot(token=self.bot_token)
-        print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id})")
 
-        # Initialize Telegram Application with longer timeouts (avoids TimedOut from slow networks)
+        # Shared request with longer timeouts (Bot.send_message and Application both use it)
+        self._request = HTTPXRequest(
+            connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
+            read_timeout=TELEGRAM_READ_TIMEOUT,
+            write_timeout=TELEGRAM_WRITE_TIMEOUT,
+            pool_timeout=TELEGRAM_POOL_TIMEOUT,
+        )
+        self.bot = Bot(token=self.bot_token, request=self._request)
+        print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id}, timeouts={TELEGRAM_READ_TIMEOUT}s)")
+
         self.application = (
             Application.builder()
             .token(self.bot_token)
-            .connect_timeout(30)
-            .read_timeout(30)
-            .write_timeout(30)
+            .request(self._request)
+            .get_updates_request(self._request)
             .build()
         )
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
@@ -70,18 +84,29 @@ class Messenger:
                 print(f"[{_ts()}] Messenger: edit_message_text error: {e}")
 
     async def send_telegram_msg(self, text, symbol=None, keyboard=None):
-        """Helper to send Markdown messages with optional keyboards."""
-        try:
-            async with self.bot:
-                await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True
-                )
-        except Exception as e:
-            print(f"[{_ts()}] Messenger: Telegram API Error: {e}")
+        """Helper to send Markdown messages with optional keyboards. Retries on timeout."""
+        last_error = None
+        for attempt in range(SEND_MESSAGE_RETRIES + 1):
+            try:
+                async with self.bot:
+                    await self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=text,
+                        parse_mode="Markdown",
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                return
+            except TimedOut as e:
+                last_error = e
+                if attempt < SEND_MESSAGE_RETRIES:
+                    print(f"[{_ts()}] Messenger: Telegram timeout (attempt {attempt + 1}), retrying in {SEND_MESSAGE_RETRY_DELAY}s...")
+                    await asyncio.sleep(SEND_MESSAGE_RETRY_DELAY)
+            except Exception as e:
+                print(f"[{_ts()}] Messenger: Telegram API Error: {e}")
+                return
+        if last_error:
+            print(f"[{_ts()}] Messenger: Telegram API Error (timed out after {SEND_MESSAGE_RETRIES + 1} attempts): {last_error}")
 
     async def listen_for_notifications(self):
         """Background task: Listens for trade execution results from Executor."""
