@@ -50,8 +50,13 @@ class Filter:
 
     def run(self):
         print("🛡️ Filter: Analyzing Volume & RSI indicators...")
-        
+        PAUSED_KEY = "system:trading_paused"
+
         while True:
+            if self.db.get(PAUSED_KEY):
+                time.sleep(5)
+                continue
+
             raw_data = self.db.get('market_data')
             if not raw_data:
                 time.sleep(5)

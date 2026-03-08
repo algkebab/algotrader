@@ -8,7 +8,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TimedOut
-from telegram.ext import Application, CallbackQueryHandler
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 load_dotenv()
@@ -20,6 +20,9 @@ TELEGRAM_CONNECT_TIMEOUT = 30.0
 TELEGRAM_POOL_TIMEOUT = 10.0
 SEND_MESSAGE_RETRIES = 2
 SEND_MESSAGE_RETRY_DELAY = 2.0
+
+# Redis key: when set, Filter and Brain skip work (pause pipeline)
+REDIS_KEY_TRADING_PAUSED = "system:trading_paused"
 
 def _ts():
     """Returns current UTC timestamp for logging."""
@@ -58,6 +61,34 @@ class Messenger:
             .build()
         )
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
+
+    def _is_allowed_chat(self, chat_id):
+        """Only the configured chat can send stop/start/status."""
+        return str(chat_id) == str(self.chat_id)
+
+    async def handle_text(self, update, context):
+        """Handle stop / start / status commands from Telegram."""
+        if not self._is_allowed_chat(update.effective_chat.id):
+            return
+        text = (update.message.text or "").strip().lower()
+        if text == "stop":
+            self.db.set(REDIS_KEY_TRADING_PAUSED, "1")
+            print(f"[{_ts()}] Messenger: Pipeline PAUSED (Filter & Brain stopped)")
+            await update.message.reply_text(
+                "⏸️ Trading pipeline paused.\n\nFilter and Brain stopped (no filtering, no AI). "
+                "Scout, Executor, Monitor still running. Send \"start\" to resume."
+            )
+        elif text == "start":
+            self.db.delete(REDIS_KEY_TRADING_PAUSED)
+            print(f"[{_ts()}] Messenger: Pipeline RESUMED (Filter & Brain running)")
+            await update.message.reply_text("▶️ Trading pipeline resumed. Filter and Brain are running.")
+        elif text == "status":
+            paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
+            if paused:
+                await update.message.reply_text("📊 Status: Pipeline **paused** (Filter & Brain stopped). Send \"start\" to resume.")
+            else:
+                await update.message.reply_text("📊 Status: Pipeline **running**.")
 
     async def handle_callback(self, update, context):
         """Handles button clicks (Buy commands) from Telegram UI."""

@@ -80,8 +80,13 @@ class Brain:
 
     def run(self):
         print(f"[{_ts()}] 🧠 Brain: AI Technical Analyst is online with Smart Cache...")
-        
+        PAUSED_KEY = "system:trading_paused"
+
         while True:
+            if self.db.get(PAUSED_KEY):
+                time.sleep(5)
+                continue
+
             raw_data = self.db.get('filtered_candidates')
             if not raw_data:
                 time.sleep(5)
