@@ -24,6 +24,7 @@ SYSTEM_KEYS = frozenset({
     "system:suppress_wait_signals",
     "system:autopilot",
     "system:muted",
+    "system:papertrading",
 })
 PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 

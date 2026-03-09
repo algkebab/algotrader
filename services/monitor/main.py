@@ -20,117 +20,102 @@ def _ts():
 
 class Monitor:
     def __init__(self):
-        # Redis setup
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
-        
-        # Exchange setup (for price tracking)
         self.exchange = ccxt.binance({
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
 
-    # services/monitor/main.py
+    def _is_paper_trading(self):
+        """Paper trading ON when key is absent or '1'."""
+        val = self.db.get("system:papertrading")
+        return val != "0"
 
-    def check_trades(self):
-        trades = self.db.hgetall('active_trades')
-        for symbol, data in trades.items():
-            trade = json.loads(data)
-            ticker = self.exchange.fetch_ticker(symbol)
-            current_price = ticker['last']
-            
-            pnl_pct = ((current_price / trade['entry']) - 1) * 100
-            pnl_usdt = (current_price - trade['entry']) * trade['qty']
-
-            # Logic for closing
-            reason = None
-            if current_price >= trade['tp']: reason = "TAKE-PROFIT 🟢"
-            elif current_price <= trade['sl']: reason = "STOP-LOSS 🔴"
-
-            if reason:
-                self.close_trade(symbol, trade, current_price, pnl_pct, pnl_usdt, reason)
-
-    def close_trade(self, symbol, trade, price, pct, usdt, reason):
-        notification = {
-            "type": "trade_closed",
-            "data": {
-                "symbol": symbol,
-                "pnl_percent": round(pct, 2),
-                "pnl_usdt": round(usdt, 2),
-                "exit_price": price,
-                "reason": reason
-            }
-        }
-        self.db.rpush('notifications', json.dumps(notification))
-        self.db.hdel('active_trades', symbol)
+    def _get_positions_to_monitor(self):
+        """Returns list of (symbol, trade_dict). In paper mode from DB (status=open); in live from Redis."""
+        if self._is_paper_trading():
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    rows = shared_db.get_open_orders(conn)
+                return [
+                    (r["symbol"], {
+                        "entry": float(r["entry_price"]),
+                        "qty": float(r["quantity"]),
+                        "tp": float(r["tp_price"]),
+                        "sl": float(r["sl_price"]),
+                    })
+                    for r in rows
+                ]
+            except Exception as e:
+                print(f"[{_ts()}] ❌ Monitor: DB error: {e}")
+                return []
+        trades = self.db.hgetall('active_trades') or {}
+        return [(s, json.loads(data)) for s, data in trades.items()]
 
     def run(self):
         print(f"[{_ts()}] 🛰️ Monitor: Tracking active positions...")
-        
         while True:
-            # 1. Get all active trades from Redis
-            # We will store them in a hash map called 'active_trades'
-            trades = self.db.hgetall('active_trades')
-            
-            if not trades:
-                time.sleep(5) # Wait if no active trades
+            positions = self._get_positions_to_monitor()
+            if not positions:
+                time.sleep(5)
                 continue
 
-            for symbol, trade_json in trades.items():
-                trade = json.loads(trade_json)
-                
+            for symbol, trade in positions:
                 try:
-                    # 2. Fetch current price
                     ticker = self.exchange.fetch_ticker(symbol)
                     current_price = ticker['last']
-                    
                     entry_price = trade['entry']
                     sl_price = trade['sl']
                     tp_price = trade['tp']
-                    
-                    # print(f"[{_ts()}] 📊 Monitoring {symbol}: Now: {current_price} | SL: {sl_price} | TP: {tp_price}")
 
-                    # 3. Check Stop-Loss
                     if current_price <= sl_price:
                         self.close_position(symbol, current_price, "STOP-LOSS 🔴")
-
-                    # 4. Check Take-Profit
                     elif current_price >= tp_price:
-                        # Instead of closing, we could implement Trailing Stop here
-                        # For now, let's just close to lock in profit
                         self.close_position(symbol, current_price, "TAKE-PROFIT 🟢")
-                    
-                    # 5. Optional: Trailing Stop Logic
-                    # If price is 2% above entry, move SL to entry price (Break even)
-                    if current_price > entry_price * 1.02 and sl_price < entry_price:
-                        trade['sl'] = entry_price
-                        self.db.hset('active_trades', symbol, json.dumps(trade))
-                        print(f"[{_ts()}] 🛡️ {symbol}: SL moved to BREAK-EVEN")
-
+                    else:
+                        # Trailing stop: move SL to break-even when 2% above entry (live only; Redis has trade state)
+                        if not self._is_paper_trading():
+                            trade_json = self.db.hget('active_trades', symbol)
+                            if trade_json:
+                                t = json.loads(trade_json)
+                                if current_price > entry_price * 1.02 and t.get('sl', 0) < entry_price:
+                                    t['sl'] = entry_price
+                                    self.db.hset('active_trades', symbol, json.dumps(t))
+                                    print(f"[{_ts()}] 🛡️ {symbol}: SL moved to BREAK-EVEN")
                 except Exception as e:
                     print(f"[{_ts()}] ❌ Error monitoring {symbol}: {e}")
 
-            time.sleep(2) # Price check frequency
+            time.sleep(2)
 
     def close_position(self, symbol, price, reason):
-        """Calculates final PnL and removes trade from active"""
-        trade_json = self.db.hget('active_trades', symbol)
-        if not trade_json:
-            return
-        
-        trade = json.loads(trade_json)
-        entry_price = float(trade['entry'])
-        qty = float(trade['qty'])
-        
-        # PnL Calculation
-        # Profit/Loss in USDT = (Current Price - Entry Price) * Quantity
+        """Close position: update DB and notify. In live mode also remove from Redis active_trades."""
+        paper = self._is_paper_trading()
+        if paper:
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    row = shared_db.get_open_order_for_symbol(conn, symbol)
+                if not row:
+                    return
+                entry_price = float(row["entry_price"])
+                qty = float(row["quantity"])
+            except Exception as e:
+                print(f"[{_ts()}] ❌ Monitor: DB error in close_position: {e}")
+                return
+        else:
+            trade_json = self.db.hget('active_trades', symbol)
+            if not trade_json:
+                return
+            trade = json.loads(trade_json)
+            entry_price = float(trade['entry'])
+            qty = float(trade['qty'])
+
         pnl_usdt = (price - entry_price) * qty
-        # Profit/Loss in %
         pnl_percent = ((price / entry_price) - 1) * 100
-        
-        print(f"[{_ts()}] 🚩 CLOSING {symbol} at {price}. PnL: {pnl_usdt:.2f} USDT ({pnl_percent:.2f}%)")
-        
-        # Notify Messenger with detailed stats
+        print(f"[{_ts()}] 🚩 CLOSING {symbol} at {price}. PnL: {pnl_usdt:.2f} USDT ({pnl_percent:.2f}%)" + (" (paper)" if paper else ""))
+
         notification = {
             "type": "trade_closed",
             "data": {
@@ -142,11 +127,11 @@ class Monitor:
                 "reason": reason
             }
         }
-        
         self.db.rpush('notifications', json.dumps(notification))
-        self.db.hdel('active_trades', symbol)
 
-        # Persist closed order and update balance in SQLite
+        if not paper:
+            self.db.hdel('active_trades', symbol)
+
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
@@ -161,7 +146,7 @@ class Monitor:
                     bal = shared_db.get_balance(conn, "USDT")
                     shared_db.set_balance(conn, "USDT", bal + pnl_usdt)
         except Exception as db_err:
-            print(f"[{_ts()}] ⚠️ DB update failed (trade still closed in Redis): {db_err}")
+            print(f"[{_ts()}] ⚠️ DB update failed: {db_err}")
 
 if __name__ == "__main__":
     monitor = Monitor()

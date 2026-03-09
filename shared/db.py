@@ -100,6 +100,16 @@ def get_open_order_id_for_symbol(conn: sqlite3.Connection, symbol: str) -> Optio
     return row["id"] if row else None
 
 
+def get_open_order_for_symbol(conn: sqlite3.Connection, symbol: str) -> Optional[Any]:
+    """Return one open order row for symbol (id, symbol, entry_price, quantity, tp_price, sl_price, etc.) or None."""
+    row = conn.execute(
+        """SELECT id, symbol, entry_price, quantity, tp_price, sl_price, amount_usdt, opened_at
+           FROM orders WHERE symbol = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1""",
+        (symbol,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def update_order_closed(
     conn: sqlite3.Connection,
     order_id: int,

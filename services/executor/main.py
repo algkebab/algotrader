@@ -66,52 +66,57 @@ class Executor:
             print(f"[{_ts()}] ❌ Error fetching balance: {e}")
             return 0.0
 
+    def _is_paper_trading(self):
+        """Paper trading is ON when key is absent or '1'; OFF when '0'."""
+        val = self.db.get("system:papertrading")
+        return val != "0"
+
     def can_open_position(self, symbol):
-        """Checks if we already have an active trade for this symbol in Redis."""
+        """Checks if we already have an active trade for this symbol (Redis in live, DB in paper)."""
+        if self._is_paper_trading():
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    return shared_db.get_open_order_id_for_symbol(conn, symbol) is None
+            except Exception:
+                return True
         return not self.db.hexists('active_trades', symbol)
 
     def place_smart_order(self, symbol, amount_usdt=10, risk_percent=0.02):
         """
-        Executes a market buy on Binance Spot and saves data for Monitor.
+        Executes a market buy on Binance Spot (live) or writes order to DB only (paper).
         """
         try:
-            print(f"[{_ts()}] 🛒 Executor: Processing order for {symbol}")
+            paper = self._is_paper_trading()
+            print(f"[{_ts()}] 🛒 Executor: Processing order for {symbol}" + (" (paper)" if paper else ""))
 
             if not self.can_open_position(symbol):
                 print(f"[{_ts()}] ⚠️ Already monitoring {symbol}. Skipping.")
                 return {"status": "error", "msg": "Position exists"}
 
+            if paper:
+                return self._place_paper_order(symbol, amount_usdt)
+
+            # --- LIVE TRADING ---
             # 1. Risk Management
             total_usdt = self.get_free_usdt_balance()
             print(f"[{_ts()}] 💰 Current Balance: {total_usdt} USDT")
             
-            # Binance minimum is usually 10 USDT
             calc_amount = max(total_usdt * risk_percent, 10.5) 
-            
             if total_usdt < 10:
                  return {"status": "error", "msg": "Insufficient funds on Binance"}
-            
             final_amount_usdt = min(calc_amount, total_usdt)
 
             # 2. Market Data
             ticker = self.exchange.fetch_ticker(symbol)
             entry_price = ticker['last']
-            
-            # 3. Precision Calculations
             tp_price = self.get_precision_price(symbol, entry_price * self.tp_percent)
             sl_price = self.get_precision_price(symbol, entry_price * self.sl_percent)
-            
             raw_qty = final_amount_usdt / entry_price
             qty = self.get_precision_amount(symbol, raw_qty)
 
-            # --- EXECUTION ON BINANCE ---
             print(f"[{_ts()}] 🚀 SENDING MARKET BUY: {qty} {symbol}")
-            
-            # Create real market buy order
             order = self.exchange.create_market_buy_order(symbol, qty)
-            
-            # 4. Prepare Trade Object for Monitor
-            # Use actual price from the order if possible, else ticker price
             actual_entry = order.get('average', entry_price)
 
             result = {
@@ -124,29 +129,16 @@ class Executor:
                 "sl": float(sl_price),
                 "timestamp": time.time()
             }
-            
-            # 5. Save to Redis for Monitor
             self.db.hset('active_trades', symbol, json.dumps(result))
-            
-            # 6. Notify Messenger
-            self.db.rpush('notifications', json.dumps({
-                "type": "trade_confirmed",
-                "data": result
-            }))
+            self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
 
-            # 7. Persist order and balance to SQLite
             try:
                 with shared_db.get_connection() as conn:
                     shared_db.init_schema(conn)
                     shared_db.insert_order(
-                        conn,
-                        symbol=symbol,
-                        side="buy",
-                        amount_usdt=final_amount_usdt,
-                        entry_price=float(actual_entry),
-                        quantity=float(qty),
-                        tp_price=float(tp_price),
-                        sl_price=float(sl_price),
+                        conn, symbol=symbol, side="buy", amount_usdt=final_amount_usdt,
+                        entry_price=float(actual_entry), quantity=float(qty),
+                        tp_price=float(tp_price), sl_price=float(sl_price),
                         exchange_order_id=str(order["id"]) if order.get("id") else None,
                     )
                     shared_db.sync_balance_from_exchange(conn, self.exchange)
@@ -160,6 +152,48 @@ class Executor:
             print(f"[{_ts()}] ❌ Binance Order Error: {e}")
             return {"status": "error", "message": str(e)}
 
+    def _place_paper_order(self, symbol, amount_usdt=10):
+        """Write order to DB only; no exchange, no Redis active_trades."""
+        try:
+            # Public ticker for entry/tp/sl (no account interaction)
+            ticker = self.exchange.fetch_ticker(symbol)
+            entry_price = float(ticker['last'])
+            tp_price = self.get_precision_price(symbol, entry_price * self.tp_percent)
+            sl_price = self.get_precision_price(symbol, entry_price * self.sl_percent)
+            raw_qty = amount_usdt / entry_price
+            qty = self.get_precision_amount(symbol, raw_qty)
+            final_amount_usdt = float(qty) * entry_price
+
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                order_id = shared_db.insert_order(
+                    conn,
+                    symbol=symbol,
+                    side="buy",
+                    amount_usdt=final_amount_usdt,
+                    entry_price=entry_price,
+                    quantity=float(qty),
+                    tp_price=float(tp_price),
+                    sl_price=float(sl_price),
+                    exchange_order_id=None,
+                )
+            result = {
+                "status": "success",
+                "order_id": f"paper-{order_id}",
+                "symbol": symbol,
+                "entry": entry_price,
+                "qty": float(qty),
+                "tp": float(tp_price),
+                "sl": float(sl_price),
+                "timestamp": time.time()
+            }
+            self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
+            print(f"[{_ts()}] ✅ Paper order written to DB (id={order_id})")
+            return result
+        except Exception as e:
+            print(f"[{_ts()}] ❌ Paper order error: {e}")
+            return {"status": "error", "message": str(e)}
+
     def run(self):
         print(f"[{_ts()}] ⚡ Executor: Waiting for trade commands from Redis...")
         while True:
@@ -168,7 +202,7 @@ class Executor:
                 _, payload = command_data
                 try:
                     data = json.loads(payload)
-                    self.place_smart_order(data.get('symbol'))
+                    self.place_smart_order(data.get('symbol'), amount_usdt=float(data.get('amount', 10)))
                 except Exception as e:
                     print(f"[{_ts()}] ❌ Parsing error: {e}")
 

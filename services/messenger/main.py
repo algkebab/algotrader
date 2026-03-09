@@ -40,6 +40,8 @@ REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"
 REDIS_KEY_AUTOPILOT = "system:autopilot"
 # Redis key: when set, no alerts/notifications sent to Telegram (platform keeps working)
 REDIS_KEY_MUTED = "system:muted"
+# Redis key: "1" = paper trading (no exchange, DB only); "0" = live. Default when absent = paper.
+REDIS_KEY_PAPERTRADING = "system:papertrading"
 # Last balance check (for "balance" command diff)
 REDIS_KEY_BALANCE_LAST_USDT = "system:balance_last_usdt"
 REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
@@ -50,6 +52,7 @@ REDIS_SYSTEM_KEYS = frozenset({
     REDIS_KEY_SUPPRESS_WAIT_SIGNALS,
     REDIS_KEY_AUTOPILOT,
     REDIS_KEY_MUTED,
+    REDIS_KEY_PAPERTRADING,
 })
 
 # Data keys and patterns to clear on "clear redis" (excludes REDIS_SYSTEM_KEYS)
@@ -78,7 +81,9 @@ HELP_MESSAGE = """🛠 Commands (send exactly as below):
 • mute — Stop sending all alerts and notifications to Telegram (platform keeps running).
 • unmute — Resume sending alerts and notifications.
 • clear redis — Clear all Redis data (queues, cache). Keeps system settings (stop/start, autopilot, mute, etc.).
-• status — Show pipeline (paused/running), WAIT setting, autopilot, and mute.
+• papertrading on — No real orders; only write to DB; Monitor uses DB. (Default.)
+• papertrading off — Live trading: real orders on exchange; Monitor uses Redis.
+• status — Show pipeline (paused/running), WAIT setting, autopilot, mute, and paper trading.
 • orders — List current open orders from the database.
 • balance — Current USDT balance from DB; shows change since last check.
 • help — Show this message."""
@@ -261,16 +266,34 @@ class Messenger:
             except Exception as e:
                 print(f"[{_ts()}] Messenger: clear redis failed: {e}")
                 await self._safe_reply(update, f"❌ Clear Redis failed: {e}")
+        elif text == "papertrading on":
+            self.db.set(REDIS_KEY_PAPERTRADING, "1")
+            print(f"[{_ts()}] Messenger: Paper trading ON (no exchange orders, DB only)")
+            await self._safe_reply(
+                update,
+                "📄 Paper trading ON.\n\nNo real orders on the exchange. Orders are written to the database only. "
+                "Monitor uses DB open orders. Send \"papertrading off\" for live trading.",
+            )
+        elif text == "papertrading off":
+            self.db.set(REDIS_KEY_PAPERTRADING, "0")
+            print(f"[{_ts()}] Messenger: Paper trading OFF (live trading)")
+            await self._safe_reply(
+                update,
+                "🔴 Paper trading OFF.\n\nLive trading: real orders on the exchange; Monitor uses Redis active_trades.",
+            )
         elif text == "status":
             paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
             suppress_wait = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
             autopilot = self.db.get(REDIS_KEY_AUTOPILOT)
             muted = self.db.get(REDIS_KEY_MUTED)
+            paper_val = self.db.get(REDIS_KEY_PAPERTRADING)
+            paper_on = paper_val != "0"
             parts = []
             parts.append("Pipeline: paused (send \"start\" to resume)." if paused else "Pipeline: running.")
             parts.append("Autopilot: ON (auto orders on BUY, no button)." if autopilot else "Autopilot: OFF (Buy button on signals).")
             parts.append("WAIT signals: suppressed (only BUY sent). Send \"start wait\" to enable." if suppress_wait else "WAIT signals: sent (BUY + WAIT). Send \"stop wait\" to suppress.")
             parts.append("Telegram: muted (no alerts/notifications). Send \"unmute\" to enable." if muted else "Telegram: unmuted (alerts/notifications sent).")
+            parts.append("Paper trading: ON (DB only, no exchange)." if paper_on else "Paper trading: OFF (live).")
             await self._safe_reply(update, "📊 Status:\n\n" + "\n".join(parts))
         elif text == "autopilot on":
             self.db.set(REDIS_KEY_AUTOPILOT, "1")
