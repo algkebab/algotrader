@@ -69,12 +69,13 @@ REDIS_DATA_KEYS = [
 REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
 AUTOPILOT_ORDER_AMOUNT_USDT = 10
+AUTOPILOT_MAX_OPEN_ORDERS = 10
 
 HELP_MESSAGE = """🛠 Commands (send exactly as below):
 
 • stop — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
 • start — Resume Filter & Brain.
-• autopilot on — Auto-place orders on BUY verdicts; no Buy button on signals; also resumes pipeline if paused.
+• autopilot on — Auto-place orders on BUY verdicts (max 10 open); no Buy button on signals; also resumes pipeline if paused.
 • autopilot off — Stop auto orders; Buy button is shown again on BUY signals.
 • stop wait — Only BUY signals sent; WAIT verdicts are not sent.
 • start wait — Send both BUY and WAIT signals again.
@@ -163,6 +164,15 @@ class Messenger:
                 f"TP: {o['tp_price']} | SL: {o['sl_price']} | {opened}"
             )
         await self._safe_reply(update, "\n".join(lines))
+
+    def _get_open_order_count(self) -> int:
+        """Return number of open orders from DB (for autopilot cap)."""
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                return len(shared_db.get_open_orders(conn))
+        except Exception:
+            return 0
 
     async def _reply_balance(self, update) -> None:
         """Reply with current USDT balance from DB and delta since last check (stored in Redis)."""
@@ -478,13 +488,20 @@ class Messenger:
                     await self.send_telegram_msg(message, symbol, keyboard)
 
                     if verdict == "BUY" and autopilot_on:
-                        command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
-                        self.db.rpush("trade_commands", json.dumps(command))
-                        await self.send_telegram_msg(
-                            f"🤖 **Automatic order placed** for {symbol} ({AUTOPILOT_ORDER_AMOUNT_USDT} USDT). "
-                            "Executor will confirm shortly."
-                        )
-                        print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
+                        open_count = self._get_open_order_count()
+                        if open_count >= AUTOPILOT_MAX_OPEN_ORDERS:
+                            await self.send_telegram_msg(
+                                f"⏸️ **Autopilot skipped** for {symbol}: max {AUTOPILOT_MAX_OPEN_ORDERS} open orders reached ({open_count})."
+                            )
+                            print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (open orders: {open_count})")
+                        else:
+                            command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
+                            self.db.rpush("trade_commands", json.dumps(command))
+                            await self.send_telegram_msg(
+                                f"🤖 **Automatic order placed** for {symbol} ({AUTOPILOT_ORDER_AMOUNT_USDT} USDT). "
+                                "Executor will confirm shortly."
+                            )
+                            print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
 
                     print(f"[{_ts()}] Messenger: Signal alert sent for {symbol} (Verdict: {verdict})")
 
