@@ -40,6 +40,9 @@ REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"
 REDIS_KEY_AUTOPILOT = "system:autopilot"
 # Redis key: when set, no alerts/notifications sent to Telegram (platform keeps working)
 REDIS_KEY_MUTED = "system:muted"
+# Last balance check (for "balance" command diff)
+REDIS_KEY_BALANCE_LAST_USDT = "system:balance_last_usdt"
+REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
 
 # Keys we never delete on "clear redis" (system settings)
 REDIS_SYSTEM_KEYS = frozenset({
@@ -57,6 +60,8 @@ REDIS_DATA_KEYS = [
     "trade_commands",
     "active_trades",
     "notifications",
+    REDIS_KEY_BALANCE_LAST_USDT,
+    REDIS_KEY_BALANCE_LAST_CHECK,
 ]
 REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
@@ -75,6 +80,7 @@ HELP_MESSAGE = """🛠 Commands (send exactly as below):
 • clear redis — Clear all Redis data (queues, cache). Keeps system settings (stop/start, autopilot, mute, etc.).
 • status — Show pipeline (paused/running), WAIT setting, autopilot, and mute.
 • orders — List current open orders from the database.
+• balance — Current USDT balance from DB; shows change since last check.
 • help — Show this message."""
 
 def _ts():
@@ -152,6 +158,45 @@ class Messenger:
                 f"TP: {o['tp_price']} | SL: {o['sl_price']} | {opened}"
             )
         await self._safe_reply(update, "\n".join(lines))
+
+    async def _reply_balance(self, update) -> None:
+        """Reply with current USDT balance from DB and delta since last check (stored in Redis)."""
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                current = shared_db.get_balance(conn, "USDT")
+        except Exception as e:
+            await self._safe_reply(update, f"❌ Could not read balance: {e}")
+            return
+        now_iso = datetime.utcnow().isoformat() + "Z"
+        now_short = (now_iso[:19].replace("T", " ") + " UTC")
+        last_str = self.db.get(REDIS_KEY_BALANCE_LAST_USDT)
+        last_check = self.db.get(REDIS_KEY_BALANCE_LAST_CHECK)
+        if last_str is not None and last_check is not None:
+            try:
+                last = float(last_str)
+                delta = current - last
+                if delta > 0:
+                    change_emoji = "📈"
+                    change_text = f"+{delta:.2f} USDT since last check"
+                elif delta < 0:
+                    change_emoji = "📉"
+                    change_text = f"{delta:.2f} USDT since last check"
+                else:
+                    change_emoji = "➡️"
+                    change_text = "No change since last check"
+                diff_line = f"{change_emoji} {change_text}\nLast check: {last_check[:19].replace('T', ' ')} UTC"
+            except (ValueError, TypeError):
+                diff_line = f"Last check: —"
+        else:
+            diff_line = "First check — no previous balance to compare."
+        self.db.set(REDIS_KEY_BALANCE_LAST_USDT, f"{current:.2f}")
+        self.db.set(REDIS_KEY_BALANCE_LAST_CHECK, now_iso)
+        msg = f"💰 **Balance (USDT)**\n\n`{current:.2f}` USDT\n\n{diff_line}"
+        try:
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except TimedOut as e:
+            print(f"[{_ts()}] Messenger: reply_text timed out (balance state already updated): {e}")
 
     def _clear_redis_data(self) -> int:
         """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
@@ -245,6 +290,8 @@ class Messenger:
             )
         elif text == "orders":
             await self._reply_orders(update)
+        elif text == "balance":
+            await self._reply_balance(update)
         elif text == "help":
             await self._safe_reply(update, HELP_MESSAGE)
 
