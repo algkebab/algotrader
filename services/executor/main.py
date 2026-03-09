@@ -45,6 +45,8 @@ class Executor:
         # Default strategy settings
         self.tp_percent = 1.05  # +5%
         self.sl_percent = 0.98  # -2%
+        # Paper trading only: simulated leverage (notional = margin * this)
+        self.paper_leverage = 3
 
     def get_precision_amount(self, symbol, amount):
         """Adjusts the coin amount to the exchange's required precision."""
@@ -153,14 +155,17 @@ class Executor:
             return {"status": "error", "message": str(e)}
 
     def _place_paper_order(self, symbol, amount_usdt=10):
-        """Write order to DB only; no exchange, no Redis active_trades."""
+        """Write order to DB only; no exchange, no Redis active_trades. Uses paper_leverage (e.g. 3x) for notional."""
         try:
             # Public ticker for entry/tp/sl (no account interaction)
             ticker = self.exchange.fetch_ticker(symbol)
             entry_price = float(ticker['last'])
+            # Same TP/SL proportions as live: +5% / -2% price levels
             tp_price = self.get_precision_price(symbol, entry_price * self.tp_percent)
             sl_price = self.get_precision_price(symbol, entry_price * self.sl_percent)
-            raw_qty = amount_usdt / entry_price
+            # Paper leverage: notional = margin * leverage (e.g. 10 USDT margin -> 30 USDT position)
+            effective_notional_usdt = amount_usdt * self.paper_leverage
+            raw_qty = effective_notional_usdt / entry_price
             qty = self.get_precision_amount(symbol, raw_qty)
             final_amount_usdt = float(qty) * entry_price
 
@@ -188,7 +193,7 @@ class Executor:
                 "timestamp": time.time()
             }
             self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
-            print(f"[{_ts()}] ✅ Paper order written to DB (id={order_id})")
+            print(f"[{_ts()}] ✅ Paper order written to DB (id={order_id}, {self.paper_leverage}x leverage)")
             return result
         except Exception as e:
             print(f"[{_ts()}] ❌ Paper order error: {e}")
