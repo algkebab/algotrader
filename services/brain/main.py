@@ -2,12 +2,21 @@
 import asyncio
 import json
 import os
+import sys
 import time
 from datetime import datetime
 
 import redis
 from dotenv import load_dotenv
 from openai import OpenAI
+
+# Allow importing shared.db (project root or /app in Docker)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) == "brain" else _this_dir
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from shared import db as shared_db
 
 load_dotenv()
 
@@ -97,6 +106,17 @@ class Brain:
             for item in candidates:
                 symbol = item['symbol']
                 current_price = item['last_price']
+
+                # Skip if we already have an open order for this symbol
+                try:
+                    with shared_db.get_connection() as conn:
+                        shared_db.init_schema(conn)
+                        if shared_db.get_open_order_id_for_symbol(conn, symbol) is not None:
+                            print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (already have open order)")
+                            continue
+                except Exception as e:
+                    print(f"[{_ts()}] 🧠 Brain: DB check failed for {symbol}: {e}")
+                    # Proceed with analysis if DB check fails
                 
                 # --- SMART CACHE START ---
                 if not self.should_analyze(symbol, current_price):
