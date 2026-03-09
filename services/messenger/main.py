@@ -38,6 +38,27 @@ REDIS_KEY_TRADING_PAUSED = "system:trading_paused"
 REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"
 # Redis key: when set, BUY verdicts trigger automatic order (no Buy button on signals)
 REDIS_KEY_AUTOPILOT = "system:autopilot"
+# Redis key: when set, no alerts/notifications sent to Telegram (platform keeps working)
+REDIS_KEY_MUTED = "system:muted"
+
+# Keys we never delete on "clear redis" (system settings)
+REDIS_SYSTEM_KEYS = frozenset({
+    REDIS_KEY_TRADING_PAUSED,
+    REDIS_KEY_SUPPRESS_WAIT_SIGNALS,
+    REDIS_KEY_AUTOPILOT,
+    REDIS_KEY_MUTED,
+})
+
+# Data keys and patterns to clear on "clear redis" (excludes REDIS_SYSTEM_KEYS)
+REDIS_DATA_KEYS = [
+    "market_data",
+    "filtered_candidates",
+    "signals",
+    "trade_commands",
+    "active_trades",
+    "notifications",
+]
+REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
 AUTOPILOT_ORDER_AMOUNT_USDT = 10
 
@@ -49,7 +70,10 @@ HELP_MESSAGE = """🛠 Commands (send exactly as below):
 • autopilot off — Stop auto orders; Buy button is shown again on BUY signals.
 • stop wait — Only BUY signals sent; WAIT verdicts are not sent.
 • start wait — Send both BUY and WAIT signals again.
-• status — Show pipeline (paused/running), WAIT setting, and autopilot.
+• mute — Stop sending all alerts and notifications to Telegram (platform keeps running).
+• unmute — Resume sending alerts and notifications.
+• clear redis — Clear all Redis data (queues, cache). Keeps system settings (stop/start, autopilot, mute, etc.).
+• status — Show pipeline (paused/running), WAIT setting, autopilot, and mute.
 • orders — List current open orders from the database.
 • help — Show this message."""
 
@@ -129,6 +153,17 @@ class Messenger:
             )
         await self._safe_reply(update, "\n".join(lines))
 
+    def _clear_redis_data(self) -> int:
+        """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
+        deleted = 0
+        for key in REDIS_DATA_KEYS:
+            deleted += self.db.delete(key)
+        for pattern in REDIS_DATA_PATTERNS:
+            for key in self.db.scan_iter(match=pattern):
+                if key not in REDIS_SYSTEM_KEYS:
+                    deleted += self.db.delete(key)
+        return deleted
+
     async def handle_text(self, update, context):
         """Handle stop / start / status commands from Telegram."""
         if not self._is_allowed_chat(update.effective_chat.id):
@@ -161,14 +196,36 @@ class Messenger:
                 update,
                 "🔔 WAIT verdicts enabled.\n\nBoth BUY and WAIT signals will be sent to Telegram.",
             )
+        elif text == "mute":
+            self.db.set(REDIS_KEY_MUTED, "1")
+            print(f"[{_ts()}] Messenger: Telegram muted (no alerts/notifications sent)")
+            await self._safe_reply(
+                update,
+                "🔇 Muted.\n\nNo alerts or notifications will be sent to Telegram until you send \"unmute\". "
+                "Platform keeps running (signals, autopilot, executor unchanged).",
+            )
+        elif text == "unmute":
+            self.db.delete(REDIS_KEY_MUTED)
+            print(f"[{_ts()}] Messenger: Telegram unmuted (alerts/notifications enabled)")
+            await self._safe_reply(update, "🔔 Unmuted. Alerts and notifications are enabled again.")
+        elif text == "clear redis":
+            try:
+                n = self._clear_redis_data()
+                print(f"[{_ts()}] Messenger: Redis data cleared ({n} keys deleted), system settings kept")
+                await self._safe_reply(update, f"🧹 Redis cleared ({n} keys deleted). System settings (stop/start, autopilot, mute, etc.) kept.")
+            except Exception as e:
+                print(f"[{_ts()}] Messenger: clear redis failed: {e}")
+                await self._safe_reply(update, f"❌ Clear Redis failed: {e}")
         elif text == "status":
             paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
             suppress_wait = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
             autopilot = self.db.get(REDIS_KEY_AUTOPILOT)
+            muted = self.db.get(REDIS_KEY_MUTED)
             parts = []
             parts.append("Pipeline: paused (send \"start\" to resume)." if paused else "Pipeline: running.")
             parts.append("Autopilot: ON (auto orders on BUY, no button)." if autopilot else "Autopilot: OFF (Buy button on signals).")
             parts.append("WAIT signals: suppressed (only BUY sent). Send \"start wait\" to enable." if suppress_wait else "WAIT signals: sent (BUY + WAIT). Send \"stop wait\" to suppress.")
+            parts.append("Telegram: muted (no alerts/notifications). Send \"unmute\" to enable." if muted else "Telegram: unmuted (alerts/notifications sent).")
             await self._safe_reply(update, "📊 Status:\n\n" + "\n".join(parts))
         elif text == "autopilot on":
             self.db.set(REDIS_KEY_AUTOPILOT, "1")
@@ -216,7 +273,10 @@ class Messenger:
                 print(f"[{_ts()}] Messenger: edit_message_text error: {e}")
 
     async def send_telegram_msg(self, text, symbol=None, keyboard=None):
-        """Helper to send Markdown messages with optional keyboards. Retries on timeout."""
+        """Helper to send Markdown messages with optional keyboards. Retries on timeout.
+        When system:muted is set, no message is sent (platform keeps working)."""
+        if self.db.get(REDIS_KEY_MUTED):
+            return
         last_error = None
         for attempt in range(SEND_MESSAGE_RETRIES + 1):
             try:

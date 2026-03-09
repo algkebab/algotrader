@@ -15,7 +15,7 @@ Microservices-based algorithmic trading system.
 | **filter**      | Liquidity and trash filtering; keeps only tradeable instruments. |
 | **brain**       | Strategy execution and GPT-backed analysis and signals. |
 | **risk-manager**| Capital protection, position sizing, and risk limits. |
-| **messenger**   | Telegram: **stop** / **start**; **autopilot on** / **autopilot off**; **stop wait** / **start wait**; **status**; **orders**; **help**. |
+| **messenger**   | Telegram: **stop** / **start**; **autopilot on** / **autopilot off**; **stop wait** / **start wait**; **mute** / **unmute**; **clear redis**; **status**; **orders**; **help**. |
 | **executor**    | Trade execution on the exchange (place/cancel orders). |
 
 ## Quick start

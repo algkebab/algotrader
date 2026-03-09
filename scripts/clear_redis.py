@@ -8,23 +8,30 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 from _redis import get_redis
 
-ALGOTRADER_KEYS = [
+# Data keys to clear (system settings are never deleted by --algotrader-only)
+ALGOTRADER_DATA_KEYS = [
     "market_data",
     "filtered_candidates",
     "signals",
     "trade_commands",
     "active_trades",
     "notifications",
+]
+SYSTEM_KEYS = frozenset({
     "system:trading_paused",
     "system:suppress_wait_signals",
     "system:autopilot",
-]
+    "system:muted",
+})
 PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
 
-def delete_pattern(db, pattern):
+def delete_pattern(db, pattern, skip_keys=None):
+    skip_keys = skip_keys or frozenset()
     count = 0
     for key in db.scan_iter(match=pattern):
+        if key in skip_keys:
+            continue
         db.delete(key)
         count += 1
     return count
@@ -59,23 +66,24 @@ def main():
 
     deleted = 0
     if args.dry_run:
-        for key in ALGOTRADER_KEYS:
+        for key in ALGOTRADER_DATA_KEYS:
             if db.exists(key):
                 print(f"Would delete: {key}")
                 deleted += 1
         for pattern in PATTERNS:
             for key in db.scan_iter(match=pattern):
-                print(f"Would delete: {key}")
-                deleted += 1
-        print(f"Would delete {deleted} key(s).")
+                if key not in SYSTEM_KEYS:
+                    print(f"Would delete: {key}")
+                    deleted += 1
+        print(f"Would delete {deleted} key(s). System settings (e.g. {', '.join(SYSTEM_KEYS)}) are kept.")
         return
 
-    for key in ALGOTRADER_KEYS:
+    for key in ALGOTRADER_DATA_KEYS:
         if db.delete(key):
             deleted += 1
             print(f"Deleted: {key}")
     for pattern in PATTERNS:
-        n = delete_pattern(db, pattern)
+        n = delete_pattern(db, pattern, skip_keys=SYSTEM_KEYS)
         deleted += n
         if n:
             print(f"Deleted {n} key(s) matching {pattern}")
