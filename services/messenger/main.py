@@ -6,6 +6,7 @@ import redis
 import time
 from datetime import datetime
 
+import ccxt
 from dotenv import load_dotenv
 
 # Allow importing shared.db (project root or /app in Docker)
@@ -137,6 +138,9 @@ class Messenger:
         self.bot = Bot(token=self.bot_token, request=self._request_bot)
         print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id}, timeouts={TELEGRAM_READ_TIMEOUT}s)")
 
+        # Exchange for current price (orders command); public API only
+        self.exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+
         self.application = (
             Application.builder()
             .token(self.bot_token)
@@ -173,9 +177,17 @@ class Messenger:
         lines = [f"📋 Open orders ({len(rows)})", ""]
         for i, o in enumerate(rows, 1):
             opened = (o.get("opened_at") or "")[:19].replace("T", " ")
+            symbol = o["symbol"]
+            try:
+                ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
+                now_price = ticker.get("last")
+                now_str = f"{float(now_price):.4g}" if now_price is not None else "—"
+            except Exception:
+                now_str = "—"
             lines.append(
-                f"{i}. {o['symbol']}\n"
+                f"{i}. {symbol}\n"
                 f"   💵 Entry: {o['entry_price']} · Qty: {o['quantity']}\n"
+                f"   📈 Now: {now_str}\n"
                 f"   🎯 TP: {o['tp_price']} · 🛑 SL: {o['sl_price']}\n"
                 f"   📅 {opened}"
             )
