@@ -1,12 +1,21 @@
-import redis
 import json
 import os
-import ccxt
+import sys
 import time
+import redis
+import ccxt
 from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Allow importing shared.db (project root or /app in Docker)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) in ("executor", "monitor") else _this_dir
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from shared import db as shared_db
 
 def _ts():
     """Returns current timestamp for logging."""
@@ -23,30 +32,36 @@ class Executor:
             'apiKey': os.getenv('BINANCE_API_KEY'),
             'secret': os.getenv('BINANCE_SECRET'),
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'} # Працюємо тільки на споті
+            'options': {'defaultType': 'spot'} 
         })
         
-        # 3. Активація Sandbox (для Testnet Bybit)
+        # 3. Активація Sandbox (Binance Spot Testnet)
         if os.getenv('IS_TESTNET', 'true').lower() == 'true':
             self.exchange.set_sandbox_mode(True)
-            print(f"[{_ts()}] ⚠️ EXECUTOR: Running in BYBIT TESTNET mode")
+            print(f"[{_ts()}] ⚠️ EXECUTOR: Running in BINANCE SPOT TESTNET mode")
+        else:
+            print(f"[{_ts()}] ⚡ EXECUTOR: Running in BINANCE REAL SPOT mode")
         
         # Default strategy settings
         self.tp_percent = 1.05  # +5%
         self.sl_percent = 0.98  # -2%
 
     def get_precision_amount(self, symbol, amount):
+        """Adjusts the coin amount to the exchange's required precision."""
+        self.exchange.load_markets()
         return float(self.exchange.amount_to_precision(symbol, amount))
 
     def get_precision_price(self, symbol, price):
+        """Adjusts the price to the exchange's required precision."""
+        self.exchange.load_markets()
         return float(self.exchange.price_to_precision(symbol, price))
 
     def get_free_usdt_balance(self):
-        """Checks available USDT balance on Bybit Spot."""
+        """Checks available USDT balance on Binance Spot account."""
         try:
             balance = self.exchange.fetch_balance()
-            # У Bybit Spot баланс лежить у 'total' або 'free'
-            return float(balance['total'].get('USDT', 0))
+            # На Binance використовуємо balance['free']
+            return float(balance['free'].get('USDT', 0))
         except Exception as e:
             print(f"[{_ts()}] ❌ Error fetching balance: {e}")
             return 0.0
@@ -57,7 +72,7 @@ class Executor:
 
     def place_smart_order(self, symbol, amount_usdt=10, risk_percent=0.02):
         """
-        Executes a real market buy on Bybit Spot and saves data for Monitor.
+        Executes a market buy on Binance Spot and saves data for Monitor.
         """
         try:
             print(f"[{_ts()}] 🛒 Executor: Processing order for {symbol}")
@@ -70,16 +85,15 @@ class Executor:
             total_usdt = self.get_free_usdt_balance()
             print(f"[{_ts()}] 💰 Current Balance: {total_usdt} USDT")
             
-            # Розрахунок суми (мінімум 10 USDT для біржі)
-            calc_amount = max(total_usdt * risk_percent, 10.1) # 10.1 щоб бути впевненим
+            # Binance minimum is usually 10 USDT
+            calc_amount = max(total_usdt * risk_percent, 10.5) 
             
             if total_usdt < 10:
-                 return {"status": "error", "msg": "Insufficient funds on Bybit"}
+                 return {"status": "error", "msg": "Insufficient funds on Binance"}
             
             final_amount_usdt = min(calc_amount, total_usdt)
 
             # 2. Market Data
-            self.exchange.load_markets()
             ticker = self.exchange.fetch_ticker(symbol)
             entry_price = ticker['last']
             
@@ -90,26 +104,28 @@ class Executor:
             raw_qty = final_amount_usdt / entry_price
             qty = self.get_precision_amount(symbol, raw_qty)
 
-            # --- EXECUTION ON BYBIT ---
+            # --- EXECUTION ON BINANCE ---
             print(f"[{_ts()}] 🚀 SENDING MARKET BUY: {qty} {symbol}")
             
-            # Справжній ордер на біржу
+            # Create real market buy order
             order = self.exchange.create_market_buy_order(symbol, qty)
-            print(f"[{_ts()}] ✅ Order executed! ID: {order.get('id')}")
-
+            
             # 4. Prepare Trade Object for Monitor
+            # Use actual price from the order if possible, else ticker price
+            actual_entry = order.get('average', entry_price)
+
             result = {
                 "status": "success",
                 "order_id": order.get('id'),
                 "symbol": symbol,
-                "entry": float(entry_price),
+                "entry": float(actual_entry),
                 "qty": float(qty),
                 "tp": float(tp_price),
                 "sl": float(sl_price),
                 "timestamp": time.time()
             }
             
-            # 5. Save to Redis for Monitor (Monitor will now close the trade on Bybit)
+            # 5. Save to Redis for Monitor
             self.db.hset('active_trades', symbol, json.dumps(result))
             
             # 6. Notify Messenger
@@ -117,15 +133,35 @@ class Executor:
                 "type": "trade_confirmed",
                 "data": result
             }))
-            
+
+            # 7. Persist order and balance to SQLite
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    shared_db.insert_order(
+                        conn,
+                        symbol=symbol,
+                        side="buy",
+                        amount_usdt=final_amount_usdt,
+                        entry_price=float(actual_entry),
+                        quantity=float(qty),
+                        tp_price=float(tp_price),
+                        sl_price=float(sl_price),
+                        exchange_order_id=str(order["id"]) if order.get("id") else None,
+                    )
+                    shared_db.sync_balance_from_exchange(conn, self.exchange)
+            except Exception as db_err:
+                print(f"[{_ts()}] ⚠️ DB write failed (order still on exchange): {db_err}")
+
+            print(f"[{_ts()}] ✅ Order confirmed on Binance! ID: {order.get('id')}")
             return result
 
         except Exception as e:
-            print(f"[{_ts()}] ❌ Bybit Order Error: {e}")
+            print(f"[{_ts()}] ❌ Binance Order Error: {e}")
             return {"status": "error", "message": str(e)}
 
     def run(self):
-        print(f"[{_ts()}] ⚡ Executor: Waiting for signals from Redis...")
+        print(f"[{_ts()}] ⚡ Executor: Waiting for trade commands from Redis...")
         while True:
             command_data = self.db.blpop('trade_commands', timeout=10)
             if command_data:

@@ -15,7 +15,7 @@ Microservices-based algorithmic trading system.
 | **filter**      | Liquidity and trash filtering; keeps only tradeable instruments. |
 | **brain**       | Strategy execution and GPT-backed analysis and signals. |
 | **risk-manager**| Capital protection, position sizing, and risk limits. |
-| **messenger**   | Telegram bot interface for alerts and commands. Send **stop** to pause Filter & Brain (no AI cost); **start** to resume; **status** to check. |
+| **messenger**   | Telegram: **stop** / **start**; **stop wait** / **start wait**; **status**; **orders**; **help** (list all commands). |
 | **executor**    | Trade execution on the exchange (place/cancel orders). |
 
 ## Quick start
@@ -78,6 +78,10 @@ algotrader/
 ```
 
 Each service has its own `main.py`, `requirements.txt`, and `Dockerfile`.
+
+### Orders and balance (SQLite)
+
+Executor and Monitor persist **orders** (trades) and **balance** in a SQLite database so you keep a history of placed orders and current balance. The DB file is shared via the `trading_data` volume (Docker) or `DATABASE_PATH` (default `./data/algotrader.db` locally). Tables: `orders` (open/closed with PnL), `balance` (e.g. USDT). Balance is synced from the exchange when placing an order and updated when a position is closed.
 
 ## Local development
 

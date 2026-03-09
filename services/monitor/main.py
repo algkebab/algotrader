@@ -1,9 +1,19 @@
-import redis
 import json
 import os
-import ccxt
+import sys
 import time
+import redis
+import ccxt
 from datetime import datetime
+
+# Allow importing shared.db
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) in ("executor", "monitor") else _this_dir
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from shared import db as shared_db
+
 
 def _ts():
     return datetime.utcnow().strftime("%H:%M:%S")
@@ -135,6 +145,23 @@ class Monitor:
         
         self.db.rpush('notifications', json.dumps(notification))
         self.db.hdel('active_trades', symbol)
+
+        # Persist closed order and update balance in SQLite
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                order_id = shared_db.get_open_order_id_for_symbol(conn, symbol)
+                if order_id is not None:
+                    shared_db.update_order_closed(
+                        conn, order_id,
+                        pnl_usdt=round(pnl_usdt, 2),
+                        pnl_percent=round(pnl_percent, 2),
+                        close_reason=reason,
+                    )
+                    bal = shared_db.get_balance(conn, "USDT")
+                    shared_db.set_balance(conn, "USDT", bal + pnl_usdt)
+        except Exception as db_err:
+            print(f"[{_ts()}] ⚠️ DB update failed (trade still closed in Redis): {db_err}")
 
 if __name__ == "__main__":
     monitor = Monitor()

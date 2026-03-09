@@ -26,12 +26,12 @@ class Scout:
         self.db.ping()
         print(f"[{_ts()}] Scout: Connected to Redis at {redis_host}:6379")
         print(f"[{_ts()}] Scout: Redis ping OK")
+        # Public API only (no keys). Tickers/OHLCV are public; keys trigger signed requests
+        # and -1021 "Timestamp outside recvWindow" when container clock drifts.
         self.exchange = ccxt.binance({
-            'apiKey': os.getenv('BINANCE_API_KEY'),
-            'secret': os.getenv('BINANCE_SECRET'),
             'enableRateLimit': True,
         })
-        print(f"[{_ts()}] Scout: Binance client initialized (rate limit enabled)")
+        print(f"[{_ts()}] Scout: Binance client initialized (public API, rate limit enabled)")
         self.max_symbols = 30
         print(f"[{_ts()}] Scout: max_symbols={self.max_symbols}")
 

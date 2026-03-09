@@ -1,11 +1,20 @@
 import asyncio
 import json
 import os
+import sys
 import redis
 import time
 from datetime import datetime
 
 from dotenv import load_dotenv
+
+# Allow importing shared.db (project root or /app in Docker)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) == "messenger" else _this_dir
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from shared import db as shared_db
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TimedOut
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
@@ -17,12 +26,26 @@ load_dotenv()
 TELEGRAM_READ_TIMEOUT = 30.0
 TELEGRAM_WRITE_TIMEOUT = 30.0
 TELEGRAM_CONNECT_TIMEOUT = 30.0
-TELEGRAM_POOL_TIMEOUT = 10.0
+TELEGRAM_POOL_TIMEOUT = 15.0
+# Pool size > 1 so polling + reply_text + send_telegram_msg can run without Pool timeout
+TELEGRAM_CONNECTION_POOL_SIZE = 8
 SEND_MESSAGE_RETRIES = 2
 SEND_MESSAGE_RETRY_DELAY = 2.0
 
 # Redis key: when set, Filter and Brain skip work (pause pipeline)
 REDIS_KEY_TRADING_PAUSED = "system:trading_paused"
+# Redis key: when set, don't send Telegram alerts for AI verdict WAIT (only BUY signals sent)
+REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"
+
+HELP_MESSAGE = """🛠 Commands (send exactly as below):
+
+• stop — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
+• start — Resume Filter & Brain.
+• stop wait — Only BUY signals sent; WAIT verdicts are not sent.
+• start wait — Send both BUY and WAIT signals again.
+• status — Show pipeline (paused/running) and WAIT setting.
+• orders — List current open orders from the database.
+• help — Show this message."""
 
 def _ts():
     """Returns current UTC timestamp for logging."""
@@ -43,21 +66,26 @@ class Messenger:
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in environment variables")
 
-        # Shared request with longer timeouts (Bot.send_message and Application both use it)
-        self._request = HTTPXRequest(
+        # Two separate HTTPXRequest instances: Application must not share with Bot.
+        # "async with self.bot" in send_telegram_msg calls request.shutdown() on exit, which would
+        # break polling if we shared one request → "This HTTPXRequest is not initialized!".
+        _req_opts = dict(
+            connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
             connect_timeout=TELEGRAM_CONNECT_TIMEOUT,
             read_timeout=TELEGRAM_READ_TIMEOUT,
             write_timeout=TELEGRAM_WRITE_TIMEOUT,
             pool_timeout=TELEGRAM_POOL_TIMEOUT,
         )
-        self.bot = Bot(token=self.bot_token, request=self._request)
+        self._request_app = HTTPXRequest(**_req_opts)
+        self._request_bot = HTTPXRequest(**_req_opts)
+        self.bot = Bot(token=self.bot_token, request=self._request_bot)
         print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id}, timeouts={TELEGRAM_READ_TIMEOUT}s)")
 
         self.application = (
             Application.builder()
             .token(self.bot_token)
-            .request(self._request)
-            .get_updates_request(self._request)
+            .request(self._request_app)
+            .get_updates_request(self._request_app)
             .build()
         )
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
@@ -67,6 +95,34 @@ class Messenger:
         """Only the configured chat can send stop/start/status."""
         return str(chat_id) == str(self.chat_id)
 
+    async def _safe_reply(self, update, text: str) -> None:
+        """Reply to the user; log and continue on timeout so handler doesn't crash."""
+        try:
+            await update.message.reply_text(text)
+        except TimedOut as e:
+            print(f"[{_ts()}] Messenger: reply_text timed out (state already updated): {e}")
+
+    async def _reply_orders(self, update) -> None:
+        """Reply with list of current (open) orders from SQLite."""
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                rows = shared_db.get_open_orders(conn)
+        except Exception as e:
+            await self._safe_reply(update, f"❌ Could not read orders: {e}")
+            return
+        if not rows:
+            await self._safe_reply(update, "📋 No open orders.")
+            return
+        lines = [f"📋 Open orders ({len(rows)})\n"]
+        for i, o in enumerate(rows, 1):
+            opened = (o.get("opened_at") or "")[:19].replace("T", " ")
+            lines.append(
+                f"{i}. {o['symbol']} | Entry: {o['entry_price']} | Qty: {o['quantity']} | "
+                f"TP: {o['tp_price']} | SL: {o['sl_price']} | {opened}"
+            )
+        await self._safe_reply(update, "\n".join(lines))
+
     async def handle_text(self, update, context):
         """Handle stop / start / status commands from Telegram."""
         if not self._is_allowed_chat(update.effective_chat.id):
@@ -75,20 +131,41 @@ class Messenger:
         if text == "stop":
             self.db.set(REDIS_KEY_TRADING_PAUSED, "1")
             print(f"[{_ts()}] Messenger: Pipeline PAUSED (Filter & Brain stopped)")
-            await update.message.reply_text(
+            await self._safe_reply(
+                update,
                 "⏸️ Trading pipeline paused.\n\nFilter and Brain stopped (no filtering, no AI). "
-                "Scout, Executor, Monitor still running. Send \"start\" to resume."
+                "Scout, Executor, Monitor still running. Send \"start\" to resume.",
             )
         elif text == "start":
             self.db.delete(REDIS_KEY_TRADING_PAUSED)
             print(f"[{_ts()}] Messenger: Pipeline RESUMED (Filter & Brain running)")
-            await update.message.reply_text("▶️ Trading pipeline resumed. Filter and Brain are running.")
+            await self._safe_reply(update, "▶️ Trading pipeline resumed. Filter and Brain are running.")
+        elif text == "stop wait":
+            self.db.set(REDIS_KEY_SUPPRESS_WAIT_SIGNALS, "1")
+            print(f"[{_ts()}] Messenger: WAIT signals disabled (only BUY alerts will be sent)")
+            await self._safe_reply(
+                update,
+                "🔇 WAIT verdicts disabled.\n\nOnly BUY signals will be sent to Telegram. "
+                "WAIT verdicts are skipped. Send \"start wait\" to send WAIT signals again.",
+            )
+        elif text == "start wait":
+            self.db.delete(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
+            print(f"[{_ts()}] Messenger: WAIT signals enabled (BUY and WAIT alerts sent)")
+            await self._safe_reply(
+                update,
+                "🔔 WAIT verdicts enabled.\n\nBoth BUY and WAIT signals will be sent to Telegram.",
+            )
         elif text == "status":
             paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
-            if paused:
-                await update.message.reply_text("📊 Status: Pipeline **paused** (Filter & Brain stopped). Send \"start\" to resume.")
-            else:
-                await update.message.reply_text("📊 Status: Pipeline **running**.")
+            suppress_wait = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
+            parts = []
+            parts.append("Pipeline: paused (send \"start\" to resume)." if paused else "Pipeline: running.")
+            parts.append("WAIT signals: suppressed (only BUY sent). Send \"start wait\" to enable." if suppress_wait else "WAIT signals: sent (BUY + WAIT). Send \"stop wait\" to suppress.")
+            await self._safe_reply(update, "📊 Status:\n\n" + "\n".join(parts))
+        elif text == "orders":
+            await self._reply_orders(update)
+        elif text == "help":
+            await self._safe_reply(update, HELP_MESSAGE)
 
     async def handle_callback(self, update, context):
         """Handles button clicks (Buy commands) from Telegram UI."""
@@ -220,6 +297,10 @@ class Messenger:
 
                     # AI Verdict handling
                     verdict = data.get('verdict', 'WAIT')
+                    if verdict == "WAIT" and self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS):
+                        print(f"[{_ts()}] Messenger: Skipped WAIT signal for {symbol} (suppress enabled)")
+                        continue
+
                     emoji = "🚀" if verdict == "BUY" else "⚠️"
                     
                     message = (
