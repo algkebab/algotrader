@@ -71,24 +71,37 @@ REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 AUTOPILOT_ORDER_AMOUNT_USDT = 10
 AUTOPILOT_MAX_OPEN_ORDERS = 10
 
-HELP_MESSAGE = """🛠 Commands (send exactly as below):
+HELP_MESSAGE = """🛠 *Algotrader — Commands*
 
-• stop — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
-• start — Resume Filter & Brain.
-• autopilot on — Auto-place orders on BUY verdicts (max 10 open); no Buy button on signals; also resumes pipeline if paused.
-• autopilot off — Stop auto orders; Buy button is shown again on BUY signals.
-• stop wait — Only BUY signals sent; WAIT verdicts are not sent.
-• start wait — Send both BUY and WAIT signals again.
-• mute — Stop sending all alerts and notifications to Telegram (platform keeps running).
-• unmute — Resume sending alerts and notifications.
-• clear redis — Clear all Redis data (queues, cache). Keeps system settings (stop/start, autopilot, mute, etc.).
-• papertrading on — No real orders; only write to DB; Monitor uses DB. (Default.)
-• papertrading off — Live trading: real orders on exchange; Monitor uses Redis.
-• status — Show pipeline (paused/running), WAIT setting, autopilot, mute, and paper trading.
-• orders — List current open orders from the database.
-• balance — Current USDT balance from DB; shows change since last check.
-• set balance <amount> — Set USDT balance in DB (e.g. set balance 100.50).
-• help — Show this message."""
+📌 *Pipeline*
+• *stop* — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
+• *start* — Resume Filter & Brain.
+
+🤖 *Autopilot*
+• *autopilot on* — Auto-place orders on BUY (max 10 open). No Buy button. Resumes pipeline if paused.
+• *autopilot off* — Stop auto orders. Buy button shown again on BUY signals.
+
+🔔 *Signals*
+• *stop wait* — Only BUY signals sent; WAIT verdicts hidden.
+• *start wait* — Send both BUY and WAIT signals.
+
+🔇 *Notifications*
+• *mute* — No alerts or notifications sent (platform keeps running).
+• *unmute* — Resume alerts and notifications.
+
+📄 *Paper / Live*
+• *papertrading on* — No real orders; DB only. (Default.)
+• *papertrading off* — Live trading on exchange.
+
+🧹 *Data*
+• *clear redis* — Clear queues and cache. Keeps system settings.
+
+📊 *Info*
+• *status* — Pipeline, autopilot, mute, paper trading.
+• *orders* — List open orders from DB.
+• *balance* — Current USDT balance and change since last check.
+• *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
+• *help* — This message."""
 
 def _ts():
     """Returns current UTC timestamp for logging."""
@@ -152,18 +165,22 @@ class Messenger:
                 shared_db.init_schema(conn)
                 rows = shared_db.get_open_orders(conn)
         except Exception as e:
-            await self._safe_reply(update, f"❌ Could not read orders: {e}")
+            await self._safe_reply(update, f"❌ Could not read orders\n\n{e}")
             return
         if not rows:
-            await self._safe_reply(update, "📋 No open orders.")
+            await self._safe_reply(update, "📋 Open orders\n\nNo open orders.")
             return
-        lines = [f"📋 Open orders ({len(rows)})\n"]
+        lines = [f"📋 Open orders ({len(rows)})", ""]
         for i, o in enumerate(rows, 1):
             opened = (o.get("opened_at") or "")[:19].replace("T", " ")
             lines.append(
-                f"{i}. {o['symbol']} | Entry: {o['entry_price']} | Qty: {o['quantity']} | "
-                f"TP: {o['tp_price']} | SL: {o['sl_price']} | {opened}"
+                f"{i}. {o['symbol']}\n"
+                f"   💵 Entry: {o['entry_price']} · Qty: {o['quantity']}\n"
+                f"   🎯 TP: {o['tp_price']} · 🛑 SL: {o['sl_price']}\n"
+                f"   📅 {opened}"
             )
+            if i < len(rows):
+                lines.append("")
         await self._safe_reply(update, "\n".join(lines))
 
     def _get_open_order_count(self) -> int:
@@ -208,7 +225,11 @@ class Messenger:
             diff_line = "First check — no previous balance to compare."
         self.db.set(REDIS_KEY_BALANCE_LAST_USDT, f"{current:.2f}")
         self.db.set(REDIS_KEY_BALANCE_LAST_CHECK, now_iso)
-        msg = f"💰 **Balance (USDT)**\n\n`{current:.2f}` USDT\n\n{diff_line}"
+        msg = (
+            f"💰 *Balance (USDT)*\n\n"
+            f"`{current:.2f}` USDT\n\n"
+            f"_{diff_line}_"
+        )
         try:
             await update.message.reply_text(msg, parse_mode="Markdown")
         except TimedOut as e:
@@ -218,24 +239,30 @@ class Messenger:
         """Set USDT balance in DB. Usage: set balance <amount> (e.g. set balance 100.50)."""
         rest = text[len("set balance "):].strip()
         if not rest:
-            await self._safe_reply(update, "Usage: set balance <amount> (e.g. set balance 100.50)")
+            await self._safe_reply(
+                update,
+                "💵 Set balance\n\nUsage: set balance <amount>\nExample: set balance 100.50",
+            )
             return
         try:
             amount = float(rest)
         except ValueError:
-            await self._safe_reply(update, "Invalid amount. Use a number (e.g. set balance 100.50).")
+            await self._safe_reply(
+                update,
+                "❌ Invalid amount\n\nUse a number, e.g. set balance 100.50",
+            )
             return
         if amount < 0:
-            await self._safe_reply(update, "Amount must be ≥ 0.")
+            await self._safe_reply(update, "❌ Amount must be ≥ 0.")
             return
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
                 shared_db.set_balance(conn, "USDT", amount)
             print(f"[{_ts()}] Messenger: Balance set to {amount:.2f} USDT")
-            await self._safe_reply(update, f"✅ Balance set to `{amount:.2f}` USDT.")
+            await self._safe_reply(update, f"✅ Balance updated\n\n💰 USDT: {amount:.2f}")
         except Exception as e:
-            await self._safe_reply(update, f"❌ Could not set balance: {e}")
+            await self._safe_reply(update, f"❌ Could not set balance\n\n{e}")
 
     def _clear_redis_data(self) -> int:
         """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
@@ -258,62 +285,72 @@ class Messenger:
             print(f"[{_ts()}] Messenger: Pipeline PAUSED (Filter & Brain stopped)")
             await self._safe_reply(
                 update,
-                "⏸️ Trading pipeline paused.\n\nFilter and Brain stopped (no filtering, no AI). "
-                "Scout, Executor, Monitor still running. Send \"start\" to resume.",
+                "⏸️ Pipeline paused\n\n"
+                "Filter & Brain stopped (no filtering, no AI).\n"
+                "Scout, Executor, Monitor still running.\n\n"
+                "👉 Send \"start\" to resume.",
             )
         elif text == "start":
             self.db.delete(REDIS_KEY_TRADING_PAUSED)
             print(f"[{_ts()}] Messenger: Pipeline RESUMED (Filter & Brain running)")
-            await self._safe_reply(update, "▶️ Trading pipeline resumed. Filter and Brain are running.")
+            await self._safe_reply(update, "▶️ Pipeline resumed\n\nFilter and Brain are running.")
         elif text == "stop wait":
             self.db.set(REDIS_KEY_SUPPRESS_WAIT_SIGNALS, "1")
             print(f"[{_ts()}] Messenger: WAIT signals disabled (only BUY alerts will be sent)")
             await self._safe_reply(
                 update,
-                "🔇 WAIT verdicts disabled.\n\nOnly BUY signals will be sent to Telegram. "
-                "WAIT verdicts are skipped. Send \"start wait\" to send WAIT signals again.",
+                "🔇 WAIT verdicts off\n\n"
+                "Only BUY signals will be sent.\n"
+                "👉 Send \"start wait\" to send WAIT again.",
             )
         elif text == "start wait":
             self.db.delete(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
             print(f"[{_ts()}] Messenger: WAIT signals enabled (BUY and WAIT alerts sent)")
             await self._safe_reply(
                 update,
-                "🔔 WAIT verdicts enabled.\n\nBoth BUY and WAIT signals will be sent to Telegram.",
+                "🔔 WAIT verdicts on\n\nBoth BUY and WAIT signals will be sent.",
             )
         elif text == "mute":
             self.db.set(REDIS_KEY_MUTED, "1")
             print(f"[{_ts()}] Messenger: Telegram muted (no alerts/notifications sent)")
             await self._safe_reply(
                 update,
-                "🔇 Muted.\n\nNo alerts or notifications will be sent to Telegram until you send \"unmute\". "
+                "🔇 Muted\n\n"
+                "No alerts or notifications until you send \"unmute\".\n"
                 "Platform keeps running (signals, autopilot, executor unchanged).",
             )
         elif text == "unmute":
             self.db.delete(REDIS_KEY_MUTED)
             print(f"[{_ts()}] Messenger: Telegram unmuted (alerts/notifications enabled)")
-            await self._safe_reply(update, "🔔 Unmuted. Alerts and notifications are enabled again.")
+            await self._safe_reply(update, "🔔 Unmuted\n\nAlerts and notifications are on again.")
         elif text == "clear redis":
             try:
                 n = self._clear_redis_data()
                 print(f"[{_ts()}] Messenger: Redis data cleared ({n} keys deleted), system settings kept")
-                await self._safe_reply(update, f"🧹 Redis cleared ({n} keys deleted). System settings (stop/start, autopilot, mute, etc.) kept.")
+                await self._safe_reply(
+                    update,
+                    f"🧹 Redis cleared\n\n{n} keys deleted.\n"
+                    "System settings (stop/start, autopilot, mute, paper) kept.",
+                )
             except Exception as e:
                 print(f"[{_ts()}] Messenger: clear redis failed: {e}")
-                await self._safe_reply(update, f"❌ Clear Redis failed: {e}")
+                await self._safe_reply(update, f"❌ Clear Redis failed\n\n{e}")
         elif text == "papertrading on":
             self.db.set(REDIS_KEY_PAPERTRADING, "1")
             print(f"[{_ts()}] Messenger: Paper trading ON (no exchange orders, DB only)")
             await self._safe_reply(
                 update,
-                "📄 Paper trading ON.\n\nNo real orders on the exchange. Orders are written to the database only. "
-                "Monitor uses DB open orders. Send \"papertrading off\" for live trading.",
+                "📄 Paper trading on\n\n"
+                "No real orders on exchange. Orders written to DB only.\n"
+                "Monitor uses DB. 👉 Send \"papertrading off\" for live.",
             )
         elif text == "papertrading off":
             self.db.set(REDIS_KEY_PAPERTRADING, "0")
             print(f"[{_ts()}] Messenger: Paper trading OFF (live trading)")
             await self._safe_reply(
                 update,
-                "🔴 Paper trading OFF.\n\nLive trading: real orders on the exchange; Monitor uses Redis active_trades.",
+                "🔴 Paper trading off\n\n"
+                "Live trading: real orders on exchange. Monitor uses Redis.",
             )
         elif text == "status":
             paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
@@ -322,28 +359,33 @@ class Messenger:
             muted = self.db.get(REDIS_KEY_MUTED)
             paper_val = self.db.get(REDIS_KEY_PAPERTRADING)
             paper_on = paper_val != "0"
-            parts = []
-            parts.append("Pipeline: paused (send \"start\" to resume)." if paused else "Pipeline: running.")
-            parts.append("Autopilot: ON (auto orders on BUY, no button)." if autopilot else "Autopilot: OFF (Buy button on signals).")
-            parts.append("WAIT signals: suppressed (only BUY sent). Send \"start wait\" to enable." if suppress_wait else "WAIT signals: sent (BUY + WAIT). Send \"stop wait\" to suppress.")
-            parts.append("Telegram: muted (no alerts/notifications). Send \"unmute\" to enable." if muted else "Telegram: unmuted (alerts/notifications sent).")
-            parts.append("Paper trading: ON (DB only, no exchange)." if paper_on else "Paper trading: OFF (live).")
-            await self._safe_reply(update, "📊 Status:\n\n" + "\n".join(parts))
+            lines = [
+                "📊 Status",
+                "",
+                "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused else "▶️ running"),
+                "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot else "OFF (Buy button on signals)"),
+                "🔔 WAIT signals: " + ("suppressed (only BUY)" if suppress_wait else "on (BUY + WAIT)"),
+                "📱 Telegram: " + ("🔇 muted" if muted else "🔔 unmuted"),
+                "📄 Paper: " + ("ON (DB only)" if paper_on else "OFF (live)"),
+            ]
+            await self._safe_reply(update, "\n".join(lines))
         elif text == "autopilot on":
             self.db.set(REDIS_KEY_AUTOPILOT, "1")
             self.db.delete(REDIS_KEY_TRADING_PAUSED)
             print(f"[{_ts()}] Messenger: Autopilot ON (pipeline resumed if was paused)")
             await self._safe_reply(
                 update,
-                "🤖 Autopilot ON.\n\nBUY verdicts will place orders automatically (10 USDT). "
-                "No Buy button on signals. Pipeline resumed if it was paused.",
+                "🤖 Autopilot on\n\n"
+                "BUY verdicts → auto orders (10 USDT). No Buy button.\n"
+                "Pipeline resumed if it was paused.",
             )
         elif text == "autopilot off":
             self.db.delete(REDIS_KEY_AUTOPILOT)
             print(f"[{_ts()}] Messenger: Autopilot OFF (Buy button restored on signals)")
             await self._safe_reply(
                 update,
-                "🛑 Autopilot OFF.\n\nNo automatic orders. Buy button is shown again on BUY signals.",
+                "🛑 Autopilot off\n\n"
+                "No auto orders. Buy button shown again on BUY signals.",
             )
         elif text == "orders":
             await self._reply_orders(update)
@@ -352,7 +394,10 @@ class Messenger:
         elif text.startswith("set balance "):
             await self._handle_set_balance(update, text)
         elif text == "help":
-            await self._safe_reply(update, HELP_MESSAGE)
+            try:
+                await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
+            except TimedOut as e:
+                print(f"[{_ts()}] Messenger: reply_text timed out (help): {e}")
 
     async def handle_callback(self, update, context):
         """Handles button clicks (Buy commands) from Telegram UI."""
@@ -372,7 +417,7 @@ class Messenger:
             print(f"[{_ts()}] Messenger: Pushed trade_command to Redis: {symbol}")
             try:
                 await query.edit_message_text(
-                    text=f"{query.message.text}\n\n⏳ **Command sent to Executor...**",
+                    text=f"{query.message.text}\n\n✅ _Command sent to Executor_",
                     parse_mode="Markdown",
                 )
             except Exception as e:
@@ -416,42 +461,30 @@ class Messenger:
                 _, payload = notification
                 note = json.loads(payload)
 
-                if note['type'] == 'trade_closed':
-                    d = note['data']
-                    msg = (
-                        f"🏁 **TRADE CLOSED**\n"
-                        f"Asset: {d['symbol']}\n"
-                        f"Result: `{d['pnl_usdt']} USDT` ({d['pnl_percent']}%)\n"
-                        f"Reason: {d['reason']}"
-                    )
-                    await self.send_telegram_msg(msg)
-                
                 if note['type'] == 'trade_confirmed':
                     d = note['data']
                     msg = (
-                        f"✅ **TRADE EXECUTED**\n\n"
+                        f"✅ *Trade opened*\n\n"
+                        f"📌 #{d['symbol'].replace('/', '')}\n\n"
                         f"💰 Entry: `{d['entry']}`\n"
-                        f"🎯 Take Profit: `{d['tp']}`\n"
-                        f"🛑 Stop Loss: `{d['sl']}`\n"
-                        f"📊 Status: `Active` (Orders placed on exchange)"
+                        f"🎯 Take profit: `{d['tp']}`\n"
+                        f"🛑 Stop loss: `{d['sl']}`\n\n"
+                        f"_Active — orders placed_"
                     )
                     await self.send_telegram_msg(msg)
 
-                # Handling Trade Closing (Exit)
                 elif note['type'] == 'trade_closed':
                     d = note['data']
-                    # Choose emoji based on profit or loss
                     result_emoji = "💰" if d['pnl_usdt'] >= 0 else "📉"
                     pnl_sign = "+" if d['pnl_usdt'] >= 0 else ""
-                    
                     msg = (
-                        f"{result_emoji} **TRADE CLOSED**\n\n"
-                        f"Symbol: #{d['symbol'].replace('/', '')}\n"
-                        f"Reason: {d['reason']}\n\n"
-                        f"💵 PnL USDT: `{pnl_sign}{d['pnl_usdt']} USDT`\n"
-                        f"📈 PnL %: `{pnl_sign}{d['pnl_percent']}%`\n\n"
-                        f"📥 Entry: `{d['entry']}`\n"
-                        f"📤 Exit: `{d['exit']}`"
+                        f"{result_emoji} *Trade closed*\n\n"
+                        f"📌 #{d['symbol'].replace('/', '')}\n"
+                        f"📋 {d['reason']}\n\n"
+                        f"💵 PnL: `{pnl_sign}{d['pnl_usdt']}` USDT\n"
+                        f"📈 PnL: `{pnl_sign}{d['pnl_percent']}`%\n\n"
+                        f"📥 Entry: `{d.get('entry', '—')}`\n"
+                        f"📤 Exit: `{d.get('exit', '—')}`"
                     )
                     await self.send_telegram_msg(msg)
             
@@ -494,14 +527,13 @@ class Messenger:
                     emoji = "🚀" if verdict == "BUY" else "⚠️"
                     
                     message = (
-                        f"{emoji} **SIGNAL: {symbol}**\n\n"
-                        f"🤖 **AI Verdict:** `{verdict}` ({data.get('confidence', 'N/A')})\n"
-                        f"📝 **Reason:** _{data.get('reason', 'N/A')}_\n\n"
-                        f"📊 **Technical Stats:**\n"
+                        f"{emoji} *Signal: {symbol}*\n\n"
+                        f"🤖 Verdict: `{verdict}` ({data.get('confidence', 'N/A')})\n"
+                        f"📝 _{data.get('reason', 'N/A')}_\n\n"
+                        f"📊 Stats\n"
                         f"• Price: `${data.get('last_price')}`\n"
-                        f"• RSI: `{data.get('rsi')}`\n"
-                        f"• RVOL: `{data.get('rvol')}x`\n\n"
-                        f"🔗 [TradingView]({tv_url}) | [Binance]({binance_url})"
+                        f"• RSI: `{data.get('rsi')}` · RVOL: `{data.get('rvol')}x`\n\n"
+                        f"🔗 [TradingView]({tv_url}) · [Binance]({binance_url})"
                     )
 
                     # Autopilot: no Buy button when on; BUY verdict triggers automatic order
@@ -517,15 +549,19 @@ class Messenger:
                         open_count = self._get_open_order_count()
                         if open_count >= AUTOPILOT_MAX_OPEN_ORDERS:
                             await self.send_telegram_msg(
-                                f"⏸️ **Autopilot skipped** for {symbol}: max {AUTOPILOT_MAX_OPEN_ORDERS} open orders reached ({open_count})."
+                                f"⏸️ *Autopilot skipped*\n\n"
+                                f"📌 {symbol}\n\n"
+                                f"Max {AUTOPILOT_MAX_OPEN_ORDERS} open orders reached ({open_count}).\n"
+                                f"Close a position or wait for TP/SL to free a slot."
                             )
                             print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (open orders: {open_count})")
                         else:
                             command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
                             self.db.rpush("trade_commands", json.dumps(command))
                             await self.send_telegram_msg(
-                                f"🤖 **Automatic order placed** for {symbol} ({AUTOPILOT_ORDER_AMOUNT_USDT} USDT). "
-                                "Executor will confirm shortly."
+                                f"🤖 *Autopilot order sent*\n\n"
+                                f"📌 {symbol} · {AUTOPILOT_ORDER_AMOUNT_USDT} USDT\n\n"
+                                f"_Executor will confirm shortly._"
                             )
                             print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
 
