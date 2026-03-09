@@ -36,14 +36,20 @@ SEND_MESSAGE_RETRY_DELAY = 2.0
 REDIS_KEY_TRADING_PAUSED = "system:trading_paused"
 # Redis key: when set, don't send Telegram alerts for AI verdict WAIT (only BUY signals sent)
 REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"
+# Redis key: when set, BUY verdicts trigger automatic order (no Buy button on signals)
+REDIS_KEY_AUTOPILOT = "system:autopilot"
+
+AUTOPILOT_ORDER_AMOUNT_USDT = 10
 
 HELP_MESSAGE = """🛠 Commands (send exactly as below):
 
 • stop — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
 • start — Resume Filter & Brain.
+• autopilot on — Auto-place orders on BUY verdicts; no Buy button on signals; also resumes pipeline if paused.
+• autopilot off — Stop auto orders; Buy button is shown again on BUY signals.
 • stop wait — Only BUY signals sent; WAIT verdicts are not sent.
 • start wait — Send both BUY and WAIT signals again.
-• status — Show pipeline (paused/running) and WAIT setting.
+• status — Show pipeline (paused/running), WAIT setting, and autopilot.
 • orders — List current open orders from the database.
 • help — Show this message."""
 
@@ -158,10 +164,28 @@ class Messenger:
         elif text == "status":
             paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
             suppress_wait = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
+            autopilot = self.db.get(REDIS_KEY_AUTOPILOT)
             parts = []
             parts.append("Pipeline: paused (send \"start\" to resume)." if paused else "Pipeline: running.")
+            parts.append("Autopilot: ON (auto orders on BUY, no button)." if autopilot else "Autopilot: OFF (Buy button on signals).")
             parts.append("WAIT signals: suppressed (only BUY sent). Send \"start wait\" to enable." if suppress_wait else "WAIT signals: sent (BUY + WAIT). Send \"stop wait\" to suppress.")
             await self._safe_reply(update, "📊 Status:\n\n" + "\n".join(parts))
+        elif text == "autopilot on":
+            self.db.set(REDIS_KEY_AUTOPILOT, "1")
+            self.db.delete(REDIS_KEY_TRADING_PAUSED)
+            print(f"[{_ts()}] Messenger: Autopilot ON (pipeline resumed if was paused)")
+            await self._safe_reply(
+                update,
+                "🤖 Autopilot ON.\n\nBUY verdicts will place orders automatically (10 USDT). "
+                "No Buy button on signals. Pipeline resumed if it was paused.",
+            )
+        elif text == "autopilot off":
+            self.db.delete(REDIS_KEY_AUTOPILOT)
+            print(f"[{_ts()}] Messenger: Autopilot OFF (Buy button restored on signals)")
+            await self._safe_reply(
+                update,
+                "🛑 Autopilot OFF.\n\nNo automatic orders. Buy button is shown again on BUY signals.",
+            )
         elif text == "orders":
             await self._reply_orders(update)
         elif text == "help":
@@ -313,14 +337,25 @@ class Messenger:
                         f"• RVOL: `{data.get('rvol')}x`\n\n"
                         f"🔗 [TradingView]({tv_url}) | [Binance]({binance_url})"
                     )
-                    
-                    # Prepare keyboard only if AI gives a BUY verdict
+
+                    # Autopilot: no Buy button when on; BUY verdict triggers automatic order
+                    autopilot_on = self.db.get(REDIS_KEY_AUTOPILOT)
                     keyboard = None
-                    if verdict == "BUY":
+                    if verdict == "BUY" and not autopilot_on:
                         kb = [[InlineKeyboardButton(f"🚀 Buy 10 USDT", callback_data=f"buy:{symbol}")]]
                         keyboard = InlineKeyboardMarkup(kb)
-                    
+
                     await self.send_telegram_msg(message, symbol, keyboard)
+
+                    if verdict == "BUY" and autopilot_on:
+                        command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
+                        self.db.rpush("trade_commands", json.dumps(command))
+                        await self.send_telegram_msg(
+                            f"🤖 **Automatic order placed** for {symbol} ({AUTOPILOT_ORDER_AMOUNT_USDT} USDT). "
+                            "Executor will confirm shortly."
+                        )
+                        print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
+
                     print(f"[{_ts()}] Messenger: Signal alert sent for {symbol} (Verdict: {verdict})")
 
             except Exception as e:

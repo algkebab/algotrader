@@ -17,6 +17,7 @@ ALGOTRADER_KEYS = [
     "notifications",
     "system:trading_paused",
     "system:suppress_wait_signals",
+    "system:autopilot",
 ]
 PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
