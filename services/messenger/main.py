@@ -87,6 +87,7 @@ HELP_MESSAGE = """🛠 Commands (send exactly as below):
 • status — Show pipeline (paused/running), WAIT setting, autopilot, mute, and paper trading.
 • orders — List current open orders from the database.
 • balance — Current USDT balance from DB; shows change since last check.
+• set balance <amount> — Set USDT balance in DB (e.g. set balance 100.50).
 • help — Show this message."""
 
 def _ts():
@@ -213,6 +214,29 @@ class Messenger:
         except TimedOut as e:
             print(f"[{_ts()}] Messenger: reply_text timed out (balance state already updated): {e}")
 
+    async def _handle_set_balance(self, update, text: str) -> None:
+        """Set USDT balance in DB. Usage: set balance <amount> (e.g. set balance 100.50)."""
+        rest = text[len("set balance "):].strip()
+        if not rest:
+            await self._safe_reply(update, "Usage: set balance <amount> (e.g. set balance 100.50)")
+            return
+        try:
+            amount = float(rest)
+        except ValueError:
+            await self._safe_reply(update, "Invalid amount. Use a number (e.g. set balance 100.50).")
+            return
+        if amount < 0:
+            await self._safe_reply(update, "Amount must be ≥ 0.")
+            return
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                shared_db.set_balance(conn, "USDT", amount)
+            print(f"[{_ts()}] Messenger: Balance set to {amount:.2f} USDT")
+            await self._safe_reply(update, f"✅ Balance set to `{amount:.2f}` USDT.")
+        except Exception as e:
+            await self._safe_reply(update, f"❌ Could not set balance: {e}")
+
     def _clear_redis_data(self) -> int:
         """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
         deleted = 0
@@ -325,6 +349,8 @@ class Messenger:
             await self._reply_orders(update)
         elif text == "balance":
             await self._reply_balance(update)
+        elif text.startswith("set balance "):
+            await self._handle_set_balance(update, text)
         elif text == "help":
             await self._safe_reply(update, HELP_MESSAGE)
 

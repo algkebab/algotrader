@@ -18,6 +18,10 @@ from shared import db as shared_db
 def _ts():
     return datetime.utcnow().strftime("%H:%M:%S")
 
+# Must match Executor.paper_leverage for balance math (margin = order amount_usdt / this)
+PAPER_LEVERAGE = 3
+
+
 class Monitor:
     def __init__(self):
         redis_host = os.getenv('REDIS_HOST', 'localhost')
@@ -92,6 +96,7 @@ class Monitor:
     def close_position(self, symbol, price, reason):
         """Close position: update DB and notify. In live mode also remove from Redis active_trades."""
         paper = self._is_paper_trading()
+        margin_usdt = 0.0  # only used for paper: add back locked margin on close
         if paper:
             try:
                 with shared_db.get_connection() as conn:
@@ -101,6 +106,8 @@ class Monitor:
                     return
                 entry_price = float(row["entry_price"])
                 qty = float(row["quantity"])
+                # amount_usdt in DB is notional; margin = notional / leverage
+                margin_usdt = float(row["amount_usdt"]) / PAPER_LEVERAGE
             except Exception as e:
                 print(f"[{_ts()}] ❌ Monitor: DB error in close_position: {e}")
                 return
@@ -144,7 +151,8 @@ class Monitor:
                         close_reason=reason,
                     )
                     bal = shared_db.get_balance(conn, "USDT")
-                    shared_db.set_balance(conn, "USDT", bal + pnl_usdt)
+                    # Paper: add back locked margin + PnL; live: only PnL
+                    shared_db.set_balance(conn, "USDT", bal + pnl_usdt + margin_usdt)
         except Exception as db_err:
             print(f"[{_ts()}] ⚠️ DB update failed: {db_err}")
 

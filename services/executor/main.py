@@ -171,6 +171,11 @@ class Executor:
 
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
+                current_bal = shared_db.get_balance(conn, "USDT")
+                if current_bal < amount_usdt:
+                    print(f"[{_ts()}] ❌ Paper order skipped: insufficient balance ({current_bal:.2f} < {amount_usdt} USDT margin)")
+                    return {"status": "error", "message": "Insufficient balance for paper order"}
+                shared_db.set_balance(conn, "USDT", current_bal - amount_usdt)
                 order_id = shared_db.insert_order(
                     conn,
                     symbol=symbol,
