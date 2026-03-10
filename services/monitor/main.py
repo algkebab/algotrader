@@ -4,7 +4,7 @@ import sys
 import time
 import redis
 import ccxt
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Allow importing shared.db
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -16,7 +16,7 @@ from shared import db as shared_db
 
 
 def _ts():
-    return datetime.utcnow().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 # Must match Executor.paper_leverage for balance math (margin = order amount_usdt / this)
 PAPER_LEVERAGE = 3

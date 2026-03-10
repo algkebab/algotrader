@@ -29,6 +29,7 @@ SYSTEM_KEYS = frozenset({
     "system:strategy",
     "system:max_open_orders",
     "system:order_amount_usdt",
+    "system:timezone_offset_min",
 })
 PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 

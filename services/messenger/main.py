@@ -4,7 +4,7 @@ import os
 import sys
 import redis
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 import ccxt
 from dotenv import load_dotenv
@@ -54,6 +54,8 @@ REDIS_KEY_STRATEGY = "system:strategy"
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
 # Order amount in USDT per trade (default 10)
 REDIS_KEY_ORDER_AMOUNT_USDT = "system:order_amount_usdt"
+# Timezone offset in minutes from UTC for user-facing timestamps (default 0)
+REDIS_KEY_TIMEZONE_OFFSET_MIN = "system:timezone_offset_min"
 
 # Keys we never delete on "clear redis" (system settings)
 REDIS_SYSTEM_KEYS = frozenset({
@@ -66,6 +68,7 @@ REDIS_SYSTEM_KEYS = frozenset({
     REDIS_KEY_STRATEGY,
     REDIS_KEY_MAX_OPEN_ORDERS,
     REDIS_KEY_ORDER_AMOUNT_USDT,
+    REDIS_KEY_TIMEZONE_OFFSET_MIN,
 })
 
 # Allowed values for "set strategy"
@@ -147,12 +150,13 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 💵 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols 50). Min 5, max 200.
 🎯 • *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
+🕒 • *set timezone* <offset> — Local timezone offset vs UTC in hours (e.g. set timezone +2, set timezone -5, set timezone 5.5). Affects timestamps in bot messages only.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 ❓ • *help* — This message."""
 
 def _ts():
     """Returns current UTC timestamp for logging."""
-    return datetime.utcnow().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 class Messenger:
     def __init__(self):
@@ -222,7 +226,7 @@ class Messenger:
             return
         lines = [f"📋 Open orders ({len(rows)})", ""]
         for i, o in enumerate(rows, 1):
-            opened = (o.get("opened_at") or "")[:19].replace("T", " ")
+            opened = self._format_iso_to_user_time(o.get("opened_at") or "")
             symbol = o["symbol"]
             entry = float(o["entry_price"])
             qty = float(o["quantity"])
@@ -384,6 +388,32 @@ class Messenger:
         except (ValueError, TypeError, Exception):
             return float(ORDER_AMOUNT_DEFAULT)
 
+    def _get_timezone_offset_minutes(self) -> int:
+        """Return timezone offset in minutes from UTC (from Redis, default 0)."""
+        val = self.db.get(REDIS_KEY_TIMEZONE_OFFSET_MIN)
+        if val is None:
+            return 0
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return 0
+
+    def _format_user_time(self, dt_utc: datetime) -> str:
+        """Format a UTC datetime into user's configured timezone."""
+        offset_min = self._get_timezone_offset_minutes()
+        local_dt = dt_utc + timedelta(minutes=offset_min)
+        return local_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _format_iso_to_user_time(self, iso_str: str) -> str:
+        """Parse UTC ISO timestamp string and return formatted in user's timezone. Returns '—' if empty/invalid."""
+        if not (iso_str and iso_str.strip()):
+            return "—"
+        try:
+            dt = datetime.fromisoformat(iso_str.strip().replace("Z", "+00:00"))
+            return self._format_user_time(dt)
+        except Exception:
+            return (iso_str[:19].replace("T", " ") if len(iso_str) >= 19 else iso_str) or "—"
+
     async def _handle_orders_amount(self, update, text: str) -> None:
         """Set order amount in USDT per trade. Usage: orders amount <number> (e.g. orders amount 15)."""
         rest = text[len("orders amount "):].strip()
@@ -430,7 +460,8 @@ class Messenger:
         except Exception as e:
             await self._safe_reply(update, f"❌ Could not read balance: {e}")
             return
-        now_iso = datetime.utcnow().isoformat() + "Z"
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
         last_pnl_str = self.db.get(REDIS_KEY_BALANCE_LAST_DAY_PNL)
         last_check = self.db.get(REDIS_KEY_BALANCE_LAST_CHECK)
         if last_pnl_str is not None and last_check is not None:
@@ -446,7 +477,8 @@ class Messenger:
                 else:
                     change_emoji = "➡️"
                     change_text = "No change since last check"
-                diff_line = f"{change_emoji} {change_text}\n🕐 Last check: {last_check[:19].replace('T', ' ')} UTC"
+                last_str = self._format_iso_to_user_time(last_check)
+                diff_line = f"{change_emoji} {change_text}\n🕐 Last check: {last_str}"
             except (ValueError, TypeError):
                 diff_line = "🕐 Last check: —"
         else:
@@ -563,6 +595,44 @@ class Messenger:
         print(f"[{_ts()}] Messenger: strategy set to {rest}")
         await self._safe_reply(update, f"✅ Strategy updated\n\n🎯 AI strategy: {rest}")
 
+    async def _handle_set_timezone(self, update, text: str) -> None:
+        """Set timezone offset in hours from UTC. Usage: set timezone <offset>, e.g. +2, -5, 1.5."""
+        rest = text[len("set timezone "):].strip()
+        if not rest:
+            offset_min = self._get_timezone_offset_minutes()
+            hours = offset_min / 60
+            await self._safe_reply(
+                update,
+                "🕒 Set timezone\n\n"
+                f"Current offset: UTC{hours:+.1f} hours\n\n"
+                "Usage: set timezone <offset>\n"
+                "Examples:\n"
+                "  set timezone 0     → UTC\n"
+                "  set timezone +2    → UTC+2\n"
+                "  set timezone -5    → UTC-5\n"
+                "  set timezone 5.5   → UTC+5:30\n",
+            )
+            return
+        try:
+            hours = float(rest.replace("UTC", "").replace("utc", ""))
+        except ValueError:
+            await self._safe_reply(
+                update,
+                "❌ Invalid offset\n\nUse a number of hours, e.g. 0, +2, -5, 5.5",
+            )
+            return
+        # Clamp to reasonable world timezones
+        if hours < -12 or hours > 14:
+            await self._safe_reply(update, "❌ Out of range. Use between -12 and +14 hours.")
+            return
+        offset_min = int(hours * 60)
+        self.db.set(REDIS_KEY_TIMEZONE_OFFSET_MIN, str(offset_min))
+        print(f"[{_ts()}] Messenger: timezone offset set to {offset_min} minutes")
+        await self._safe_reply(
+            update,
+            f"✅ Timezone updated\n\n🕒 New offset: UTC{hours:+.1f}",
+        )
+
     async def _handle_stats(self, update, text: str) -> None:
         """Reply with closed orders statistics. Usage: stats [today|yesterday|week|month|all]. Default: today."""
         rest = text[len("stats"):].strip().lower() if text.startswith("stats") else ""
@@ -579,7 +649,7 @@ class Messenger:
             await self._safe_reply(
                 update,
                 f"📊 Stats ({period_label})\n"
-                f"━━━━━━━━━━━━━━\n\n"
+                f"\n"
                 f"No closed orders in this period.",
             )
             return
@@ -589,8 +659,7 @@ class Messenger:
         success_pct = (s["count_successful"] / s["count"] * 100) if s["count"] else 0
         parts = [
             f"📊 Stats ({period_label})",
-            "━━━━━━━━━━━━━━",
-            "",
+            "\n",
             f"📋 Closed orders: {s['count']}",
             f"{pnl_emoji} Total PnL: {pnl_sign}{total_pnl:.2f} USDT",
             f"✅ Successful (PnL > 0): {s['count_successful']} ({success_pct:.0f}%)",
@@ -761,6 +830,8 @@ class Messenger:
             await self._handle_set_symbols(update, text)
         elif text.startswith("set strategy "):
             await self._handle_set_strategy(update, text)
+        elif text.startswith("set timezone "):
+            await self._handle_set_timezone(update, text)
         elif text == "stats" or text.startswith("stats "):
             await self._handle_stats(update, text)
         elif text == "help":

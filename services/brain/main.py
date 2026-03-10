@@ -4,7 +4,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import redis
 from dotenv import load_dotenv
@@ -21,7 +21,7 @@ from shared import db as shared_db
 load_dotenv()
 
 def _ts():
-    return datetime.utcnow().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 # Redis key for max open orders (set by Messenger "orders set max"); default 10
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"

@@ -2,8 +2,7 @@
 import asyncio
 import json
 import os
-import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import ccxt.async_support as ccxt
 import redis
@@ -14,7 +13,7 @@ load_dotenv()
 
 
 def _ts():
-    return datetime.utcnow().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
 class Scout:
@@ -48,7 +47,10 @@ class Scout:
             return self._max_symbols_default
 
     async def get_top_active_symbols(self):
-        """Fetches TOP coins by 24h volume to ensure we track volatile assets."""
+        """Fetches TOP coins by 24h volume to ensure we track volatile assets.
+
+        Returns (symbols_list, tickers_dict_for_those_symbols).
+        """
         max_symbols = self._get_max_symbols()
         try:
             print(f"[{_ts()}] 🔄 Scout: Refreshing TOP {max_symbols} assets by volume...")
@@ -66,25 +68,15 @@ class Scout:
             sorted_pairs = sorted(usdt_pairs, key=lambda x: x['volume'], reverse=True)
             top = [p['symbol'] for p in sorted_pairs[:max_symbols]]
             print(f"[{_ts()}] Scout: Selected {len(top)} USDT pairs by volume (max_symbols={max_symbols})")
-            return top
+            top_tickers = {s: tickers[s] for s in top if s in tickers}
+            return top, top_tickers
             
         except Exception as e:
             print(f"[{_ts()}] ❌ Error fetching symbols: {e}")
             print(f"[{_ts()}] Scout: Using emergency fallback symbol list")
-            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT'] # Emergency fallback
-
-    async def save_to_redis(self, data):
-        """
-        Saves normalized market data to Redis as a JSON string.
-        """
-        try:
-            print(f"[{_ts()}] Scout: Building payload for {len(data)} symbols")
-            payload = json.dumps(data)
-            self.db.set('market_data', payload)
-            size_kb = len(payload) / 1024
-            print(f"[{_ts()}] Scout: Saved {len(data)} USDT pairs to Redis (key: market_data, ~{size_kb:.1f} KB)")
-        except Exception as e:
-            print(f"[{_ts()}] Scout: Redis error: {e}")
+            # Emergency fallback (no pre-fetched tickers)
+            fallback = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT']
+            return fallback, {}
 
     async def fetch_ohlcv_data(self, symbol, timeframe='1h', limit=24):
         """Fetches historical candlestick data from the exchange"""
@@ -101,39 +93,54 @@ class Scout:
         print("🔭 Scout: Starting advanced market monitoring...")
         
         while True:
-            market_summary = {}
-            active_symbols = await self.get_top_active_symbols()
-            
-            print(f"[{_ts()}] 🛰️ Scanning {len(active_symbols)} symbols for opportunities...")
+            symbols, tickers = await self.get_top_active_symbols()
+            print(f"[{_ts()}] 🛰️ Scanning {len(symbols)} symbols for opportunities...")
 
-            for symbol in active_symbols:
+            active_symbols = []
+
+            for symbol in symbols:
                 try:
-                    # 1. Get current ticker
-                    print(f"[{_ts()}] Scout: Fetching ticker {symbol}")
-                    ticker = await self.exchange.fetch_ticker(symbol)
-                    
+                    ticker = tickers.get(symbol)
+                    if not ticker:
+                        print(f"[{_ts()}] Scout: Missing ticker for {symbol}, skipping.")
+                        continue
+
+                    # 1. Use existing ticker data
+                    last_price = ticker.get('last')
+                    change_24h = ticker.get('percentage')
+                    volume_24h = ticker.get('quoteVolume')
+
                     # 2. Get historical candles (last 24 hours)
                     candles = await self.fetch_ohlcv_data(symbol)
-                    
-                    market_summary[symbol] = {
-                        'last_price': ticker['last'],
-                        'change_24h': ticker['percentage'],
-                        'volume_24h': ticker['quoteVolume'],
-                        'candles': candles  # Nested candle data for AI/Filter analysis
+
+                    entry = {
+                        'last_price': last_price,
+                        'change_24h': change_24h,
+                        'volume_24h': volume_24h,
+                        'candles': candles,  # Nested candle data for AI/Filter analysis
                     }
-                    print(f"✅ Data updated: {symbol}")
+
+                    # Save per-symbol market data
+                    key = f"market_data:{symbol}"
+                    self.db.set(key, json.dumps(entry))
+                    active_symbols.append(symbol)
+                    print(f"[{_ts()}] ✅ Data updated & saved: {symbol}")
 
                     # Small delay to keep API weight usage low
                     print(f"[{_ts()}] Scout: Rate limit pause 0.1s after {symbol}")
-                    time.sleep(0.1)
-                    
+                    await asyncio.sleep(0.1)
+
                 except Exception as e:
-                    print(f"❌ Error updating {symbol}: {e}")
-            
-            # Save the enriched data to Redis
-            print(f"[{_ts()}] Scout: Writing market_data to Redis ({len(market_summary)} symbols)")
-            self.db.set('market_data', json.dumps(market_summary))
-            print(f"[{_ts()}] ✅ Scan complete. Analyzing {len(market_summary)} candidates.")
+                    print(f"[{_ts()}] ❌ Error updating {symbol}: {e}")
+
+            # Save active symbols list so other services know which keys to read
+            try:
+                self.db.set('system:active_symbols', json.dumps(active_symbols))
+                print(f"[{_ts()}] Scout: Updated system:active_symbols ({len(active_symbols)} symbols)")
+            except Exception as e:
+                print(f"[{_ts()}] Scout: Redis error saving active symbols: {e}")
+
+            print(f"[{_ts()}] ✅ Scan complete. Analyzing {len(active_symbols)} candidates.")
             print(f"[{_ts()}] Scout: Sleeping 120s until next cycle")
             await asyncio.sleep(120)
             

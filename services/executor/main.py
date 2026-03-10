@@ -4,7 +4,7 @@ import sys
 import time
 import redis
 import ccxt
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,7 +19,7 @@ from shared import db as shared_db
 
 def _ts():
     """Returns current timestamp for logging."""
-    return datetime.utcnow().strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 class Executor:
     def __init__(self):

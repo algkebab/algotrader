@@ -96,15 +96,41 @@ class Filter:
                 time.sleep(10)
                 continue
 
-            raw_data = self.db.get('market_data')
-            if not raw_data:
+            # New data layout:
+            # - system:active_symbols -> JSON list of symbols
+            # - market_data:{symbol}  -> JSON per-symbol payload from Scout
+            raw_symbols = self.db.get("system:active_symbols")
+            if not raw_symbols:
                 time.sleep(5)
                 continue
 
-            market_data = json.loads(raw_data)
+            try:
+                symbols = json.loads(raw_symbols)
+            except json.JSONDecodeError:
+                time.sleep(5)
+                continue
+
+            if not isinstance(symbols, list) or not symbols:
+                time.sleep(5)
+                continue
+
+            # Fetch all per-symbol market data in one pipeline for performance
+            pipe = self.db.pipeline()
+            keys = []
+            for symbol in symbols:
+                keys.append(symbol)
+                pipe.get(f"market_data:{symbol}")
+            results = pipe.execute()
+
             filtered_candidates = []
 
-            for symbol, data in market_data.items():
+            for symbol, raw_data in zip(keys, results):
+                if not raw_data:
+                    continue
+                try:
+                    data = json.loads(raw_data)
+                except json.JSONDecodeError:
+                    continue
                 # 1. Volume Check
                 if data['volume_24h'] < self.min_24h_volume:
                     continue
