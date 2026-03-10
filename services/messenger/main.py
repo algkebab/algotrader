@@ -360,13 +360,13 @@ class Messenger:
 
     def _get_order_amount_usdt(self) -> float:
         """Return order amount in USDT from Redis (default ORDER_AMOUNT_DEFAULT)."""
-        val = self.db.get(REDIS_KEY_ORDER_AMOUNT_USDT)
-        if val is None:
-            return float(ORDER_AMOUNT_DEFAULT)
         try:
+            val = self.db.get(REDIS_KEY_ORDER_AMOUNT_USDT)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                return float(ORDER_AMOUNT_DEFAULT)
             n = float(val)
             return max(ORDER_AMOUNT_MIN, min(ORDER_AMOUNT_MAX, n))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, Exception):
             return float(ORDER_AMOUNT_DEFAULT)
 
     async def _handle_orders_amount(self, update, text: str) -> None:
@@ -613,36 +613,40 @@ class Messenger:
                 "Live trading: real orders on exchange. Monitor uses Redis.",
             )
         elif text == "status":
-            paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
-            # "0" = send WAIT; missing or "1" = suppress (default after deploy)
-            suppress_wait_val = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
-            suppress_wait = suppress_wait_val != "0"
-            autopilot = self.db.get(REDIS_KEY_AUTOPILOT)
-            muted = self.db.get(REDIS_KEY_MUTED)
-            paper_val = self.db.get(REDIS_KEY_PAPERTRADING)
-            paper_on = paper_val != "0"
-            symbols_val = self.db.get(REDIS_KEY_MAX_SYMBOLS)
-            symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else MAX_SYMBOLS_DEFAULT
-            lines = [
-                "📊 Status",
-                "",
-                "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused else "▶️ running"),
-                "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot else "OFF (Buy button on signals)"),
-                "🔔 WAIT signals: " + ("suppressed (only BUY)" if suppress_wait else "on (BUY + WAIT)"),
-                "📱 Telegram: " + ("🔇 muted" if muted else "🔔 unmuted"),
-                "📄 Paper: " + ("ON (DB only)" if paper_on else "OFF (live)"),
-                f"📈 Symbols: top {symbols_n} by volume",
-            ]
-            strategy_val = (self.db.get(REDIS_KEY_STRATEGY) or "conservative").strip().lower()
-            if strategy_val not in STRATEGY_VALUES:
-                strategy_val = "conservative"
-            lines.append(f"🎯 Strategy: {strategy_val}")
-            max_open = self._get_max_open_orders()
-            open_count = self._get_open_order_count()
-            lines.append(f"📋 Open orders: {open_count} / {max_open}")
-            amt = self._get_order_amount_usdt()
-            lines.append(f"💵 Order amount: {amt:.0f if amt == int(amt) else amt} USDT")
-            await self._safe_reply(update, "\n".join(lines))
+            try:
+                paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
+                # "0" = send WAIT; missing or "1" = suppress (default after deploy)
+                suppress_wait_val = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
+                suppress_wait = suppress_wait_val != "0"
+                autopilot = self.db.get(REDIS_KEY_AUTOPILOT)
+                muted = self.db.get(REDIS_KEY_MUTED)
+                paper_val = self.db.get(REDIS_KEY_PAPERTRADING)
+                paper_on = paper_val != "0"
+                symbols_val = self.db.get(REDIS_KEY_MAX_SYMBOLS)
+                symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else MAX_SYMBOLS_DEFAULT
+                lines = [
+                    "📊 Status",
+                    "",
+                    "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused else "▶️ running"),
+                    "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot else "OFF (Buy button on signals)"),
+                    "🔔 WAIT signals: " + ("suppressed (only BUY)" if suppress_wait else "on (BUY + WAIT)"),
+                    "📱 Telegram: " + ("🔇 muted" if muted else "🔔 unmuted"),
+                    "📄 Paper: " + ("ON (DB only)" if paper_on else "OFF (live)"),
+                    f"📈 Symbols: top {symbols_n} by volume",
+                ]
+                strategy_val = (self.db.get(REDIS_KEY_STRATEGY) or "conservative").strip().lower()
+                if strategy_val not in STRATEGY_VALUES:
+                    strategy_val = "conservative"
+                lines.append(f"🎯 Strategy: {strategy_val}")
+                max_open = self._get_max_open_orders()
+                open_count = self._get_open_order_count()
+                lines.append(f"📋 Open orders: {open_count} / {max_open}")
+                amt = self._get_order_amount_usdt()
+                lines.append(f"💵 Order amount: {amt:.0f if amt == int(amt) else amt} USDT")
+                await self._safe_reply(update, "\n".join(lines))
+            except Exception as e:
+                print(f"[{_ts()}] Messenger: status failed: {e}")
+                await self._safe_reply(update, f"❌ Status failed\n\n{e}")
         elif text == "autopilot on":
             self.db.set(REDIS_KEY_AUTOPILOT, "1")
             self.db.delete(REDIS_KEY_TRADING_PAUSED)
