@@ -105,40 +105,41 @@ def _normalize_symbol(s: str) -> str:
     return s + "/USDT"
 
 HELP_MESSAGE = """🛠 *Algotrader — Commands*
+━━━━━━━━━━━━━━━━━━━━━━
 
 📌 *Pipeline*
-• *stop* — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
-• *start* — Resume Filter & Brain.
+⏸️ • *stop* — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
+▶️ • *start* — Resume Filter & Brain.
 
 🤖 *Autopilot*
-• *autopilot on* — Auto-place orders on BUY (max set by orders set max). No Buy button. Resumes pipeline if paused.
-• *autopilot off* — Stop auto orders. Buy button shown again on BUY signals.
+🟢 • *autopilot on* — Auto-place orders on BUY (max set by orders set max). No Buy button. Resumes pipeline if paused.
+🔴 • *autopilot off* — Stop auto orders. Buy button shown again on BUY signals.
 
 🔔 *Signals*
-• *stop wait* — Only BUY signals sent; WAIT verdicts hidden.
-• *start wait* — Send both BUY and WAIT signals.
+🔇 • *stop wait* — Only BUY signals sent; WAIT verdicts hidden.
+🔊 • *start wait* — Send both BUY and WAIT signals.
 
-🔇 *Notifications*
-• *mute* — No alerts or notifications sent (platform keeps running).
-• *unmute* — Resume alerts and notifications.
+📱 *Notifications*
+🔕 • *mute* — No alerts or notifications sent (platform keeps running).
+🔔 • *unmute* — Resume alerts and notifications.
 
 📄 *Paper / Live*
-• *papertrading on* — No real orders; DB only. (Default.)
-• *papertrading off* — Live trading on exchange.
+📋 • *papertrading on* — No real orders; DB only. (Default.)
+🔥 • *papertrading off* — Live trading on exchange.
 
 🧹 *Data*
-• *clear redis* — Clear queues and cache. Keeps system settings.
+🗑️ • *clear redis* — Clear queues and cache. Keeps system settings.
 
-📊 *Info*
-• *status* — Pipeline, autopilot, mute, paper trading.
-• *orders* — List open orders from DB.
-• *orders close* <symbol> — Manually close open order for symbol (e.g. orders close BTC/USDT). Updates balance.
-• *orders set max* <number> — Max simultaneous open orders for autopilot (e.g. orders set max 15). Default 10.
-• *balance* — Current USDT balance, today's PnL (from closed orders), and day PnL change since last check.
-• *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
-• *set symbols* <number> — Top N symbols by volume to fetch (e.g. set symbols 50). Min 5, max 200.
-• *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
-• *help* — This message."""
+📊 *Info & Trading*
+📈 • *status* — Pipeline, autopilot, mute, paper trading.
+📋 • *orders* — List open orders from DB.
+🔒 • *orders close* <symbol> — Manually close open order (e.g. orders close BTC/USDT). Updates balance.
+🔢 • *orders set max* <number> — Max open orders for autopilot (e.g. orders set max 15). Default 10.
+💰 • *balance* — Wallet, today PnL, and change since last check.
+💵 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
+📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols 50). Min 5, max 200.
+🎯 • *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
+❓ • *help* — This message."""
 
 def _ts():
     """Returns current UTC timestamp for logging."""
@@ -378,18 +379,20 @@ class Messenger:
                 else:
                     change_emoji = "➡️"
                     change_text = "No change since last check"
-                diff_line = f"{change_emoji} {change_text}\nLast check: {last_check[:19].replace('T', ' ')} UTC"
+                diff_line = f"{change_emoji} {change_text}\n🕐 Last check: {last_check[:19].replace('T', ' ')} UTC"
             except (ValueError, TypeError):
-                diff_line = "Last check: —"
+                diff_line = "🕐 Last check: —"
         else:
-            diff_line = "First check — no previous day PnL to compare."
+            diff_line = "🆕 First check — no previous day PnL to compare."
         self.db.set(REDIS_KEY_BALANCE_LAST_DAY_PNL, f"{today_pnl:.2f}")
         self.db.set(REDIS_KEY_BALANCE_LAST_CHECK, now_iso)
         pnl_sign = "+" if today_pnl >= 0 else ""
+        pnl_emoji = "📈" if today_pnl >= 0 else "📉" if today_pnl < 0 else "➡️"
         msg = (
-            f"💰 *Balance (USDT)*\n\n"
-            f"Balance: `{current:.2f}` USDT\n"
-            f"Today PnL: `{pnl_sign}{today_pnl:.2f}` USDT\n\n"
+            f"💰 *Balance*\n"
+            f"━━━━━━━━━━━━━━\n\n"
+            f"💵 Wallet: `{current:.2f}` USDT\n"
+            f"{pnl_emoji} Today PnL: `{pnl_sign}{today_pnl:.2f}` USDT\n\n"
             f"_{diff_line}_"
         )
         await self._safe_reply(update, msg)

@@ -21,4 +21,5 @@ jobs:
             set -e
             cd "${{ secrets.DEPLOY_PATH || '/opt/algotrader' }}"
             git pull origin main
+            docker compose down
             docker compose up -d --build
