@@ -693,6 +693,17 @@ class Messenger:
                     )
                     await self.send_telegram_msg(msg)
 
+                elif note['type'] == 'trade_skipped':
+                    d = note.get('data', {})
+                    symbol = d.get('symbol', '—')
+                    reason = d.get('reason', 'Already have open order for this symbol')
+                    msg = (
+                        f"⏸️ *Order skipped*\n\n"
+                        f"📌 {symbol}\n\n"
+                        f"{reason}"
+                    )
+                    await self.send_telegram_msg(msg)
+
                 elif note['type'] == 'trade_closed':
                     d = note['data']
                     result_emoji = "💰" if d['pnl_usdt'] >= 0 else "📉"
@@ -777,14 +788,37 @@ class Messenger:
                             )
                             print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (open orders: {open_count})")
                         else:
-                            command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
-                            self.db.rpush("trade_commands", json.dumps(command))
-                            await self.send_telegram_msg(
-                                f"🤖 *Autopilot order sent*\n\n"
-                                f"📌 {symbol} · {AUTOPILOT_ORDER_AMOUNT_USDT} USDT\n\n"
-                                f"_Executor will confirm shortly._"
-                            )
-                            print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
+                            # Do not send order if we already have an open position for this symbol
+                            try:
+                                with shared_db.get_connection() as conn:
+                                    shared_db.init_schema(conn)
+                                    if shared_db.get_open_order_id_for_symbol(conn, symbol) is not None:
+                                        await self.send_telegram_msg(
+                                            f"⏸️ *Autopilot skipped*\n\n"
+                                            f"📌 {symbol}\n\n"
+                                            f"Already have an open order for this symbol."
+                                        )
+                                        print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (already have open order)")
+                                        # skip pushing command below
+                                    else:
+                                        command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
+                                        self.db.rpush("trade_commands", json.dumps(command))
+                                        await self.send_telegram_msg(
+                                            f"🤖 *Autopilot order sent*\n\n"
+                                            f"📌 {symbol} · {AUTOPILOT_ORDER_AMOUNT_USDT} USDT\n\n"
+                                            f"_Executor will confirm shortly._"
+                                        )
+                                        print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
+                            except Exception as e:
+                                print(f"[{_ts()}] Messenger: DB check for open order failed: {e}")
+                                command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
+                                self.db.rpush("trade_commands", json.dumps(command))
+                                await self.send_telegram_msg(
+                                    f"🤖 *Autopilot order sent*\n\n"
+                                    f"📌 {symbol} · {AUTOPILOT_ORDER_AMOUNT_USDT} USDT\n\n"
+                                    f"_Executor will confirm shortly._"
+                                )
+                                print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
 
                     print(f"[{_ts()}] Messenger: Signal alert sent for {symbol} (Verdict: {verdict})")
 

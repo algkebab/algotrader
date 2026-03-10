@@ -126,6 +126,14 @@ class Filter:
                 
                 # FINAL LOGIC: Strong volume spike AND not overbought
                 if rvol >= self.rvol_threshold and rsi <= self.rsi_max:
+                    # Skip if we already have an open order for this symbol
+                    try:
+                        with shared_db.get_connection() as conn:
+                            shared_db.init_schema(conn)
+                            if shared_db.get_open_order_id_for_symbol(conn, symbol) is not None:
+                                continue
+                    except Exception:
+                        pass
                     print(f"✅ Filter Match: {symbol} | RVOL: {rvol:.2f} | RSI: {rsi}")
                     data['symbol'] = symbol
                     data['rvol'] = round(rvol, 2)

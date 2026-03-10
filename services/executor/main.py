@@ -94,6 +94,10 @@ class Executor:
 
             if not self.can_open_position(symbol):
                 print(f"[{_ts()}] ⚠️ Already monitoring {symbol}. Skipping.")
+                self.db.rpush("notifications", json.dumps({
+                    "type": "trade_skipped",
+                    "data": {"symbol": symbol, "reason": "Already have open order for this symbol"},
+                }))
                 return {"status": "error", "msg": "Position exists"}
 
             if paper:
