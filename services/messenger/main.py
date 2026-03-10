@@ -84,6 +84,19 @@ AUTOPILOT_MAX_OPEN_ORDERS = 10
 MAX_SYMBOLS_MIN = 5
 MAX_SYMBOLS_MAX = 200
 MAX_SYMBOLS_DEFAULT = 30
+# Paper leverage for margin on manual close (must match Monitor/Executor)
+PAPER_LEVERAGE = 3
+
+def _normalize_symbol(s: str) -> str:
+    """Normalize to BASE/USDT (e.g. BTCUSDT or btc/usdt -> BTC/USDT)."""
+    s = (s or "").strip().upper()
+    if not s:
+        return s
+    if "/" in s:
+        return s
+    if s.endswith("USDT"):
+        return s[:-4] + "/USDT"
+    return s + "/USDT"
 
 HELP_MESSAGE = """🛠 *Algotrader — Commands*
 
@@ -113,6 +126,7 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 📊 *Info*
 • *status* — Pipeline, autopilot, mute, paper trading.
 • *orders* — List open orders from DB.
+• *orders close* <symbol> — Manually close open order for symbol (e.g. orders close BTC/USDT). Updates balance.
 • *balance* — Current USDT balance and change since last check.
 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 • *set symbols* <number> — Top N symbols by volume to fetch (e.g. set symbols 50). Min 5, max 200.
@@ -209,6 +223,77 @@ class Messenger:
             if i < len(rows):
                 lines.append("")
         await self._safe_reply(update, "\n".join(lines))
+
+    async def _handle_orders_close(self, update, text: str) -> None:
+        """Close open order for symbol and update balance (manual close). Usage: orders close <symbol>."""
+        rest = text[len("orders close "):].strip()
+        if not rest:
+            await self._safe_reply(
+                update,
+                "📋 Orders close\n\nUsage: orders close <symbol>\nExample: orders close BTC/USDT",
+            )
+            return
+        symbol = _normalize_symbol(rest)
+        if not symbol or symbol == "/USDT":
+            await self._safe_reply(update, "❌ Invalid symbol. Use e.g. BTC/USDT or BTCUSDT.")
+            return
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                row = shared_db.get_open_order_for_symbol(conn, symbol)
+            if not row:
+                await self._safe_reply(update, f"❌ No open order for {symbol}.")
+                return
+            try:
+                ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
+                close_price = float(ticker.get("last", 0))
+            except Exception as e:
+                await self._safe_reply(update, f"❌ Could not get price for {symbol}\n\n{e}")
+                return
+            entry_price = float(row["entry_price"])
+            qty = float(row["quantity"])
+            order_id = row["id"]
+            pnl_usdt = (close_price - entry_price) * qty
+            pnl_percent = ((close_price / entry_price) - 1) * 100
+            reason = "Manual close"
+            paper = self.db.get("system:papertrading") != "0"
+            margin_usdt = float(row["amount_usdt"]) / PAPER_LEVERAGE if paper else 0.0
+
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                shared_db.update_order_closed(
+                    conn, order_id,
+                    pnl_usdt=round(pnl_usdt, 2),
+                    pnl_percent=round(pnl_percent, 2),
+                    close_reason=reason,
+                )
+                bal = shared_db.get_balance(conn, "USDT")
+                shared_db.set_balance(conn, "USDT", bal + pnl_usdt + margin_usdt)
+
+            if not paper:
+                self.db.hdel("active_trades", symbol)
+
+            self.db.rpush("notifications", json.dumps({
+                "type": "trade_closed",
+                "data": {
+                    "symbol": symbol,
+                    "entry": entry_price,
+                    "exit": close_price,
+                    "pnl_usdt": round(pnl_usdt, 2),
+                    "pnl_percent": round(pnl_percent, 2),
+                    "reason": reason,
+                },
+            }))
+            print(f"[{_ts()}] Messenger: Manual close {symbol} at {close_price}. PnL: {pnl_usdt:.2f} USDT")
+            await self._safe_reply(
+                update,
+                f"✅ Order closed\n\n{symbol}\n"
+                f"💵 PnL: {pnl_usdt:+.2f} USDT ({pnl_percent:+.2f}%)\n"
+                f"Exit: {close_price}",
+            )
+        except Exception as e:
+            print(f"[{_ts()}] Messenger: orders close failed: {e}")
+            await self._safe_reply(update, f"❌ Close failed\n\n{e}")
 
     def _get_open_order_count(self) -> int:
         """Return number of open orders from DB (for autopilot cap)."""
@@ -469,6 +554,8 @@ class Messenger:
             )
         elif text == "orders":
             await self._reply_orders(update)
+        elif text.startswith("orders close "):
+            await self._handle_orders_close(update, text)
         elif text == "balance":
             await self._reply_balance(update)
         elif text.startswith("set balance "):
@@ -478,10 +565,7 @@ class Messenger:
         elif text.startswith("set strategy "):
             await self._handle_set_strategy(update, text)
         elif text == "help":
-            try:
-                await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")
-            except TimedOut as e:
-                print(f"[{_ts()}] Messenger: reply_text timed out (help): {e}")
+            await self._safe_reply(update, HELP_MESSAGE)
 
     async def handle_callback(self, update, context):
         """Handles button clicks (Buy commands) from Telegram UI."""
