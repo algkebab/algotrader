@@ -16,18 +16,38 @@ from shared import db as shared_db
 # Redis key for max open orders (set by Messenger "orders set max"); default 10
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
 MAX_OPEN_ORDERS_DEFAULT = 10
+# Redis key for filter strategy (set by Messenger "strategy <name>"); default CONSERVATIVE
+REDIS_KEY_FILTER_STRATEGY = "system:filter_strategy"
+
+# Hardcoded strategy profiles: min_24h_volume, rvol_threshold, rsi_max, min_change (%)
+# REVERSAL: rsi_max used as oversold threshold (RSI < 30), min_change negative (price drop)
+FILTER_STRATEGY_PROFILES = {
+    "CONSERVATIVE": {
+        "min_24h_volume": 10_000_000,
+        "rvol_threshold": 2.0,
+        "rsi_max": 70,
+        "min_change": 1.5,
+    },
+    "AGGRESSIVE": {
+        "min_24h_volume": 5_000_000,
+        "rvol_threshold": 1.5,
+        "rsi_max": 85,
+        "min_change": 3.0,
+    },
+    "REVERSAL": {
+        "min_24h_volume": 20_000_000,
+        "rvol_threshold": 4.0,
+        "rsi_max": 30,   # oversold: look for RSI < 30
+        "min_change": -5.0,  # negative: look for price drop >= 5%
+    },
+}
+FILTER_STRATEGY_DEFAULT = "CONSERVATIVE"
 
 
 class Filter:
     def __init__(self):
         redis_host = os.getenv('REDIS_HOST', 'localhost')
-        self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)        
-
-        # Configuration thresholds
-        self.min_24h_volume = 10_000_000
-        self.rvol_threshold = 2.0
-        self.min_change = 1.5             # 1.5% min price move
-        self.rsi_max = 70  # Do not enter if RSI is above 70 (overbought)
+        self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
         self.rsi_period = 14
 
     def calculate_rsi(self, candles):
@@ -70,6 +90,14 @@ class Filter:
         except Exception:
             return 0
 
+    def _get_filter_strategy(self):
+        """Return current filter strategy name and profile. Default CONSERVATIVE."""
+        val = self.db.get(REDIS_KEY_FILTER_STRATEGY)
+        name = (val or FILTER_STRATEGY_DEFAULT).strip().upper()
+        if name not in FILTER_STRATEGY_PROFILES:
+            name = FILTER_STRATEGY_DEFAULT
+        return name, FILTER_STRATEGY_PROFILES[name]
+
     def calculate_rvol(self, current_vol_24h):
         """
         Simplified Relative Volume calculation.
@@ -95,6 +123,9 @@ class Filter:
                 print(f"🛡️ Filter: Idle (max open orders reached: {open_count}/{max_open})")
                 time.sleep(10)
                 continue
+
+            strategy_name, profile = self._get_filter_strategy()
+            print(f"🛡️ Filter: Scan cycle — strategy: {strategy_name}")
 
             # New data layout:
             # - system:active_symbols -> JSON list of symbols
@@ -132,7 +163,7 @@ class Filter:
                 except json.JSONDecodeError:
                     continue
                 # 1. Volume Check
-                if data['volume_24h'] < self.min_24h_volume:
+                if data.get('volume_24h') is None or data['volume_24h'] < profile['min_24h_volume']:
                     continue
 
                 # 2. RVOL Calculation (Relative Volume)
@@ -149,9 +180,26 @@ class Filter:
 
                 # 3. RSI Indicator
                 rsi = self.calculate_rsi(data.get('candles', []))
-                
-                # FINAL LOGIC: Strong volume spike AND not overbought
-                if rvol >= self.rvol_threshold and rsi <= self.rsi_max:
+                change_24h = data.get('change_24h')
+                if change_24h is None:
+                    change_24h = 0.0
+                try:
+                    change_24h = float(change_24h)
+                except (TypeError, ValueError):
+                    change_24h = 0.0
+
+                # 4. Strategy-specific logic
+                rvol_ok = rvol >= profile['rvol_threshold']
+                if strategy_name == "REVERSAL":
+                    # Oversold (RSI < 30) and significant price drop (change <= -5%)
+                    rsi_ok = rsi <= profile['rsi_max']
+                    change_ok = change_24h <= profile['min_change']
+                else:
+                    # Not overbought (RSI <= rsi_max) and min positive move
+                    rsi_ok = rsi <= profile['rsi_max']
+                    change_ok = change_24h >= profile['min_change']
+
+                if rvol_ok and rsi_ok and change_ok:
                     # Skip if we already have an open order for this symbol
                     try:
                         with shared_db.get_connection() as conn:

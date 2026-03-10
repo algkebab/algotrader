@@ -27,6 +27,7 @@ SYSTEM_KEYS = frozenset({
     "system:papertrading",
     "system:max_symbols",
     "system:strategy",
+    "system:filter_strategy",
     "system:max_open_orders",
     "system:order_amount_usdt",
     "system:timezone_offset_min",

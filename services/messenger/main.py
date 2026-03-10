@@ -50,6 +50,8 @@ REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
 REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
 # AI strategy: conservative, moderate, aggressive, active_day (default conservative)
 REDIS_KEY_STRATEGY = "system:strategy"
+# Filter strategy: CONSERVATIVE, AGGRESSIVE, REVERSAL (default CONSERVATIVE)
+REDIS_KEY_FILTER_STRATEGY = "system:filter_strategy"
 # Max simultaneous open orders for autopilot (default 10)
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
 # Order amount in USDT per trade (default 10)
@@ -66,13 +68,16 @@ REDIS_SYSTEM_KEYS = frozenset({
     REDIS_KEY_PAPERTRADING,
     REDIS_KEY_MAX_SYMBOLS,
     REDIS_KEY_STRATEGY,
+    REDIS_KEY_FILTER_STRATEGY,
     REDIS_KEY_MAX_OPEN_ORDERS,
     REDIS_KEY_ORDER_AMOUNT_USDT,
     REDIS_KEY_TIMEZONE_OFFSET_MIN,
 })
 
-# Allowed values for "set strategy"
+# Allowed values for "set strategy" (AI)
 STRATEGY_VALUES = frozenset({"conservative", "moderate", "aggressive", "active_day"})
+# Allowed values for "strategy <name>" (Filter)
+FILTER_STRATEGY_VALUES = frozenset({"conservative", "aggressive", "reversal"})
 # Allowed values for "stats <value>"
 STATS_VALUES = frozenset({"today", "yesterday", "week", "month", "all"})
 
@@ -150,6 +155,7 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 💵 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols 50). Min 5, max 200.
 🎯 • *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
+🛡️ • *strategy* <name> — Filter strategy: conservative, aggressive, reversal. Default: CONSERVATIVE.
 🕒 • *set timezone* <offset> — Local timezone offset vs UTC in hours (e.g. set timezone +2, set timezone -5, set timezone 5.5). Affects timestamps in bot messages only.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 ❓ • *help* — This message."""
@@ -595,6 +601,28 @@ class Messenger:
         print(f"[{_ts()}] Messenger: strategy set to {rest}")
         await self._safe_reply(update, f"✅ Strategy updated\n\n🎯 AI strategy: {rest}")
 
+    async def _handle_filter_strategy(self, update, text: str) -> None:
+        """Set Filter strategy. Usage: strategy <name>. Values: conservative, aggressive, reversal."""
+        rest = text[len("strategy "):].strip().lower() if text.startswith("strategy ") else ""
+        if not rest:
+            await self._safe_reply(
+                update,
+                "🎯 Filter strategy\n\nUsage: strategy <name>\n"
+                "Values: conservative, aggressive, reversal.\n"
+                "Default: CONSERVATIVE.",
+            )
+            return
+        if rest not in FILTER_STRATEGY_VALUES:
+            await self._safe_reply(
+                update,
+                f"❌ Invalid filter strategy. Use one of: conservative, aggressive, reversal.",
+            )
+            return
+        name_upper = rest.upper()
+        self.db.set(REDIS_KEY_FILTER_STRATEGY, name_upper)
+        print(f"[{_ts()}] Messenger: filter strategy set to {name_upper}")
+        await self._safe_reply(update, f"🎯 Strategy changed to {name_upper}. Filters updated.")
+
     async def _handle_set_timezone(self, update, text: str) -> None:
         """Set timezone offset in hours from UTC. Usage: set timezone <offset>, e.g. +2, -5, 1.5."""
         rest = text[len("set timezone "):].strip()
@@ -785,6 +813,10 @@ class Messenger:
                 if strategy_val not in STRATEGY_VALUES:
                     strategy_val = "conservative"
                 lines.append(f"🎯 Strategy: {strategy_val}")
+                filter_strategy_val = (self.db.get(REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+                if filter_strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                    filter_strategy_val = "CONSERVATIVE"
+                lines.append(f"🛡️ Filter strategy: {filter_strategy_val}")
                 max_open = self._get_max_open_orders()
                 open_count = self._get_open_order_count()
                 lines.append(f"📋 Open orders: {open_count} / {max_open}")
@@ -822,6 +854,10 @@ class Messenger:
             await self._handle_orders_amount(update, text)
         elif text == "orders amount":
             await self._handle_orders_amount(update, "orders amount ")
+        elif text == "strategy":
+            await self._handle_filter_strategy(update, "strategy ")
+        elif text.startswith("strategy "):
+            await self._handle_filter_strategy(update, text)
         elif text == "balance":
             await self._reply_balance(update)
         elif text.startswith("set balance "):
