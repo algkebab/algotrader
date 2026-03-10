@@ -808,6 +808,7 @@ class Messenger:
                     "📱 Telegram: " + ("🔇 muted" if muted else "🔔 unmuted"),
                     "📄 Paper: " + ("ON (DB only)" if paper_on else "OFF (live)"),
                     f"📈 Symbols: top {symbols_n} by volume",
+                    "⚙️ Paper model: 3x leverage · 0.1% taker fee · 0.001%/h margin interest",
                 ]
                 strategy_val = (self.db.get(REDIS_KEY_STRATEGY) or "conservative").strip().lower()
                 if strategy_val not in STRATEGY_VALUES:
@@ -883,9 +884,22 @@ class Messenger:
             print(f"[{_ts()}] Messenger: query.answer() failed (continuing): {e}")
 
         if query.data.startswith("buy:"):
-            symbol = query.data.split(":")[1]
+            # Format: buy:SYMBOL[:stop_loss_pct:take_profit_pct]
+            parts = query.data.split(":")
+            symbol = parts[1]
+            stop_loss_pct = float(parts[2]) if len(parts) > 2 and parts[2] else None
+            take_profit_pct = float(parts[3]) if len(parts) > 3 and parts[3] else None
             amount = self._get_order_amount_usdt()
-            command = {"symbol": symbol, "amount": amount}
+            strategy_name = (self.db.get(REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+            if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                strategy_name = "CONSERVATIVE"
+            command = {
+                "symbol": symbol,
+                "amount": amount,
+                "stop_loss_pct": stop_loss_pct,
+                "take_profit_pct": take_profit_pct,
+                "strategy_name": strategy_name,
+            }
             self.db.rpush("trade_commands", json.dumps(command))
             
             print(f"[{_ts()}] Messenger: Pushed trade_command to Redis: {symbol}")
@@ -962,15 +976,49 @@ class Messenger:
                     d = note['data']
                     result_emoji = "💰" if d['pnl_usdt'] >= 0 else "📉"
                     pnl_sign = "+" if d['pnl_usdt'] >= 0 else ""
-                    msg = (
-                        f"{result_emoji} *Trade closed*\n\n"
-                        f"📌 #{d['symbol'].replace('/', '')}\n"
-                        f"📋 {d['reason']}\n\n"
-                        f"💵 PnL: `{pnl_sign}{d['pnl_usdt']}` USDT\n"
-                        f"📈 PnL: `{pnl_sign}{d['pnl_percent']}`%\n\n"
-                        f"📥 Entry: `{d.get('entry', '—')}`\n"
-                        f"📤 Exit: `{d.get('exit', '—')}`"
+                    lines = [
+                        f"{result_emoji} *Trade closed*",
+                        "",
+                        f"📌 #{d['symbol'].replace('/', '')}",
+                        f"📋 {d['reason']}",
+                        "",
+                        f"💵 Net PnL: `{pnl_sign}{d['pnl_usdt']}` USDT",
+                        f"📈 PnL: `{pnl_sign}{d['pnl_percent']}`%",
+                    ]
+                    # Optional extended audit fields (paper trades)
+                    gross_pnl_usdt = d.get("gross_pnl_usdt")
+                    if gross_pnl_usdt is not None:
+                        gross_sign = "+" if gross_pnl_usdt >= 0 else ""
+                        lines.append(f"💰 Gross PnL: `{gross_sign}{gross_pnl_usdt}` USDT")
+                    gross_pnl_percent = d.get("gross_pnl_percent")
+                    if gross_pnl_percent is not None:
+                        gsign = "+" if gross_pnl_percent >= 0 else ""
+                        lines.append(f"📊 Gross PnL: `{gsign}{gross_pnl_percent}`%")
+                    exit_fee = d.get("exit_fee_usd")
+                    interest = d.get("margin_interest_paid")
+                    if exit_fee is not None or interest is not None:
+                        fee_str = f"{exit_fee:.4f}" if isinstance(exit_fee, (int, float)) else exit_fee
+                        int_str = f"{interest:.4f}" if isinstance(interest, (int, float)) else interest
+                        lines.append(f"💸 Fees: entry (inc.), exit `{fee_str}` USDT")
+                        lines.append(f"🏦 Margin interest: `{int_str}` USDT")
+                    net_roe = d.get("net_pnl_pct")
+                    if net_roe is not None:
+                        roe_sign = "+" if net_roe >= 0 else ""
+                        lines.append(f"📈 ROE (on margin): `{roe_sign}{net_roe}`%")
+                    hours_held = d.get("hours_held")
+                    if hours_held is not None:
+                        lines.append(f"⏱️ Time in trade: `{hours_held}` h")
+                    strategy_name = d.get("strategy_name")
+                    if strategy_name:
+                        lines.append(f"🎯 Strategy: `{strategy_name}`")
+                    lines.extend(
+                        [
+                            "",
+                            f"📥 Entry: `{d.get('entry', '—')}`",
+                            f"📤 Exit: `{d.get('exit', '—')}`",
+                        ]
                     )
+                    msg = "\n".join(lines)
                     await self.send_telegram_msg(msg)
             
             await asyncio.sleep(1)
@@ -1019,14 +1067,49 @@ class Messenger:
                         continue
 
                     emoji = "🚀" if verdict == "BUY" else "⚠️"
-                    
+
+                    stop_loss_pct = data.get("stop_loss_pct")
+                    take_profit_pct = data.get("take_profit_pct")
+                    high_24h = data.get("high_24h")
+                    low_24h = data.get("low_24h")
+
+                    # Strategies for context
+                    ai_strategy_val = (self.db.get(REDIS_KEY_STRATEGY) or "conservative").strip().lower()
+                    if ai_strategy_val not in STRATEGY_VALUES:
+                        ai_strategy_val = "conservative"
+                    filter_strategy_val = (self.db.get(REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+                    if filter_strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                        filter_strategy_val = "CONSERVATIVE"
+
+                    # Format TP/SL line
+                    sl_str = None
+                    tp_str = None
+                    try:
+                        if stop_loss_pct is not None:
+                            sl_str = f"{float(stop_loss_pct):.2f}%"
+                        if take_profit_pct is not None:
+                            tp_str = f"{float(take_profit_pct):.2f}%"
+                    except (TypeError, ValueError):
+                        pass
+
+                    tp_sl_line = ""
+                    if sl_str or tp_str:
+                        tp_sl_line = f"• SL/TP: `{sl_str or 'N/A'}` / `{tp_str or 'N/A'}`\n"
+
+                    range_line = ""
+                    if high_24h is not None or low_24h is not None:
+                        range_line = f"• 24h range: `{low_24h or 'N/A'}` – `{high_24h or 'N/A'}`\n"
+
                     message = (
                         f"{emoji} *Signal: {symbol}*\n\n"
                         f"🤖 Verdict: `{verdict}` ({data.get('confidence', 'N/A')})\n"
                         f"📝 _{data.get('reason', 'N/A')}_\n\n"
                         f"📊 Stats\n"
                         f"• Price: `${data.get('last_price')}`\n"
-                        f"• RSI: `{data.get('rsi')}` · RVOL: `{data.get('rvol')}x`\n\n"
+                        f"• RSI: `{data.get('rsi')}` · RVOL: `{data.get('rvol')}x`\n"
+                        f"{tp_sl_line}"
+                        f"{range_line}"
+                        f"• AI strategy: `{ai_strategy_val}` · Filter: `{filter_strategy_val}`\n\n"
                         f"🔗 [TradingView]({tv_url}) · [Binance]({binance_url})"
                     )
 
@@ -1035,7 +1118,15 @@ class Messenger:
                     keyboard = None
                     if verdict == "BUY" and not autopilot_on:
                         amt = self._get_order_amount_usdt()
-                        kb = [[InlineKeyboardButton(f"🚀 Buy {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT", callback_data=f"buy:{symbol}")]]
+                        # Encode AI TP/SL percentages into callback data when available
+                        if stop_loss_pct is not None and take_profit_pct is not None:
+                            callback = f"buy:{symbol}:{stop_loss_pct}:{take_profit_pct}"
+                        else:
+                            callback = f"buy:{symbol}"
+                        kb = [[InlineKeyboardButton(
+                            f"🚀 Buy {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT",
+                            callback_data=callback,
+                        )]]
                         keyboard = InlineKeyboardMarkup(kb)
 
                     await self.send_telegram_msg(message, symbol, keyboard)
@@ -1066,22 +1157,38 @@ class Messenger:
                                         # skip pushing command below
                                     else:
                                         amt = self._get_order_amount_usdt()
-                                        command = {"symbol": symbol, "amount": amt}
+                                        strategy_name = (self.db.get(REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+                                        if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                                            strategy_name = "CONSERVATIVE"
+                                        command = {
+                                            "symbol": symbol,
+                                            "amount": amt,
+                                            "stop_loss_pct": stop_loss_pct,
+                                            "take_profit_pct": take_profit_pct,
+                                            "strategy_name": strategy_name,
+                                        }
                                         self.db.rpush("trade_commands", json.dumps(command))
+                                        sl_info = f"{float(stop_loss_pct):.2f}%" if isinstance(stop_loss_pct, (int, float)) else str(stop_loss_pct)
+                                        tp_info = f"{float(take_profit_pct):.2f}%" if isinstance(take_profit_pct, (int, float)) else str(take_profit_pct)
                                         await self.send_telegram_msg(
                                             f"🤖 *Autopilot order sent*\n\n"
-                                            f"📌 {symbol} · {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT\n\n"
+                                            f"📌 {symbol} · {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT\n"
+                                            f"🎯 Strategy: `{strategy_name}` · SL/TP: `{sl_info}` / `{tp_info}`\n\n"
                                             f"_Executor will confirm shortly._"
                                         )
                                         print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
                             except Exception as e:
                                 print(f"[{_ts()}] Messenger: DB check for open order failed: {e}")
                                 amt = self._get_order_amount_usdt()
-                                command = {"symbol": symbol, "amount": amt}
+                                strategy_name = (self.db.get(REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+                                if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                                    strategy_name = "CONSERVATIVE"
+                                command = {"symbol": symbol, "amount": amt, "strategy_name": strategy_name}
                                 self.db.rpush("trade_commands", json.dumps(command))
                                 await self.send_telegram_msg(
                                     f"🤖 *Autopilot order sent*\n\n"
-                                    f"📌 {symbol} · {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT\n\n"
+                                    f"📌 {symbol} · {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT\n"
+                                    f"🎯 Strategy: `{strategy_name}`\n\n"
                                     f"_Executor will confirm shortly._"
                                 )
                                 print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")

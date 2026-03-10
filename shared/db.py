@@ -16,6 +16,20 @@ def get_database_path() -> str:
     return os.getenv("DATABASE_PATH", DEFAULT_DB_PATH)
 
 
+def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
+    """Add new order columns for existing DBs that were created before these columns existed."""
+    cur = conn.execute("PRAGMA table_info(orders)")
+    existing = {row[1] for row in cur.fetchall()}
+    for col, spec in [
+        ("borrowed_amount", "REAL NOT NULL DEFAULT 0"),
+        ("hourly_interest_rate", "REAL"),
+        ("strategy_name", "TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
+            existing.add(col)
+
+
 @contextmanager
 def get_connection():
     path = get_database_path()
@@ -50,11 +64,21 @@ def init_schema(conn: sqlite3.Connection) -> None:
             pnl_usdt REAL,
             pnl_percent REAL,
             close_reason TEXT,
+            entry_fee_usd REAL NOT NULL DEFAULT 0,
+            exit_fee_usd REAL NOT NULL DEFAULT 0,
+            margin_interest_paid REAL NOT NULL DEFAULT 0,
+            net_pnl_pct REAL,
+            borrowed_amount REAL NOT NULL DEFAULT 0,
+            hourly_interest_rate REAL,
+            strategy_name TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_orders_symbol_status ON orders(symbol, status);
         CREATE INDEX IF NOT EXISTS idx_orders_opened_at ON orders(opened_at);
+    """)
+    _add_orders_columns_if_missing(conn)
 
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS balance (
             currency TEXT PRIMARY KEY,
             amount REAL NOT NULL DEFAULT 0,
@@ -72,13 +96,17 @@ def insert_order(
     quantity: float,
     tp_price: float,
     sl_price: float,
+    entry_fee_usd: float = 0.0,
     exchange_order_id: Optional[str] = None,
+    borrowed_amount: float = 0.0,
+    hourly_interest_rate: Optional[float] = None,
+    strategy_name: Optional[str] = None,
 ) -> int:
     now = datetime.utcnow().isoformat() + "Z"
     cur = conn.execute(
-        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, status, exchange_order_id, opened_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
-        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, now),
+        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)""",
+        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name),
     )
     return cur.lastrowid
 
@@ -103,7 +131,7 @@ def get_open_order_id_for_symbol(conn: sqlite3.Connection, symbol: str) -> Optio
 def get_open_order_for_symbol(conn: sqlite3.Connection, symbol: str) -> Optional[Any]:
     """Return one open order row for symbol (id, symbol, entry_price, quantity, tp_price, sl_price, etc.) or None."""
     row = conn.execute(
-        """SELECT id, symbol, entry_price, quantity, tp_price, sl_price, amount_usdt, opened_at
+        """SELECT id, symbol, entry_price, quantity, tp_price, sl_price, amount_usdt, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name
            FROM orders WHERE symbol = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1""",
         (symbol,),
     ).fetchone()
@@ -116,12 +144,23 @@ def update_order_closed(
     pnl_usdt: float,
     pnl_percent: float,
     close_reason: str,
+    exit_fee_usd: float,
+    margin_interest_paid: float,
+    net_pnl_pct: float,
 ) -> None:
     now = datetime.utcnow().isoformat() + "Z"
     conn.execute(
-        """UPDATE orders SET status = 'closed', closed_at = ?, pnl_usdt = ?, pnl_percent = ?, close_reason = ?
+        """UPDATE orders
+           SET status = 'closed',
+               closed_at = ?,
+               pnl_usdt = ?,
+               pnl_percent = ?,
+               close_reason = ?,
+               exit_fee_usd = ?,
+               margin_interest_paid = ?,
+               net_pnl_pct = ?
            WHERE id = ?""",
-        (now, pnl_usdt, pnl_percent, close_reason, order_id),
+        (now, pnl_usdt, pnl_percent, close_reason, exit_fee_usd, margin_interest_paid, net_pnl_pct, order_id),
     )
 
 
