@@ -21,6 +21,10 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
     cur = conn.execute("PRAGMA table_info(orders)")
     existing = {row[1] for row in cur.fetchall()}
     for col, spec in [
+        ("entry_fee_usd", "REAL NOT NULL DEFAULT 0"),
+        ("exit_fee_usd", "REAL NOT NULL DEFAULT 0"),
+        ("margin_interest_paid", "REAL NOT NULL DEFAULT 0"),
+        ("net_pnl_pct", "REAL"),
         ("borrowed_amount", "REAL NOT NULL DEFAULT 0"),
         ("hourly_interest_rate", "REAL"),
         ("strategy_name", "TEXT"),
