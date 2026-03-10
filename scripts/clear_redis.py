@@ -27,6 +27,8 @@ SYSTEM_KEYS = frozenset({
     "system:papertrading",
     "system:max_symbols",
     "system:strategy",
+    "system:max_open_orders",
+    "system:order_amount_usdt",
 })
 PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 

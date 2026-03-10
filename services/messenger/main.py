@@ -52,6 +52,8 @@ REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
 REDIS_KEY_STRATEGY = "system:strategy"
 # Max simultaneous open orders for autopilot (default 10)
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
+# Order amount in USDT per trade (default 10)
+REDIS_KEY_ORDER_AMOUNT_USDT = "system:order_amount_usdt"
 
 # Keys we never delete on "clear redis" (system settings)
 REDIS_SYSTEM_KEYS = frozenset({
@@ -63,6 +65,7 @@ REDIS_SYSTEM_KEYS = frozenset({
     REDIS_KEY_MAX_SYMBOLS,
     REDIS_KEY_STRATEGY,
     REDIS_KEY_MAX_OPEN_ORDERS,
+    REDIS_KEY_ORDER_AMOUNT_USDT,
 })
 
 # Allowed values for "set strategy"
@@ -81,7 +84,10 @@ REDIS_DATA_KEYS = [
 ]
 REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
-AUTOPILOT_ORDER_AMOUNT_USDT = 10
+# Bounds for "orders amount <n>"
+ORDER_AMOUNT_MIN = 1
+ORDER_AMOUNT_MAX = 1000
+ORDER_AMOUNT_DEFAULT = 10
 # Bounds for "orders set max <n>"
 MAX_OPEN_ORDERS_MIN = 1
 MAX_OPEN_ORDERS_MAX = 50
@@ -134,6 +140,7 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 📋 • *orders* — List open orders from DB.
 🔒 • *orders close* <symbol> — Manually close open order (e.g. orders close BTC/USDT). Updates balance.
 🔢 • *orders set max* <number> — Max open orders for autopilot (e.g. orders set max 15). Default 10.
+💵 • *orders amount* <number> — USDT per order for autopilot & Buy button (e.g. orders amount 15). Default 10.
 💰 • *balance* — Wallet, today PnL, and change since last check.
 💵 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols 50). Min 5, max 200.
@@ -349,6 +356,52 @@ class Messenger:
         await self._safe_reply(
             update,
             f"✅ Max open orders updated\n\n📋 Autopilot will allow up to {n} simultaneous open orders.",
+        )
+
+    def _get_order_amount_usdt(self) -> float:
+        """Return order amount in USDT from Redis (default ORDER_AMOUNT_DEFAULT)."""
+        val = self.db.get(REDIS_KEY_ORDER_AMOUNT_USDT)
+        if val is None:
+            return float(ORDER_AMOUNT_DEFAULT)
+        try:
+            n = float(val)
+            return max(ORDER_AMOUNT_MIN, min(ORDER_AMOUNT_MAX, n))
+        except (ValueError, TypeError):
+            return float(ORDER_AMOUNT_DEFAULT)
+
+    async def _handle_orders_amount(self, update, text: str) -> None:
+        """Set order amount in USDT per trade. Usage: orders amount <number> (e.g. orders amount 15)."""
+        rest = text[len("orders amount "):].strip()
+        if not rest:
+            amt = self._get_order_amount_usdt()
+            await self._safe_reply(
+                update,
+                f"💵 Orders amount\n\n"
+                f"Current: {amt:.0f} USDT per order\n\n"
+                f"Usage: orders amount <number>\n"
+                f"Min {ORDER_AMOUNT_MIN}, max {ORDER_AMOUNT_MAX}. Default {ORDER_AMOUNT_DEFAULT}.\n"
+                "Example: orders amount 15",
+            )
+            return
+        try:
+            n = float(rest)
+        except ValueError:
+            await self._safe_reply(
+                update,
+                f"❌ Invalid number. Use a value between {ORDER_AMOUNT_MIN} and {ORDER_AMOUNT_MAX}.",
+            )
+            return
+        if n < ORDER_AMOUNT_MIN or n > ORDER_AMOUNT_MAX:
+            await self._safe_reply(
+                update,
+                f"❌ Out of range. Use {ORDER_AMOUNT_MIN}–{ORDER_AMOUNT_MAX}.",
+            )
+            return
+        self.db.set(REDIS_KEY_ORDER_AMOUNT_USDT, f"{n:.2f}".rstrip('0').rstrip('.'))
+        print(f"[{_ts()}] Messenger: order_amount_usdt set to {n}")
+        await self._safe_reply(
+            update,
+            f"✅ Order amount updated\n\n💵 {n:.0f if n == int(n) else n} USDT per order (autopilot & Buy button).",
         )
 
     async def _reply_balance(self, update) -> None:
@@ -587,6 +640,8 @@ class Messenger:
             max_open = self._get_max_open_orders()
             open_count = self._get_open_order_count()
             lines.append(f"📋 Open orders: {open_count} / {max_open}")
+            amt = self._get_order_amount_usdt()
+            lines.append(f"💵 Order amount: {amt:.0f if amt == int(amt) else amt} USDT")
             await self._safe_reply(update, "\n".join(lines))
         elif text == "autopilot on":
             self.db.set(REDIS_KEY_AUTOPILOT, "1")
@@ -595,7 +650,7 @@ class Messenger:
             await self._safe_reply(
                 update,
                 "🤖 Autopilot on\n\n"
-                "BUY verdicts → auto orders (10 USDT). No Buy button.\n"
+                "BUY verdicts → auto orders (set by orders amount). No Buy button.\n"
                 "Pipeline resumed if it was paused.",
             )
         elif text == "autopilot off":
@@ -612,6 +667,10 @@ class Messenger:
             await self._handle_orders_close(update, text)
         elif text.startswith("orders set max "):
             await self._handle_orders_set_max(update, text)
+        elif text.startswith("orders amount "):
+            await self._handle_orders_amount(update, text)
+        elif text == "orders amount":
+            await self._handle_orders_amount(update, "orders amount ")
         elif text == "balance":
             await self._reply_balance(update)
         elif text.startswith("set balance "):
@@ -634,8 +693,8 @@ class Messenger:
 
         if query.data.startswith("buy:"):
             symbol = query.data.split(":")[1]
-            # Payload for the Executor service
-            command = {"symbol": symbol, "amount": 10}
+            amount = self._get_order_amount_usdt()
+            command = {"symbol": symbol, "amount": amount}
             self.db.rpush("trade_commands", json.dumps(command))
             
             print(f"[{_ts()}] Messenger: Pushed trade_command to Redis: {symbol}")
@@ -784,7 +843,8 @@ class Messenger:
                     autopilot_on = self.db.get(REDIS_KEY_AUTOPILOT)
                     keyboard = None
                     if verdict == "BUY" and not autopilot_on:
-                        kb = [[InlineKeyboardButton(f"🚀 Buy 10 USDT", callback_data=f"buy:{symbol}")]]
+                        amt = self._get_order_amount_usdt()
+                        kb = [[InlineKeyboardButton(f"🚀 Buy {amt:.0f if amt == int(amt) else amt} USDT", callback_data=f"buy:{symbol}")]]
                         keyboard = InlineKeyboardMarkup(kb)
 
                     await self.send_telegram_msg(message, symbol, keyboard)
@@ -814,21 +874,23 @@ class Messenger:
                                         print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (already have open order)")
                                         # skip pushing command below
                                     else:
-                                        command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
+                                        amt = self._get_order_amount_usdt()
+                                        command = {"symbol": symbol, "amount": amt}
                                         self.db.rpush("trade_commands", json.dumps(command))
                                         await self.send_telegram_msg(
                                             f"🤖 *Autopilot order sent*\n\n"
-                                            f"📌 {symbol} · {AUTOPILOT_ORDER_AMOUNT_USDT} USDT\n\n"
+                                            f"📌 {symbol} · {amt:.0f if amt == int(amt) else amt} USDT\n\n"
                                             f"_Executor will confirm shortly._"
                                         )
                                         print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
                             except Exception as e:
                                 print(f"[{_ts()}] Messenger: DB check for open order failed: {e}")
-                                command = {"symbol": symbol, "amount": AUTOPILOT_ORDER_AMOUNT_USDT}
+                                amt = self._get_order_amount_usdt()
+                                command = {"symbol": symbol, "amount": amt}
                                 self.db.rpush("trade_commands", json.dumps(command))
                                 await self.send_telegram_msg(
                                     f"🤖 *Autopilot order sent*\n\n"
-                                    f"📌 {symbol} · {AUTOPILOT_ORDER_AMOUNT_USDT} USDT\n\n"
+                                    f"📌 {symbol} · {amt:.0f if amt == int(amt) else amt} USDT\n\n"
                                     f"_Executor will confirm shortly._"
                                 )
                                 print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
