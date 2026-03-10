@@ -109,6 +109,8 @@ class Scout:
                     last_price = ticker.get('last')
                     change_24h = ticker.get('percentage')
                     volume_24h = ticker.get('quoteVolume')
+                    high_24h = ticker.get('high')
+                    low_24h = ticker.get('low')
 
                     # 2. Get historical candles (last 24 hours)
                     candles = await self.fetch_ohlcv_data(symbol)
@@ -117,6 +119,8 @@ class Scout:
                         'last_price': last_price,
                         'change_24h': change_24h,
                         'volume_24h': volume_24h,
+                        'high_24h': high_24h,
+                        'low_24h': low_24h,
                         'candles': candles,  # Nested candle data for AI/Filter analysis
                     }
 

@@ -27,13 +27,34 @@ def _ts():
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
 MAX_OPEN_ORDERS_DEFAULT = 10
 
-# AI system prompts per strategy (set via Telegram "set strategy <name>")
+# AI system prompts per AI strategy (set via Telegram "set strategy <name>")
 STRATEGY_SYSTEM_MESSAGES = {
-    "conservative": "You are an expert crypto day-trader. Be conservative and look for high-probability setups. Prefer WAIT unless the setup is very clear and well confirmed.",
-    "moderate": "You are an expert crypto day-trader. Use a balanced approach: take setups with good risk/reward and allow more entries than conservative. Still require technical confirmation before BUY.",
-    "aggressive": "You are an expert crypto day-trader. You are aggressive: take more BUY signals when technicals align. Higher risk tolerance. Favor BUY when RSI and volume support the move.",
-    "active_day": "You are an expert crypto day-trader focused on active day-trading. Take frequent opportunities: scalp-style, more BUY signals on momentum and volume spikes. Quick in-and-out mindset.",
+    "conservative": (
+        "You are an expert crypto day-trader in CONSERVATIVE mode. "
+        "Focus on high-probability setups only. Require strong volume confirmation, "
+        "RSI below 70, and clean technical structure before considering BUY. "
+        "Prefer WAIT unless the setup is very clear, with asymmetric risk/reward and "
+        "a logical stop below recent support."
+    ),
+    "aggressive": (
+        "You are an expert crypto day-trader in AGGRESSIVE mode. "
+        "Focus on momentum and breakouts with higher risk tolerance. "
+        "You may accept RSI up to 85 when strong volume and trend continuation justify it. "
+        "Still avoid chasing obvious exhaustion wicks; look for continuation patterns, "
+        "strong breakouts, and clear invalidation levels for the stop loss."
+    ),
+    "reversal": (
+        "You are an expert crypto day-trader in REVERSAL mode. "
+        "Focus on identifying oversold exhaustion and potential bounces from local bottoms. "
+        "Look for RSI below 30, price-action rejection at or near the lows of the recent range, "
+        "and signs of seller exhaustion (long lower wicks, volume spikes on bounces). "
+        "Avoid late entries after the move has already bounced far from the lows."
+    ),
 }
+
+# Filter strategy key (set by Messenger 'strategy <name>', used by Filter & Brain)
+REDIS_KEY_FILTER_STRATEGY = "system:filter_strategy"
+FILTER_STRATEGY_DEFAULT = "CONSERVATIVE"
 
 class Brain:
     def __init__(self):
@@ -55,11 +76,25 @@ class Brain:
         key = str(val).strip().lower()
         return STRATEGY_SYSTEM_MESSAGES.get(key, STRATEGY_SYSTEM_MESSAGES["conservative"])
 
+    def _get_filter_strategy_name(self):
+        """Return current filter strategy name used by Filter service (default CONSERVATIVE)."""
+        val = self.db.get(REDIS_KEY_FILTER_STRATEGY)
+        name = (val or FILTER_STRATEGY_DEFAULT).strip().upper()
+        if name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+            name = FILTER_STRATEGY_DEFAULT
+        return name
+
     def should_analyze(self, symbol, current_price):
         """
         Implements smart caching to save money.
         Returns True if price moved significantly or cache expired.
         """
+        # Skip symbols that recently received a WAIT verdict (negative cache)
+        wait_key = f"cache:brain_wait:{symbol}"
+        if self.db.get(wait_key):
+            print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (recent WAIT verdict cache active)")
+            return False
+
         cache_data = self.db.get(f"cache:brain_price:{symbol}")
         
         if cache_data:
@@ -90,24 +125,58 @@ class Brain:
         except Exception:
             return 0
 
-    def get_ai_verdict(self, symbol, price, rsi, rvol, candles):
-        """Sends technical data to GPT for a high-level trading verdict"""
-        candle_summary = [f"Close: {c[4]}, Vol: {c[5]}" for c in candles[-5:]]
-        
-        prompt = f"""
-        Analyze this crypto trade setup for {symbol}:
-        - Current Price: {price}
-        - RSI (14): {rsi}
-        - Relative Volume (RVOL): {rvol}
-        - Recent Price Action (Last 5h): {', '.join(candle_summary)}
+    def get_ai_verdict(self, symbol, price, rsi, rvol, candles, high_24h, low_24h):
+        """Sends technical data to GPT for a high-level trading verdict with TP/SL targets."""
+        recent_candles = candles[-5:] if candles else []
+        candle_summary = [f"Close: {c[4]}, Vol: {c[5]}" for c in recent_candles]
 
-        Provide a verdict in JSON format:
-        {{
-            "verdict": "BUY" or "WAIT",
-            "reason": "Short technical explanation",
-            "confidence": "0-100%"
-        }}
-        """
+        # 24h range context
+        high_str = "N/A" if high_24h is None else f"{high_24h}"
+        low_str = "N/A" if low_24h is None else f"{low_24h}"
+
+        filter_strategy = self._get_filter_strategy_name()
+
+        symbol_base = symbol.split("/")[0] if "/" in symbol else symbol
+        is_major = symbol_base in {"BTC", "ETH"}
+
+        prompt = f"""
+Analyze this crypto trade setup for {symbol} in the context of the current market:
+- Current Price: {price}
+- 24h High: {high_str}
+- 24h Low: {low_str}
+- RSI (14): {rsi}
+- Relative Volume (RVOL): {rvol}
+- Recent Price Action (Last 5 candles): {', '.join(candle_summary) if candle_summary else 'N/A'}
+- Active filter strategy from the pipeline: {filter_strategy}
+
+You must act as a strategic architect for entries and exits, not just a simple yes/no filter.
+
+Return a STRICT JSON object with this exact schema:
+{{
+  "verdict": "BUY" or "WAIT",
+  "stop_loss_pct": "Float (e.g., 1.5 for 1.5% below entry)",
+  "take_profit_pct": "Float (e.g., 4.5 for 4.5% above entry)",
+  "reason": "Technical justification for these specific levels and the verdict",
+  "confidence": "0-100%"
+}}
+
+Rules for stop_loss_pct (very important):
+- stop_loss_pct is the percentage distance BELOW the entry price where the stop should be placed.
+- For BTC/USDT and ETH/USDT you MUST use stop_loss_pct >= 0.8 (never tighter than 0.8%).
+- For ALL other symbols you MUST use stop_loss_pct >= 1.2 (never tighter than 1.2%).
+- Place the stop loss below the recent local support or the lowest wick of the last 5 candles when possible.
+- Avoid unrealistically tight stops that will be hit by normal intraday noise.
+
+Rules for take_profit_pct:
+- Choose a realistic take_profit_pct that gives a favorable risk/reward vs the stop loss, consistent with the active filter strategy {filter_strategy}.
+
+Behavior by strategy:
+- When filter strategy is CONSERVATIVE, prefer WAIT unless the setup is very clean with strong confirmation and a clear invalidation level.
+- When filter strategy is AGGRESSIVE, you may accept more marginal setups if momentum and volume are strong, but still respect the stop loss rules above.
+- When filter strategy is REVERSAL, focus on oversold exhaustion, RSI below 30, rejection from lows, and bounces from support; avoid chasing late bounces that are far from the recent lows.
+
+Respond with ONLY the JSON object, no comments or additional text.
+"""
 
         system_content = self._get_strategy_system_content()
         try:
@@ -117,12 +186,20 @@ class Brain:
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": prompt}
                 ],
-                response_format={ "type": "json_object" }
+                response_format={"type": "json_object"},
             )
-            return json.loads(response.choices[0].message.content)
+            content = response.choices[0].message.content
+            data = json.loads(content)
+            return data
         except Exception as e:
             print(f"[{_ts()}] ❌ AI Error: {e}")
-            return {"verdict": "WAIT", "reason": "AI Analysis failed", "confidence": "0%"}
+            return {
+                "verdict": "WAIT",
+                "stop_loss_pct": 0.0,
+                "take_profit_pct": 0.0,
+                "reason": "AI Analysis failed",
+                "confidence": "0%",
+            }
 
     def run(self):
         print(f"[{_ts()}] 🧠 Brain: AI Technical Analyst is online with Smart Cache...")
@@ -184,12 +261,19 @@ class Brain:
                 print(f"[{_ts()}] 🔍 Analyzing {symbol} with AI...")
                 
                 analysis = self.get_ai_verdict(
-                    symbol, 
-                    current_price, 
-                    item['rsi'], 
-                    item['rvol'], 
-                    item.get('candles', [])
+                    symbol,
+                    current_price,
+                    item['rsi'],
+                    item['rvol'],
+                    item.get('candles', []),
+                    item.get('high_24h'),
+                    item.get('low_24h'),
                 )
+
+                # Negative cache: when AI says WAIT, cache symbol to avoid re-analyzing flat charts
+                if str(analysis.get("verdict", "")).upper() == "WAIT":
+                    wait_key = f"cache:brain_wait:{symbol}"
+                    self.db.set(wait_key, "1", ex=1800)
 
                 # Merge AI verdict with market data
                 final_signal = {**item, **analysis}
