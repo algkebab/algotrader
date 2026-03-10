@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import sys
 import redis
@@ -108,6 +109,9 @@ MAX_SYMBOLS_MAX = 200
 MAX_SYMBOLS_DEFAULT = 30
 # Paper leverage for margin on manual close (must match Monitor/Executor)
 PAPER_LEVERAGE = 3
+# Paper close: fee and interest (must match Monitor)
+BINANCE_SPOT_FEE = 0.001
+HOURLY_MARGIN_INTEREST_RATE = 0.00001
 
 def _normalize_symbol(s: str) -> str:
     """Normalize to BASE/USDT (e.g. BTCUSDT or btc/usdt -> BTC/USDT)."""
@@ -292,22 +296,58 @@ class Messenger:
             entry_price = float(row["entry_price"])
             qty = float(row["quantity"])
             order_id = row["id"]
-            pnl_usdt = (close_price - entry_price) * qty
-            pnl_percent = ((close_price / entry_price) - 1) * 100
+            notional_usdt = float(row["amount_usdt"])
+            gross_pnl_usdt = (close_price - entry_price) * qty
+            gross_pnl_percent = ((close_price / entry_price) - 1) * 100
             reason = "Manual close"
             paper = self.db.get("system:papertrading") != "0"
-            margin_usdt = float(row["amount_usdt"]) / PAPER_LEVERAGE if paper else 0.0
+            margin_usdt = notional_usdt / PAPER_LEVERAGE if paper else 0.0
+
+            exit_fee_usd = 0.0
+            margin_interest_paid = 0.0
+            net_pnl_usdt = gross_pnl_usdt
+            net_pnl_pct = gross_pnl_percent
+            if paper:
+                exit_notional = qty * close_price
+                exit_fee_usd = exit_notional * BINANCE_SPOT_FEE
+                borrowed = row.get("borrowed_amount")
+                if borrowed is not None:
+                    try:
+                        borrowed = float(borrowed)
+                    except (TypeError, ValueError):
+                        borrowed = None
+                if borrowed is None:
+                    borrowed = max(0.0, notional_usdt - margin_usdt)
+                rate = row.get("hourly_interest_rate")
+                if rate is not None:
+                    try:
+                        rate = float(rate)
+                    except (TypeError, ValueError):
+                        rate = HOURLY_MARGIN_INTEREST_RATE
+                else:
+                    rate = HOURLY_MARGIN_INTEREST_RATE
+                try:
+                    opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", "+00:00"))
+                    hours_held = max(1, math.ceil((datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0))
+                except Exception:
+                    hours_held = 1
+                margin_interest_paid = borrowed * rate * hours_held
+                net_pnl_usdt = gross_pnl_usdt - exit_fee_usd - margin_interest_paid
+                net_pnl_pct = (net_pnl_usdt / margin_usdt * 100) if margin_usdt else 0.0
 
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
                 shared_db.update_order_closed(
                     conn, order_id,
-                    pnl_usdt=round(pnl_usdt, 2),
-                    pnl_percent=round(pnl_percent, 2),
+                    pnl_usdt=round(net_pnl_usdt, 2),
+                    pnl_percent=round(net_pnl_pct, 2),
                     close_reason=reason,
+                    exit_fee_usd=float(exit_fee_usd),
+                    margin_interest_paid=float(margin_interest_paid),
+                    net_pnl_pct=round(net_pnl_pct, 2),
                 )
                 bal = shared_db.get_balance(conn, "USDT")
-                shared_db.set_balance(conn, "USDT", bal + pnl_usdt + margin_usdt)
+                shared_db.set_balance(conn, "USDT", bal + margin_usdt + net_pnl_usdt)
 
             if not paper:
                 self.db.hdel("active_trades", symbol)
@@ -318,16 +358,16 @@ class Messenger:
                     "symbol": symbol,
                     "entry": entry_price,
                     "exit": close_price,
-                    "pnl_usdt": round(pnl_usdt, 2),
-                    "pnl_percent": round(pnl_percent, 2),
+                    "pnl_usdt": round(net_pnl_usdt, 2),
+                    "pnl_percent": round(net_pnl_pct, 2),
                     "reason": reason,
                 },
             }))
-            print(f"[{_ts()}] Messenger: Manual close {symbol} at {close_price}. PnL: {pnl_usdt:.2f} USDT")
+            print(f"[{_ts()}] Messenger: Manual close {symbol} at {close_price}. PnL: {net_pnl_usdt:.2f} USDT")
             await self._safe_reply(
                 update,
                 f"✅ Order closed\n\n{symbol}\n"
-                f"💵 PnL: {pnl_usdt:+.2f} USDT ({pnl_percent:+.2f}%)\n"
+                f"💵 PnL: {net_pnl_usdt:+.2f} USDT ({net_pnl_pct:+.2f}%)\n"
                 f"Exit: {close_price}",
             )
         except Exception as e:
