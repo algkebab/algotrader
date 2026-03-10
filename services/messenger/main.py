@@ -43,8 +43,8 @@ REDIS_KEY_AUTOPILOT = "system:autopilot"
 REDIS_KEY_MUTED = "system:muted"
 # Redis key: "1" = paper trading (no exchange, DB only); "0" = live. Default when absent = paper.
 REDIS_KEY_PAPERTRADING = "system:papertrading"
-# Last balance check (for "balance" command diff)
-REDIS_KEY_BALANCE_LAST_USDT = "system:balance_last_usdt"
+# Last balance check (for "balance" command: compare day PnL since last check)
+REDIS_KEY_BALANCE_LAST_DAY_PNL = "system:balance_last_day_pnl"
 REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
 # Number of top symbols by volume Scout fetches from Binance (default 30)
 REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
@@ -76,7 +76,7 @@ REDIS_DATA_KEYS = [
     "trade_commands",
     "active_trades",
     "notifications",
-    REDIS_KEY_BALANCE_LAST_USDT,
+    REDIS_KEY_BALANCE_LAST_DAY_PNL,
     REDIS_KEY_BALANCE_LAST_CHECK,
 ]
 REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
@@ -134,7 +134,7 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 • *orders* — List open orders from DB.
 • *orders close* <symbol> — Manually close open order for symbol (e.g. orders close BTC/USDT). Updates balance.
 • *orders set max* <number> — Max simultaneous open orders for autopilot (e.g. orders set max 15). Default 10.
-• *balance* — Current USDT balance and change since last check.
+• *balance* — Current USDT balance, today's PnL (from closed orders), and day PnL change since last check.
 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 • *set symbols* <number> — Top N symbols by volume to fetch (e.g. set symbols 50). Min 5, max 200.
 • *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
@@ -352,47 +352,47 @@ class Messenger:
         )
 
     async def _reply_balance(self, update) -> None:
-        """Reply with current USDT balance from DB and delta since last check (stored in Redis)."""
+        """Reply with current USDT balance, today's PnL (from closed orders), and day PnL delta since last check."""
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
                 current = shared_db.get_balance(conn, "USDT")
+                today_pnl = shared_db.get_today_closed_pnl(conn)
         except Exception as e:
             await self._safe_reply(update, f"❌ Could not read balance: {e}")
             return
         now_iso = datetime.utcnow().isoformat() + "Z"
         now_short = (now_iso[:19].replace("T", " ") + " UTC")
-        last_str = self.db.get(REDIS_KEY_BALANCE_LAST_USDT)
+        last_pnl_str = self.db.get(REDIS_KEY_BALANCE_LAST_DAY_PNL)
         last_check = self.db.get(REDIS_KEY_BALANCE_LAST_CHECK)
-        if last_str is not None and last_check is not None:
+        if last_pnl_str is not None and last_check is not None:
             try:
-                last = float(last_str)
-                delta = current - last
-                if delta > 0:
+                last_pnl = float(last_pnl_str)
+                delta_pnl = today_pnl - last_pnl
+                if delta_pnl > 0:
                     change_emoji = "📈"
-                    change_text = f"+{delta:.2f} USDT since last check"
-                elif delta < 0:
+                    change_text = f"+{delta_pnl:.2f} USDT since last check"
+                elif delta_pnl < 0:
                     change_emoji = "📉"
-                    change_text = f"{delta:.2f} USDT since last check"
+                    change_text = f"{delta_pnl:.2f} USDT since last check"
                 else:
                     change_emoji = "➡️"
                     change_text = "No change since last check"
                 diff_line = f"{change_emoji} {change_text}\nLast check: {last_check[:19].replace('T', ' ')} UTC"
             except (ValueError, TypeError):
-                diff_line = f"Last check: —"
+                diff_line = "Last check: —"
         else:
-            diff_line = "First check — no previous balance to compare."
-        self.db.set(REDIS_KEY_BALANCE_LAST_USDT, f"{current:.2f}")
+            diff_line = "First check — no previous day PnL to compare."
+        self.db.set(REDIS_KEY_BALANCE_LAST_DAY_PNL, f"{today_pnl:.2f}")
         self.db.set(REDIS_KEY_BALANCE_LAST_CHECK, now_iso)
+        pnl_sign = "+" if today_pnl >= 0 else ""
         msg = (
             f"💰 *Balance (USDT)*\n\n"
-            f"`{current:.2f}` USDT\n\n"
+            f"Balance: `{current:.2f}` USDT\n"
+            f"Today PnL: `{pnl_sign}{today_pnl:.2f}` USDT\n\n"
             f"_{diff_line}_"
         )
-        try:
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        except TimedOut as e:
-            print(f"[{_ts()}] Messenger: reply_text timed out (balance state already updated): {e}")
+        await self._safe_reply(update, msg)
 
     async def _handle_set_balance(self, update, text: str) -> None:
         """Set USDT balance in DB. Usage: set balance <amount> (e.g. set balance 100.50)."""
@@ -559,7 +559,9 @@ class Messenger:
             )
         elif text == "status":
             paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
-            suppress_wait = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
+            # "0" = send WAIT; missing or "1" = suppress (default after deploy)
+            suppress_wait_val = self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
+            suppress_wait = suppress_wait_val != "0"
             autopilot = self.db.get(REDIS_KEY_AUTOPILOT)
             muted = self.db.get(REDIS_KEY_MUTED)
             paper_val = self.db.get(REDIS_KEY_PAPERTRADING)
@@ -743,16 +745,25 @@ class Messenger:
                     data = json.loads(payload)
                     
                     symbol = data['symbol']
-                    
+                    verdict = data.get('verdict', 'WAIT')
+
+                    # When at max open orders, don't show BUY signals (no slot to trade); consume and skip
+                    if verdict == "BUY":
+                        open_count = self._get_open_order_count()
+                        max_open = self._get_max_open_orders()
+                        if open_count >= max_open:
+                            print(f"[{_ts()}] Messenger: Dropping BUY signal for {symbol} (max open orders: {open_count}/{max_open})")
+                            continue
+
                     # Formatting external links
                     clean_symbol = symbol.replace('/', '')
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{clean_symbol}"
                     binance_url = f"https://www.binance.com/en/trade/{symbol.replace('/', '_')}"
 
-                    # AI Verdict handling
-                    verdict = data.get('verdict', 'WAIT')
-                    if verdict == "WAIT" and self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS):
-                        print(f"[{_ts()}] Messenger: Skipped WAIT signal for {symbol} (suppress enabled)")
+                    # AI Verdict handling: only send WAIT when explicitly enabled ("start wait").
+                    # When key is missing (e.g. after deploy) we suppress WAIT so deploy doesn't re-enable it.
+                    if verdict == "WAIT" and self.db.get(REDIS_KEY_SUPPRESS_WAIT_SIGNALS) != "0":
+                        print(f"[{_ts()}] Messenger: Skipped WAIT signal for {symbol} (suppress enabled or default)")
                         continue
 
                     emoji = "🚀" if verdict == "BUY" else "⚠️"

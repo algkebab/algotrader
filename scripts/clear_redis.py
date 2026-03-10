@@ -16,7 +16,7 @@ ALGOTRADER_DATA_KEYS = [
     "trade_commands",
     "active_trades",
     "notifications",
-    "system:balance_last_usdt",
+    "system:balance_last_day_pnl",
     "system:balance_last_check",
 ]
 SYSTEM_KEYS = frozenset({

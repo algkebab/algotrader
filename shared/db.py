@@ -130,6 +130,15 @@ def get_balance(conn: sqlite3.Connection, currency: str) -> float:
     return float(row["amount"]) if row else 0.0
 
 
+def get_today_closed_pnl(conn: sqlite3.Connection) -> float:
+    """Sum pnl_usdt for orders closed today (UTC). Returns 0.0 if none."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(pnl_usdt), 0) AS total
+           FROM orders WHERE status = 'closed' AND date(closed_at) = date('now')"""
+    ).fetchone()
+    return float(row["total"]) if row else 0.0
+
+
 def set_balance(conn: sqlite3.Connection, currency: str, amount: float) -> None:
     now = datetime.utcnow().isoformat() + "Z"
     conn.execute(

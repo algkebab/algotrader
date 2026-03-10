@@ -100,6 +100,13 @@ Automatic deployment runs on **push to `main`**: GitHub Actions SSHs into your V
 - **Automatic**: every **push to `main`** runs the deploy workflow (pull + `docker compose up -d --build`).
 - **Manual**: **Actions** → **Deploy to VPS** → **Run workflow**.
 
+### 3.1 Preserving state across deploys
+
+- **Redis** (signals, system settings, queues) and **trading_data** (SQLite DB, etc.) use **named volumes** (`redis_data`, `trading_data`). They persist across `docker compose up -d --build`.
+- **Do not** run `docker compose down -v`: the `-v` flag removes volumes and wipes Redis and DB, so the app would start from scratch (all settings and session state lost).
+- Use `docker compose down` (no `-v`) if you need to stop and remove containers; volumes stay. Next `up` will reuse the same data.
+- Redis is configured with `--appendonly yes` so keys are written to disk in `/data` and survive restarts.
+
 ---
 
 ## 4. Troubleshooting
@@ -110,3 +117,5 @@ Automatic deployment runs on **push to `main`**: GitHub Actions SSHs into your V
   - Ensure `VPS_USER` is in the `docker` group (`usermod -aG docker VPS_USER`) and that the user has logged in again (or reboot).
 - **No such file or directory** in deploy script  
   - Ensure `DEPLOY_PATH` (or `/opt/algotrader`) exists and is the directory that contains `docker-compose.yml` and the repo (so `git pull` and `docker compose` run there).
+- **Redis “empty” after deploy (e.g. WAIT signals reappear, settings reset)**  
+  - Normal deploys (`up -d --build`) do **not** remove volumes; Redis should keep its data. If state was lost, check: (1) Was this the **first** deploy on this host? (Volumes start empty.) (2) Was `docker compose down -v` or any volume-removing command run? Avoid `-v` to keep `redis_data` and `trading_data`.

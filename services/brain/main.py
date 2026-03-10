@@ -150,6 +150,13 @@ class Brain:
                 continue
 
             for item in candidates:
+                # Re-check at max capacity before each item (avoids race: 10th order opened after batch start)
+                open_count = self._get_open_order_count()
+                max_open = self._get_max_open_orders()
+                if open_count >= max_open:
+                    print(f"[{_ts()}] 🧠 Brain: Stopping (max open orders reached: {open_count}/{max_open})")
+                    break
+
                 symbol = item['symbol']
                 current_price = item['last_price']
 
@@ -169,6 +176,11 @@ class Brain:
                     continue
                 # --- SMART CACHE END ---
 
+                # Re-check again right before calling AI (no API call when at capacity)
+                if self._get_open_order_count() >= self._get_max_open_orders():
+                    print(f"[{_ts()}] 🧠 Brain: Skipping AI for {symbol} (max open orders reached)")
+                    break
+
                 print(f"[{_ts()}] 🔍 Analyzing {symbol} with AI...")
                 
                 analysis = self.get_ai_verdict(
@@ -182,7 +194,10 @@ class Brain:
                 # Merge AI verdict with market data
                 final_signal = {**item, **analysis}
 
-                # Never send a signal if we have an open order for this symbol
+                # Never send a signal if at max open orders or already have open order for this symbol
+                if self._get_open_order_count() >= self._get_max_open_orders():
+                    print(f"[{_ts()}] 🧠 Brain: Not sending signal for {symbol} (max open orders reached)")
+                    continue
                 try:
                     with shared_db.get_connection() as conn:
                         shared_db.init_schema(conn)

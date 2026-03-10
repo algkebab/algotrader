@@ -141,8 +141,11 @@ class Filter:
                     filtered_candidates.append(data)
 
             if filtered_candidates:
-                # Save to a new key for Brain to analyze
-                self.db.set('filtered_candidates', json.dumps(filtered_candidates))
+                # Re-check before writing (avoid race: 10th order opened during this loop)
+                if self._get_open_order_count() >= self._get_max_open_orders():
+                    pass  # Don't write; next cycle Filter will stay idle
+                else:
+                    self.db.set('filtered_candidates', json.dumps(filtered_candidates))
             
             time.sleep(10)
 
