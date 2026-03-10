@@ -23,6 +23,10 @@ load_dotenv()
 def _ts():
     return datetime.utcnow().strftime("%H:%M:%S")
 
+# Redis key for max open orders (set by Messenger "orders set max"); default 10
+REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
+MAX_OPEN_ORDERS_DEFAULT = 10
+
 # AI system prompts per strategy (set via Telegram "set strategy <name>")
 STRATEGY_SYSTEM_MESSAGES = {
     "conservative": "You are an expert crypto day-trader. Be conservative and look for high-probability setups. Prefer WAIT unless the setup is very clear and well confirmed.",
@@ -69,6 +73,22 @@ class Brain:
         # If no cache or price moved enough, we update and proceed
         self.db.set(f"cache:brain_price:{symbol}", current_price, ex=1800)
         return True
+
+    def _get_max_open_orders(self):
+        """Return max simultaneous open orders from Redis (default 10)."""
+        val = self.db.get(REDIS_KEY_MAX_OPEN_ORDERS)
+        if val is None or not str(val).isdigit():
+            return MAX_OPEN_ORDERS_DEFAULT
+        return max(1, min(50, int(val)))
+
+    def _get_open_order_count(self):
+        """Return number of open orders in DB."""
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                return len(shared_db.get_open_orders(conn))
+        except Exception:
+            return 0
 
     def get_ai_verdict(self, symbol, price, rsi, rvol, candles):
         """Sends technical data to GPT for a high-level trading verdict"""
@@ -119,7 +139,16 @@ class Brain:
                 continue
 
             candidates = json.loads(raw_data)
-            
+
+            # Do not call OpenAI when at max open orders (no new orders would be placed)
+            open_count = self._get_open_order_count()
+            max_open = self._get_max_open_orders()
+            if open_count >= max_open:
+                print(f"[{_ts()}] 🧠 Brain: Skipping AI (max open orders reached: {open_count}/{max_open})")
+                self.db.delete('filtered_candidates')
+                time.sleep(5)
+                continue
+
             for item in candidates:
                 symbol = item['symbol']
                 current_price = item['last_price']
@@ -152,8 +181,18 @@ class Brain:
 
                 # Merge AI verdict with market data
                 final_signal = {**item, **analysis}
-                
-                # Push to signals queue (for Messenger)
+
+                # Never send a signal if we have an open order for this symbol
+                try:
+                    with shared_db.get_connection() as conn:
+                        shared_db.init_schema(conn)
+                        if shared_db.get_open_order_id_for_symbol(conn, symbol) is not None:
+                            print(f"[{_ts()}] 🧠 Brain: Not sending signal for {symbol} (open order exists)")
+                            continue
+                except Exception as e:
+                    print(f"[{_ts()}] 🧠 Brain: DB check before push failed for {symbol}: {e}")
+                    continue
+
                 self.db.rpush('signals', json.dumps(final_signal))
 
             # Clear candidates after processing

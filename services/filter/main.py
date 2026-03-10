@@ -1,7 +1,22 @@
-import redis
 import json
 import os
+import sys
 import time
+
+import redis
+
+# Allow importing shared.db (project root or /app in Docker)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) == "filter" else _this_dir
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from shared import db as shared_db
+
+# Redis key for max open orders (set by Messenger "orders set max"); default 10
+REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
+MAX_OPEN_ORDERS_DEFAULT = 10
+
 
 class Filter:
     def __init__(self):
@@ -39,6 +54,22 @@ class Filter:
         rsi = 100 - (100 / (1 + rs))
         return round(rsi, 2)
 
+    def _get_max_open_orders(self):
+        """Return max simultaneous open orders from Redis (default 10)."""
+        val = self.db.get(REDIS_KEY_MAX_OPEN_ORDERS)
+        if val is None or not str(val).isdigit():
+            return MAX_OPEN_ORDERS_DEFAULT
+        return max(1, min(50, int(val)))
+
+    def _get_open_order_count(self):
+        """Return number of open orders in DB."""
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                return len(shared_db.get_open_orders(conn))
+        except Exception:
+            return 0
+
     def calculate_rvol(self, current_vol_24h):
         """
         Simplified Relative Volume calculation.
@@ -55,6 +86,14 @@ class Filter:
         while True:
             if self.db.get(PAUSED_KEY):
                 time.sleep(5)
+                continue
+
+            # Stop filtering when at max open orders (no new orders would be placed)
+            open_count = self._get_open_order_count()
+            max_open = self._get_max_open_orders()
+            if open_count >= max_open:
+                print(f"🛡️ Filter: Idle (max open orders reached: {open_count}/{max_open})")
+                time.sleep(10)
                 continue
 
             raw_data = self.db.get('market_data')

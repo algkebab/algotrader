@@ -50,6 +50,8 @@ REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
 REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
 # AI strategy: conservative, moderate, aggressive, active_day (default conservative)
 REDIS_KEY_STRATEGY = "system:strategy"
+# Max simultaneous open orders for autopilot (default 10)
+REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
 
 # Keys we never delete on "clear redis" (system settings)
 REDIS_SYSTEM_KEYS = frozenset({
@@ -60,6 +62,7 @@ REDIS_SYSTEM_KEYS = frozenset({
     REDIS_KEY_PAPERTRADING,
     REDIS_KEY_MAX_SYMBOLS,
     REDIS_KEY_STRATEGY,
+    REDIS_KEY_MAX_OPEN_ORDERS,
 })
 
 # Allowed values for "set strategy"
@@ -79,7 +82,10 @@ REDIS_DATA_KEYS = [
 REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
 AUTOPILOT_ORDER_AMOUNT_USDT = 10
-AUTOPILOT_MAX_OPEN_ORDERS = 10
+# Bounds for "orders set max <n>"
+MAX_OPEN_ORDERS_MIN = 1
+MAX_OPEN_ORDERS_MAX = 50
+MAX_OPEN_ORDERS_DEFAULT = 10
 # Bounds for "set symbols <n>"
 MAX_SYMBOLS_MIN = 5
 MAX_SYMBOLS_MAX = 200
@@ -105,7 +111,7 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 • *start* — Resume Filter & Brain.
 
 🤖 *Autopilot*
-• *autopilot on* — Auto-place orders on BUY (max 10 open). No Buy button. Resumes pipeline if paused.
+• *autopilot on* — Auto-place orders on BUY (max set by orders set max). No Buy button. Resumes pipeline if paused.
 • *autopilot off* — Stop auto orders. Buy button shown again on BUY signals.
 
 🔔 *Signals*
@@ -127,6 +133,7 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 • *status* — Pipeline, autopilot, mute, paper trading.
 • *orders* — List open orders from DB.
 • *orders close* <symbol> — Manually close open order for symbol (e.g. orders close BTC/USDT). Updates balance.
+• *orders set max* <number> — Max simultaneous open orders for autopilot (e.g. orders set max 15). Default 10.
 • *balance* — Current USDT balance and change since last check.
 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 • *set symbols* <number> — Top N symbols by volume to fetch (e.g. set symbols 50). Min 5, max 200.
@@ -303,6 +310,46 @@ class Messenger:
                 return len(shared_db.get_open_orders(conn))
         except Exception:
             return 0
+
+    def _get_max_open_orders(self) -> int:
+        """Return max simultaneous open orders (from Redis, default MAX_OPEN_ORDERS_DEFAULT)."""
+        val = self.db.get(REDIS_KEY_MAX_OPEN_ORDERS)
+        if val is None or not str(val).isdigit():
+            return MAX_OPEN_ORDERS_DEFAULT
+        n = int(val)
+        return max(MAX_OPEN_ORDERS_MIN, min(MAX_OPEN_ORDERS_MAX, n))
+
+    async def _handle_orders_set_max(self, update, text: str) -> None:
+        """Set max simultaneous open orders. Usage: orders set max <number> (e.g. orders set max 15)."""
+        rest = text[len("orders set max "):].strip()
+        if not rest:
+            await self._safe_reply(
+                update,
+                f"📋 Orders set max\n\nUsage: orders set max <number>\n"
+                f"Min {MAX_OPEN_ORDERS_MIN}, max {MAX_OPEN_ORDERS_MAX}. Default {MAX_OPEN_ORDERS_DEFAULT}.\n"
+                "Example: orders set max 15",
+            )
+            return
+        try:
+            n = int(rest)
+        except ValueError:
+            await self._safe_reply(
+                update,
+                f"❌ Invalid number. Use an integer between {MAX_OPEN_ORDERS_MIN} and {MAX_OPEN_ORDERS_MAX}.",
+            )
+            return
+        if n < MAX_OPEN_ORDERS_MIN or n > MAX_OPEN_ORDERS_MAX:
+            await self._safe_reply(
+                update,
+                f"❌ Out of range. Use {MAX_OPEN_ORDERS_MIN}–{MAX_OPEN_ORDERS_MAX}.",
+            )
+            return
+        self.db.set(REDIS_KEY_MAX_OPEN_ORDERS, str(n))
+        print(f"[{_ts()}] Messenger: max_open_orders set to {n}")
+        await self._safe_reply(
+            update,
+            f"✅ Max open orders updated\n\n📋 Autopilot will allow up to {n} simultaneous open orders.",
+        )
 
     async def _reply_balance(self, update) -> None:
         """Reply with current USDT balance from DB and delta since last check (stored in Redis)."""
@@ -533,6 +580,9 @@ class Messenger:
             if strategy_val not in STRATEGY_VALUES:
                 strategy_val = "conservative"
             lines.append(f"🎯 Strategy: {strategy_val}")
+            max_open = self._get_max_open_orders()
+            open_count = self._get_open_order_count()
+            lines.append(f"📋 Open orders: {open_count} / {max_open}")
             await self._safe_reply(update, "\n".join(lines))
         elif text == "autopilot on":
             self.db.set(REDIS_KEY_AUTOPILOT, "1")
@@ -556,6 +606,8 @@ class Messenger:
             await self._reply_orders(update)
         elif text.startswith("orders close "):
             await self._handle_orders_close(update, text)
+        elif text.startswith("orders set max "):
+            await self._handle_orders_set_max(update, text)
         elif text == "balance":
             await self._reply_balance(update)
         elif text.startswith("set balance "):
@@ -715,11 +767,12 @@ class Messenger:
 
                     if verdict == "BUY" and autopilot_on:
                         open_count = self._get_open_order_count()
-                        if open_count >= AUTOPILOT_MAX_OPEN_ORDERS:
+                        max_open = self._get_max_open_orders()
+                        if open_count >= max_open:
                             await self.send_telegram_msg(
                                 f"⏸️ *Autopilot skipped*\n\n"
                                 f"📌 {symbol}\n\n"
-                                f"Max {AUTOPILOT_MAX_OPEN_ORDERS} open orders reached ({open_count}).\n"
+                                f"Max {max_open} open orders reached ({open_count}).\n"
                                 f"Close a position or wait for TP/SL to free a slot."
                             )
                             print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (open orders: {open_count})")
