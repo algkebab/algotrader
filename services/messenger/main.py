@@ -221,17 +221,29 @@ class Messenger:
         for i, o in enumerate(rows, 1):
             opened = (o.get("opened_at") or "")[:19].replace("T", " ")
             symbol = o["symbol"]
+            entry = float(o["entry_price"])
+            qty = float(o["quantity"])
             try:
                 ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
                 now_price = ticker.get("last")
-                now_str = f"{float(now_price):.4g}" if now_price is not None else "—"
+                now_f = float(now_price) if now_price is not None else None
+                now_str = f"{now_f:.4g}" if now_f is not None else "—"
+                if now_f is not None:
+                    unrealized = (now_f - entry) * qty
+                    pnl_sign = "+" if unrealized >= 0 else ""
+                    pnl_emoji = "📈" if unrealized >= 0 else "📉"
+                    pnl_line = f"\n   {pnl_emoji} Unrealized PnL: {pnl_sign}{unrealized:.2f} USDT"
+                else:
+                    pnl_line = ""
             except Exception:
                 now_str = "—"
+                pnl_line = ""
             lines.append(
                 f"{i}. {symbol}\n"
                 f"   💵 Entry: {o['entry_price']} · Qty: {o['quantity']}\n"
                 f"   📈 Now: {now_str}\n"
-                f"   🎯 TP: {o['tp_price']} · 🛑 SL: {o['sl_price']}\n"
+                f"   🎯 TP: {o['tp_price']} · 🛑 SL: {o['sl_price']}"
+                f"{pnl_line}\n"
                 f"   📅 {opened}"
             )
             if i < len(rows):
@@ -401,21 +413,21 @@ class Messenger:
         print(f"[{_ts()}] Messenger: order_amount_usdt set to {n}")
         await self._safe_reply(
             update,
-            f"✅ Order amount updated\n\n💵 {n:.0f if n == int(n) else n} USDT per order (autopilot & Buy button).",
+            f"✅ Order amount updated\n\n💵 {(f'{n:.0f}' if n == int(n) else n)} USDT per order (autopilot & Buy button).",
         )
 
     async def _reply_balance(self, update) -> None:
-        """Reply with current USDT balance, today's PnL (from closed orders), and day PnL delta since last check."""
+        """Reply with current USDT balance, today's PnL, day PnL delta, and unrealized PnL per open order."""
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
                 current = shared_db.get_balance(conn, "USDT")
                 today_pnl = shared_db.get_today_closed_pnl(conn)
+                open_orders = shared_db.get_open_orders(conn)
         except Exception as e:
             await self._safe_reply(update, f"❌ Could not read balance: {e}")
             return
         now_iso = datetime.utcnow().isoformat() + "Z"
-        now_short = (now_iso[:19].replace("T", " ") + " UTC")
         last_pnl_str = self.db.get(REDIS_KEY_BALANCE_LAST_DAY_PNL)
         last_check = self.db.get(REDIS_KEY_BALANCE_LAST_CHECK)
         if last_pnl_str is not None and last_check is not None:
@@ -440,13 +452,37 @@ class Messenger:
         self.db.set(REDIS_KEY_BALANCE_LAST_CHECK, now_iso)
         pnl_sign = "+" if today_pnl >= 0 else ""
         pnl_emoji = "📈" if today_pnl >= 0 else "📉" if today_pnl < 0 else "➡️"
-        msg = (
-            f"💰 *Balance*\n"
-            f"\n\n"
-            f"💵 Wallet: {current:.2f} USDT\n"
-            f"{pnl_emoji} Today PnL: {pnl_sign}{today_pnl:.2f} USDT\n\n"
-            f"{diff_line}"
-        )
+        parts = [
+            f"💰 Balance",
+            f"\n\n",
+            "",
+            f"💵 Wallet: {current:.2f} USDT",
+            f"{pnl_emoji} Today PnL: {pnl_sign}{today_pnl:.2f} USDT",
+            "",
+            diff_line,
+        ]
+        total_unrealized = 0.0
+        if open_orders:
+            parts.append("")
+            parts.append("📋 Open positions (unrealized PnL)")
+            for row in open_orders:
+                symbol = row["symbol"]
+                entry = float(row["entry_price"])
+                qty = float(row["quantity"])
+                try:
+                    ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
+                    price = float(ticker.get("last", 0))
+                    unrealized = (price - entry) * qty
+                    total_unrealized += unrealized
+                    sign = "+" if unrealized >= 0 else ""
+                    em = "📈" if unrealized >= 0 else "📉"
+                    parts.append(f"  {em} {symbol}: {sign}{unrealized:.2f} USDT")
+                except Exception:
+                    parts.append(f"  ➡️ {symbol}: —")
+            if open_orders and total_unrealized != 0:
+                sign = "+" if total_unrealized >= 0 else ""
+                parts.append(f"  Total unrealized: {sign}{total_unrealized:.2f} USDT")
+        msg = "\n".join(parts)
         await self._safe_reply(update, msg)
 
     async def _handle_set_balance(self, update, text: str) -> None:
@@ -642,7 +678,7 @@ class Messenger:
                 open_count = self._get_open_order_count()
                 lines.append(f"📋 Open orders: {open_count} / {max_open}")
                 amt = self._get_order_amount_usdt()
-                lines.append(f"💵 Order amount: {amt:.0f if amt == int(amt) else amt} USDT")
+                lines.append(f"💵 Order amount: {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT")
                 await self._safe_reply(update, "\n".join(lines))
             except Exception as e:
                 print(f"[{_ts()}] Messenger: status failed: {e}")
@@ -848,7 +884,7 @@ class Messenger:
                     keyboard = None
                     if verdict == "BUY" and not autopilot_on:
                         amt = self._get_order_amount_usdt()
-                        kb = [[InlineKeyboardButton(f"🚀 Buy {amt:.0f if amt == int(amt) else amt} USDT", callback_data=f"buy:{symbol}")]]
+                        kb = [[InlineKeyboardButton(f"🚀 Buy {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT", callback_data=f"buy:{symbol}")]]
                         keyboard = InlineKeyboardMarkup(kb)
 
                     await self.send_telegram_msg(message, symbol, keyboard)
@@ -883,7 +919,7 @@ class Messenger:
                                         self.db.rpush("trade_commands", json.dumps(command))
                                         await self.send_telegram_msg(
                                             f"🤖 *Autopilot order sent*\n\n"
-                                            f"📌 {symbol} · {amt:.0f if amt == int(amt) else amt} USDT\n\n"
+                                            f"📌 {symbol} · {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT\n\n"
                                             f"_Executor will confirm shortly._"
                                         )
                                         print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
@@ -894,7 +930,7 @@ class Messenger:
                                 self.db.rpush("trade_commands", json.dumps(command))
                                 await self.send_telegram_msg(
                                     f"🤖 *Autopilot order sent*\n\n"
-                                    f"📌 {symbol} · {amt:.0f if amt == int(amt) else amt} USDT\n\n"
+                                    f"📌 {symbol} · {(f'{amt:.0f}' if amt == int(amt) else amt)} USDT\n\n"
                                     f"_Executor will confirm shortly._"
                                 )
                                 print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
