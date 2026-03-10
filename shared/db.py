@@ -139,6 +139,54 @@ def get_today_closed_pnl(conn: sqlite3.Connection) -> float:
     return float(row["total"]) if row else 0.0
 
 
+def get_closed_orders_stats(
+    conn: sqlite3.Connection,
+    period: str,
+) -> dict:
+    """Stats for closed orders in the given period. period: 'today'|'yesterday'|'week'|'month'|'all'.
+    Returns dict: total_pnl, count, count_sl, count_tp, count_manual, count_successful."""
+    if period == "today":
+        where = "status = 'closed' AND date(closed_at) = date('now')"
+    elif period == "yesterday":
+        where = "status = 'closed' AND date(closed_at) = date('now', '-1 day')"
+    elif period == "week":
+        where = "status = 'closed' AND closed_at >= datetime('now', '-7 days')"
+    elif period == "month":
+        where = "status = 'closed' AND closed_at >= datetime('now', '-30 days')"
+    else:
+        where = "status = 'closed'"
+    row = conn.execute(
+        f"""
+        SELECT
+            COALESCE(SUM(pnl_usdt), 0) AS total_pnl,
+            COUNT(*) AS count,
+            SUM(CASE WHEN close_reason LIKE 'STOP-LOSS%' THEN 1 ELSE 0 END) AS count_sl,
+            SUM(CASE WHEN close_reason LIKE 'TAKE-PROFIT%' THEN 1 ELSE 0 END) AS count_tp,
+            SUM(CASE WHEN close_reason LIKE 'Manual%' THEN 1 ELSE 0 END) AS count_manual,
+            SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) AS count_successful
+        FROM orders
+        WHERE {where}
+        """
+    ).fetchone()
+    if not row or row["count"] == 0:
+        return {
+            "total_pnl": 0.0,
+            "count": 0,
+            "count_sl": 0,
+            "count_tp": 0,
+            "count_manual": 0,
+            "count_successful": 0,
+        }
+    return {
+        "total_pnl": float(row["total_pnl"]),
+        "count": int(row["count"]),
+        "count_sl": int(row["count_sl"]),
+        "count_tp": int(row["count_tp"]),
+        "count_manual": int(row["count_manual"]),
+        "count_successful": int(row["count_successful"]),
+    }
+
+
 def set_balance(conn: sqlite3.Connection, currency: str, amount: float) -> None:
     now = datetime.utcnow().isoformat() + "Z"
     conn.execute(

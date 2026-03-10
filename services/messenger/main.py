@@ -70,6 +70,8 @@ REDIS_SYSTEM_KEYS = frozenset({
 
 # Allowed values for "set strategy"
 STRATEGY_VALUES = frozenset({"conservative", "moderate", "aggressive", "active_day"})
+# Allowed values for "stats <value>"
+STATS_VALUES = frozenset({"today", "yesterday", "week", "month", "all"})
 
 # Data keys and patterns to clear on "clear redis" (excludes REDIS_SYSTEM_KEYS)
 REDIS_DATA_KEYS = [
@@ -145,6 +147,7 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 💵 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols 50). Min 5, max 200.
 🎯 • *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
+📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 ❓ • *help* — This message."""
 
 def _ts():
@@ -560,6 +563,45 @@ class Messenger:
         print(f"[{_ts()}] Messenger: strategy set to {rest}")
         await self._safe_reply(update, f"✅ Strategy updated\n\n🎯 AI strategy: {rest}")
 
+    async def _handle_stats(self, update, text: str) -> None:
+        """Reply with closed orders statistics. Usage: stats [today|yesterday|week|month|all]. Default: today."""
+        rest = text[len("stats"):].strip().lower() if text.startswith("stats") else ""
+        period = rest if rest in STATS_VALUES else "today"
+        period_label = {"today": "Today", "yesterday": "Yesterday", "week": "Last 7 days", "month": "Last 30 days", "all": "All time"}[period]
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                s = shared_db.get_closed_orders_stats(conn, period)
+        except Exception as e:
+            await self._safe_reply(update, f"❌ Could not read stats: {e}")
+            return
+        if s["count"] == 0:
+            await self._safe_reply(
+                update,
+                f"📊 Stats ({period_label})\n"
+                f"━━━━━━━━━━━━━━\n\n"
+                f"No closed orders in this period.",
+            )
+            return
+        total_pnl = s["total_pnl"]
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        pnl_emoji = "📈" if total_pnl >= 0 else "📉"
+        success_pct = (s["count_successful"] / s["count"] * 100) if s["count"] else 0
+        parts = [
+            f"📊 Stats ({period_label})",
+            "━━━━━━━━━━━━━━",
+            "",
+            f"📋 Closed orders: {s['count']}",
+            f"{pnl_emoji} Total PnL: {pnl_sign}{total_pnl:.2f} USDT",
+            f"✅ Successful (PnL > 0): {s['count_successful']} ({success_pct:.0f}%)",
+            "",
+            "Closed by:",
+            f"  🟢 Take profit: {s['count_tp']}",
+            f"  🔴 Stop loss: {s['count_sl']}",
+            f"  ✋ Manual: {s['count_manual']}",
+        ]
+        await self._safe_reply(update, "\n".join(parts))
+
     def _clear_redis_data(self) -> int:
         """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
         deleted = 0
@@ -719,6 +761,8 @@ class Messenger:
             await self._handle_set_symbols(update, text)
         elif text.startswith("set strategy "):
             await self._handle_set_strategy(update, text)
+        elif text == "stats" or text.startswith("stats "):
+            await self._handle_stats(update, text)
         elif text == "help":
             await self._safe_reply(update, HELP_MESSAGE)
 
