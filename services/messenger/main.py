@@ -46,6 +46,10 @@ REDIS_KEY_PAPERTRADING = "system:papertrading"
 # Last balance check (for "balance" command diff)
 REDIS_KEY_BALANCE_LAST_USDT = "system:balance_last_usdt"
 REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
+# Number of top symbols by volume Scout fetches from Binance (default 30)
+REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
+# AI strategy: conservative, moderate, aggressive, active_day (default conservative)
+REDIS_KEY_STRATEGY = "system:strategy"
 
 # Keys we never delete on "clear redis" (system settings)
 REDIS_SYSTEM_KEYS = frozenset({
@@ -54,7 +58,12 @@ REDIS_SYSTEM_KEYS = frozenset({
     REDIS_KEY_AUTOPILOT,
     REDIS_KEY_MUTED,
     REDIS_KEY_PAPERTRADING,
+    REDIS_KEY_MAX_SYMBOLS,
+    REDIS_KEY_STRATEGY,
 })
+
+# Allowed values for "set strategy"
+STRATEGY_VALUES = frozenset({"conservative", "moderate", "aggressive", "active_day"})
 
 # Data keys and patterns to clear on "clear redis" (excludes REDIS_SYSTEM_KEYS)
 REDIS_DATA_KEYS = [
@@ -71,6 +80,10 @@ REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
 AUTOPILOT_ORDER_AMOUNT_USDT = 10
 AUTOPILOT_MAX_OPEN_ORDERS = 10
+# Bounds for "set symbols <n>"
+MAX_SYMBOLS_MIN = 5
+MAX_SYMBOLS_MAX = 200
+MAX_SYMBOLS_DEFAULT = 30
 
 HELP_MESSAGE = """🛠 *Algotrader — Commands*
 
@@ -102,6 +115,8 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 • *orders* — List open orders from DB.
 • *balance* — Current USDT balance and change since last check.
 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
+• *set symbols* <number> — Top N symbols by volume to fetch (e.g. set symbols 50). Min 5, max 200.
+• *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
 • *help* — This message."""
 
 def _ts():
@@ -276,6 +291,52 @@ class Messenger:
         except Exception as e:
             await self._safe_reply(update, f"❌ Could not set balance\n\n{e}")
 
+    async def _handle_set_symbols(self, update, text: str) -> None:
+        """Set number of top symbols by volume Scout fetches. Usage: set symbols <number> (5–200)."""
+        rest = text[len("set symbols "):].strip()
+        if not rest:
+            await self._safe_reply(
+                update,
+                f"📈 Set symbols\n\nUsage: set symbols <number>\n"
+                f"Min {MAX_SYMBOLS_MIN}, max {MAX_SYMBOLS_MAX}. Example: set symbols 50",
+            )
+            return
+        try:
+            n = int(rest)
+        except ValueError:
+            await self._safe_reply(update, f"❌ Invalid number. Use an integer between {MAX_SYMBOLS_MIN} and {MAX_SYMBOLS_MAX}.")
+            return
+        if n < MAX_SYMBOLS_MIN or n > MAX_SYMBOLS_MAX:
+            await self._safe_reply(
+                update,
+                f"❌ Out of range. Use {MAX_SYMBOLS_MIN}–{MAX_SYMBOLS_MAX}.",
+            )
+            return
+        self.db.set(REDIS_KEY_MAX_SYMBOLS, str(n))
+        print(f"[{_ts()}] Messenger: max_symbols set to {n}")
+        await self._safe_reply(update, f"✅ Symbols updated\n\n📈 Scout will fetch top {n} symbols by volume.")
+
+    async def _handle_set_strategy(self, update, text: str) -> None:
+        """Set AI strategy. Usage: set strategy <name>. Values: conservative, moderate, aggressive, active_day."""
+        rest = text[len("set strategy "):].strip().lower()
+        if not rest:
+            await self._safe_reply(
+                update,
+                "🎯 Set strategy\n\nUsage: set strategy <name>\n"
+                "Values: conservative, moderate, aggressive, active_day.\n"
+                "Default: conservative.",
+            )
+            return
+        if rest not in STRATEGY_VALUES:
+            await self._safe_reply(
+                update,
+                f"❌ Invalid strategy. Use one of: conservative, moderate, aggressive, active_day.",
+            )
+            return
+        self.db.set(REDIS_KEY_STRATEGY, rest)
+        print(f"[{_ts()}] Messenger: strategy set to {rest}")
+        await self._safe_reply(update, f"✅ Strategy updated\n\n🎯 AI strategy: {rest}")
+
     def _clear_redis_data(self) -> int:
         """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
         deleted = 0
@@ -371,6 +432,8 @@ class Messenger:
             muted = self.db.get(REDIS_KEY_MUTED)
             paper_val = self.db.get(REDIS_KEY_PAPERTRADING)
             paper_on = paper_val != "0"
+            symbols_val = self.db.get(REDIS_KEY_MAX_SYMBOLS)
+            symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else MAX_SYMBOLS_DEFAULT
             lines = [
                 "📊 Status",
                 "",
@@ -379,7 +442,12 @@ class Messenger:
                 "🔔 WAIT signals: " + ("suppressed (only BUY)" if suppress_wait else "on (BUY + WAIT)"),
                 "📱 Telegram: " + ("🔇 muted" if muted else "🔔 unmuted"),
                 "📄 Paper: " + ("ON (DB only)" if paper_on else "OFF (live)"),
+                f"📈 Symbols: top {symbols_n} by volume",
             ]
+            strategy_val = (self.db.get(REDIS_KEY_STRATEGY) or "conservative").strip().lower()
+            if strategy_val not in STRATEGY_VALUES:
+                strategy_val = "conservative"
+            lines.append(f"🎯 Strategy: {strategy_val}")
             await self._safe_reply(update, "\n".join(lines))
         elif text == "autopilot on":
             self.db.set(REDIS_KEY_AUTOPILOT, "1")
@@ -405,6 +473,10 @@ class Messenger:
             await self._reply_balance(update)
         elif text.startswith("set balance "):
             await self._handle_set_balance(update, text)
+        elif text.startswith("set symbols "):
+            await self._handle_set_symbols(update, text)
+        elif text.startswith("set strategy "):
+            await self._handle_set_strategy(update, text)
         elif text == "help":
             try:
                 await update.message.reply_text(HELP_MESSAGE, parse_mode="Markdown")

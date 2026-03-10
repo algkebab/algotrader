@@ -25,6 +25,8 @@ SYSTEM_KEYS = frozenset({
     "system:autopilot",
     "system:muted",
     "system:papertrading",
+    "system:max_symbols",
+    "system:strategy",
 })
 PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 

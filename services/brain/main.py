@@ -23,6 +23,14 @@ load_dotenv()
 def _ts():
     return datetime.utcnow().strftime("%H:%M:%S")
 
+# AI system prompts per strategy (set via Telegram "set strategy <name>")
+STRATEGY_SYSTEM_MESSAGES = {
+    "conservative": "You are an expert crypto day-trader. Be conservative and look for high-probability setups. Prefer WAIT unless the setup is very clear and well confirmed.",
+    "moderate": "You are an expert crypto day-trader. Use a balanced approach: take setups with good risk/reward and allow more entries than conservative. Still require technical confirmation before BUY.",
+    "aggressive": "You are an expert crypto day-trader. You are aggressive: take more BUY signals when technicals align. Higher risk tolerance. Favor BUY when RSI and volume support the move.",
+    "active_day": "You are an expert crypto day-trader focused on active day-trading. Take frequent opportunities: scalp-style, more BUY signals on momentum and volume spikes. Quick in-and-out mindset.",
+}
+
 class Brain:
     def __init__(self):
         # Redis setup
@@ -33,7 +41,15 @@ class Brain:
         self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
         # Sensitivity setting: 0.005 = 0.5%
-        self.price_change_threshold = 0.005 
+        self.price_change_threshold = 0.005
+
+    def _get_strategy_system_content(self):
+        """Read strategy from Redis (set by Messenger 'set strategy'); default conservative."""
+        val = self.db.get("system:strategy")
+        if not val:
+            return STRATEGY_SYSTEM_MESSAGES["conservative"]
+        key = str(val).strip().lower()
+        return STRATEGY_SYSTEM_MESSAGES.get(key, STRATEGY_SYSTEM_MESSAGES["conservative"])
 
     def should_analyze(self, symbol, current_price):
         """
@@ -73,11 +89,12 @@ class Brain:
         }}
         """
 
+        system_content = self._get_strategy_system_content()
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": "You are an expert crypto day-trader. Be conservative and look for high-probability setups."},
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={ "type": "json_object" }

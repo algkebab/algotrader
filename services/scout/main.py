@@ -32,13 +32,26 @@ class Scout:
             'enableRateLimit': True,
         })
         print(f"[{_ts()}] Scout: Binance client initialized (public API, rate limit enabled)")
-        self.max_symbols = 30
-        print(f"[{_ts()}] Scout: max_symbols={self.max_symbols}")
+        self._max_symbols_default = 30
+        self._max_symbols_min = 5
+        self._max_symbols_max = 200
+
+    def _get_max_symbols(self):
+        """Read max_symbols from Redis (set by Messenger 'set symbols'); default 30, clamped 5–200."""
+        val = self.db.get("system:max_symbols")
+        if val is None:
+            return self._max_symbols_default
+        try:
+            n = int(val)
+            return max(self._max_symbols_min, min(self._max_symbols_max, n))
+        except (ValueError, TypeError):
+            return self._max_symbols_default
 
     async def get_top_active_symbols(self):
         """Fetches TOP coins by 24h volume to ensure we track volatile assets."""
+        max_symbols = self._get_max_symbols()
         try:
-            print(f"[{_ts()}] 🔄 Scout: Refreshing TOP {self.max_symbols} assets by volume...")
+            print(f"[{_ts()}] 🔄 Scout: Refreshing TOP {max_symbols} assets by volume...")
             tickers = await self.exchange.fetch_tickers()
             
             print(f"[{_ts()}] Scout: Fetched {len(tickers)} tickers from exchange")
@@ -51,8 +64,8 @@ class Scout:
             
             # Sort by volume descending and take the top ones
             sorted_pairs = sorted(usdt_pairs, key=lambda x: x['volume'], reverse=True)
-            top = [p['symbol'] for p in sorted_pairs[:self.max_symbols]]
-            print(f"[{_ts()}] Scout: Selected {len(top)} USDT pairs by volume")
+            top = [p['symbol'] for p in sorted_pairs[:max_symbols]]
+            print(f"[{_ts()}] Scout: Selected {len(top)} USDT pairs by volume (max_symbols={max_symbols})")
             return top
             
         except Exception as e:

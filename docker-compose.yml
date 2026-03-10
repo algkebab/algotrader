@@ -3,6 +3,8 @@ services:
     image: redis:alpine
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
     restart: always
 
   scout:
@@ -99,3 +101,4 @@ services:
 
 volumes:
   trading_data:
+  redis_data:
