@@ -105,7 +105,6 @@ def _normalize_symbol(s: str) -> str:
     return s + "/USDT"
 
 HELP_MESSAGE = """🛠 *Algotrader — Commands*
-━━━━━━━━━━━━━━━━━━━━━━
 
 📌 *Pipeline*
 ⏸️ • *stop* — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
@@ -390,10 +389,10 @@ class Messenger:
         pnl_emoji = "📈" if today_pnl >= 0 else "📉" if today_pnl < 0 else "➡️"
         msg = (
             f"💰 *Balance*\n"
-            f"━━━━━━━━━━━━━━\n\n"
-            f"💵 Wallet: `{current:.2f}` USDT\n"
-            f"{pnl_emoji} Today PnL: `{pnl_sign}{today_pnl:.2f}` USDT\n\n"
-            f"_{diff_line}_"
+            f"\n\n"
+            f"💵 Wallet: {current:.2f} USDT\n"
+            f"{pnl_emoji} Today PnL: {pnl_sign}{today_pnl:.2f} USDT\n\n"
+            f"{diff_line}"
         )
         await self._safe_reply(update, msg)
 
