@@ -14,12 +14,9 @@ SL_PERCENT = 0.98  # -2% stop-loss (Executor default)
 POSITION_RISK_PCT = 0.01  # 1% of balance risked per position (Executor position sizing)
 
 # --- Orders / autopilot (Brain, Filter, Messenger) ---
-MAX_OPEN_ORDERS_DEFAULT = 5
+MAX_OPEN_ORDERS_DEFAULT = 4
 MAX_OPEN_ORDERS_MIN = 1
 MAX_OPEN_ORDERS_MAX = 50
-ORDER_AMOUNT_DEFAULT = 10
-ORDER_AMOUNT_MIN = 1
-ORDER_AMOUNT_MAX = 1000
 
 # --- Brain (AI analysis) ---
 PRICE_CHANGE_THRESHOLD = 0.005  # 0.5% min price move to re-analyze (skip if change < this)
@@ -31,7 +28,6 @@ MAX_SYMBOLS_MAX = 200
 
 # --- Redis key names (shared across services and clear_redis) ---
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
-REDIS_KEY_ORDER_AMOUNT_USDT = "system:order_amount_usdt"
 REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
 REDIS_KEY_TRADING_PAUSED = "system:trading_paused"
 REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"

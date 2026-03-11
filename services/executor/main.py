@@ -80,8 +80,8 @@ class Executor:
         except Exception:
             return True
 
-    def place_smart_order(self, symbol, amount_usdt=10, risk_percent=0.02, stop_loss_pct=None, take_profit_pct=None, strategy_name=None):
-        """Writes paper order to DB only (no live trading)."""
+    def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None):
+        """Writes paper order to DB only (no live trading). Position size is derived from balance and risk (POSITION_RISK_PCT, stop loss)."""
         try:
             print(f"[{_ts()}] 🛒 Executor: Processing paper order for {symbol}")
 
@@ -93,15 +93,15 @@ class Executor:
                 }))
                 return {"status": "error", "msg": "Position exists"}
 
-            return self._place_paper_order(symbol, amount_usdt, stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct, strategy_name=strategy_name)
+            return self._place_paper_order(symbol, stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct, strategy_name=strategy_name)
 
         except Exception as e:
             print(f"[{_ts()}] ❌ Binance Order Error: {e}")
             return {"status": "error", "message": str(e)}
 
-    def _place_paper_order(self, symbol, amount_usdt=10, stop_loss_pct=None, take_profit_pct=None, strategy_name=None):
+    def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None):
         """Write order to DB only; no exchange, no Redis active_trades.
-        Uses paper_leverage (e.g. 3x) for notional and 1% risk sizing."""
+        Position size is derived from balance, POSITION_RISK_PCT, and stop loss (no external amount)."""
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
@@ -210,7 +210,6 @@ class Executor:
                     data = json.loads(payload)
                     self.place_smart_order(
                         data.get('symbol'),
-                        amount_usdt=float(data.get('amount', 10)),
                         stop_loss_pct=data.get("stop_loss_pct"),
                         take_profit_pct=data.get("take_profit_pct"),
                         strategy_name=data.get("strategy_name"),
