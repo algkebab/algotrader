@@ -1,6 +1,6 @@
 """
 Shared configuration used across services (Executor, Monitor, Messenger, Filter, Brain, Scout).
-Define numeric defaults, bounds, and Redis key names in one place.
+Define numeric defaults, bounds, system setting keys (DB), and Redis key names in one place.
 """
 
 # --- Trading / simulation (Executor, Monitor, Messenger) ---
@@ -26,13 +26,16 @@ MAX_SYMBOLS_DEFAULT = 25
 MAX_SYMBOLS_MIN = 5
 MAX_SYMBOLS_MAX = 200
 
-# --- Redis key names (shared across services and clear_redis) ---
-REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
-REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
-REDIS_KEY_TRADING_PAUSED = "system:trading_paused"
-REDIS_KEY_AUTOPILOT = "system:autopilot"
-REDIS_KEY_BALANCE_LAST_DAY_PNL = "system:balance_last_day_pnl"
-REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
-REDIS_KEY_STRATEGY = "system:strategy"
-REDIS_KEY_TIMEZONE_OFFSET_MIN = "system:timezone_offset_min"
-REDIS_KEY_ACTIVE_SYMBOLS = "system:active_symbols"
+# --- System setting keys (stored in DB settings table) ---
+SYSTEM_KEY_MAX_OPEN_ORDERS = "max_open_orders"
+SYSTEM_KEY_MAX_SYMBOLS = "max_symbols"
+SYSTEM_KEY_TRADING_PAUSED = "trading_paused"
+SYSTEM_KEY_AUTOPILOT = "autopilot"
+SYSTEM_KEY_BALANCE_LAST_DAY_PNL = "balance_last_day_pnl"
+SYSTEM_KEY_BALANCE_LAST_CHECK = "balance_last_check"
+SYSTEM_KEY_STRATEGY = "strategy"
+SYSTEM_KEY_TIMEZONE_OFFSET_MIN = "timezone_offset_min"
+SYSTEM_KEY_SIGNAL_WAIT = "signal_wait"
+
+# --- Redis key (pipeline data; Scout writes, Filter reads) ---
+REDIS_KEY_ACTIVE_SYMBOLS = "active_symbols"

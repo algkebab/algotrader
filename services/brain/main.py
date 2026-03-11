@@ -63,7 +63,7 @@ class Brain:
 
     def _get_strategy_name(self):
         """Return current strategy name (default CONSERVATIVE)."""
-        val = self.db.get(shared_config.REDIS_KEY_STRATEGY)
+        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_STRATEGY)
         name = (val or STRATEGY_DEFAULT).strip().upper()
         if name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
             name = STRATEGY_DEFAULT
@@ -95,8 +95,8 @@ class Brain:
         return True
 
     def _get_max_open_orders(self):
-        """Return max simultaneous open orders from Redis (default 10)."""
-        val = self.db.get(shared_config.REDIS_KEY_MAX_OPEN_ORDERS)
+        """Return max simultaneous open orders from DB (default 10)."""
+        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS)
         if val is None or not str(val).isdigit():
             return shared_config.MAX_OPEN_ORDERS_DEFAULT
         return max(1, min(50, int(val)))
@@ -189,10 +189,10 @@ Respond with ONLY the JSON object, no comments or additional text.
 
     def run(self):
         print(f"[{_ts()}] 🧠 Brain: AI Technical Analyst is online with Smart Cache...")
-        PAUSED_KEY = shared_config.REDIS_KEY_TRADING_PAUSED
+        PAUSED_KEY = shared_config.SYSTEM_KEY_TRADING_PAUSED
 
         while True:
-            if self.db.get(PAUSED_KEY):
+            if shared_db.get_setting_value(PAUSED_KEY) == "1":
                 time.sleep(5)
                 continue
 

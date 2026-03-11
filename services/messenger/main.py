@@ -35,22 +35,16 @@ TELEGRAM_CONNECTION_POOL_SIZE = 8
 SEND_MESSAGE_RETRIES = 2
 SEND_MESSAGE_RETRY_DELAY = 2.0
 
-# Keys we never delete on "clear redis" (system settings; all from shared.config)
-REDIS_SYSTEM_KEYS = frozenset({
-    shared_config.REDIS_KEY_TRADING_PAUSED,
-    shared_config.REDIS_KEY_AUTOPILOT,
-    shared_config.REDIS_KEY_MAX_SYMBOLS,
-    shared_config.REDIS_KEY_STRATEGY,
-    shared_config.REDIS_KEY_MAX_OPEN_ORDERS,
-    shared_config.REDIS_KEY_TIMEZONE_OFFSET_MIN,
-})
+# System settings are stored in DB (shared/db.py settings table), not Redis.
+# Keys we never delete on "clear redis" (empty: no system keys in Redis)
+REDIS_SYSTEM_KEYS = frozenset()
 
 # Allowed values for "strategy <name>"
 STRATEGY_VALUES = frozenset({"conservative", "aggressive", "reversal"})
 # Allowed values for "stats <value>"
 STATS_VALUES = frozenset({"today", "yesterday", "week", "month", "all"})
 
-# Data keys and patterns to clear on "clear redis" (excludes REDIS_SYSTEM_KEYS)
+# Data keys and patterns to clear on "clear redis"
 REDIS_DATA_KEYS = [
     "market_data",
     "filtered_candidates",
@@ -58,8 +52,6 @@ REDIS_DATA_KEYS = [
     "trade_commands",
     "active_trades",
     "notifications",
-    shared_config.REDIS_KEY_BALANCE_LAST_DAY_PNL,
-    shared_config.REDIS_KEY_BALANCE_LAST_CHECK,
 ]
 REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
@@ -88,7 +80,9 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 🗑️ • *clear redis* — Clear queues and cache. Keeps system settings.
 
 📊 *Info & Trading*
-📈 • *status* — Pipeline, autopilot.
+📈 • *status* — Pipeline, autopilot, WAIT signals.
+📢 • *signal wait on* — Send Telegram notifications for WAIT verdicts.
+📢 • *signal wait off* — Do not notify for WAIT verdicts (default).
 📋 • *orders* — List open orders from DB.
 🔒 • *orders close* <symbol> — Manually close open order (e.g. orders close BTC/USDT). Updates balance.
 🔢 • *orders set max* <number> — Max open orders for autopilot (e.g. orders set max 15). Default {shared_config.MAX_OPEN_ORDERS_DEFAULT}. Min {shared_config.MAX_OPEN_ORDERS_MIN}, max {shared_config.MAX_OPEN_ORDERS_MAX}.
@@ -150,6 +144,16 @@ class Messenger:
     def _is_allowed_chat(self, chat_id):
         """Only the configured chat can send stop/start/status."""
         return str(chat_id) == str(self.chat_id)
+
+    def _get_setting(self, key: str, default: str | None = None) -> str | None:
+        """Read system setting from DB (not Redis)."""
+        return shared_db.get_setting_value(key, default)
+
+    def _set_setting(self, key: str, value: str) -> None:
+        """Write system setting to DB (not Redis)."""
+        with shared_db.get_connection() as conn:
+            shared_db.init_schema(conn)
+            shared_db.set_setting(conn, key, value)
 
     async def _safe_reply(self, update, text: str) -> None:
         """Reply to the user; log and continue on timeout so handler doesn't crash."""
@@ -312,8 +316,8 @@ class Messenger:
             return 0
 
     def _get_max_open_orders(self) -> int:
-        """Return max simultaneous open orders (from Redis, default shared_config.MAX_OPEN_ORDERS_DEFAULT)."""
-        val = self.db.get(shared_config.REDIS_KEY_MAX_OPEN_ORDERS)
+        """Return max simultaneous open orders (from DB, default shared_config.MAX_OPEN_ORDERS_DEFAULT)."""
+        val = self._get_setting(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS)
         if val is None or not str(val).isdigit():
             return shared_config.MAX_OPEN_ORDERS_DEFAULT
         n = int(val)
@@ -344,7 +348,7 @@ class Messenger:
                 f"❌ Out of range. Use {shared_config.MAX_OPEN_ORDERS_MIN}–{shared_config.MAX_OPEN_ORDERS_MAX}.",
             )
             return
-        self.db.set(shared_config.REDIS_KEY_MAX_OPEN_ORDERS, str(n))
+        self._set_setting(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS, str(n))
         print(f"[{_ts()}] Messenger: max_open_orders set to {n}")
         await self._safe_reply(
             update,
@@ -353,7 +357,7 @@ class Messenger:
 
     def _get_timezone_offset_minutes(self) -> int:
         """Return timezone offset in minutes from UTC (from Redis, default 0)."""
-        val = self.db.get(shared_config.REDIS_KEY_TIMEZONE_OFFSET_MIN)
+        val = self._get_setting(shared_config.SYSTEM_KEY_TIMEZONE_OFFSET_MIN)
         if val is None:
             return 0
         try:
@@ -390,8 +394,8 @@ class Messenger:
             return
         now_utc = datetime.now(timezone.utc)
         now_iso = now_utc.isoformat()
-        last_pnl_str = self.db.get(shared_config.REDIS_KEY_BALANCE_LAST_DAY_PNL)
-        last_check = self.db.get(shared_config.REDIS_KEY_BALANCE_LAST_CHECK)
+        last_pnl_str = self._get_setting(shared_config.SYSTEM_KEY_BALANCE_LAST_DAY_PNL)
+        last_check = self._get_setting(shared_config.SYSTEM_KEY_BALANCE_LAST_CHECK)
         if last_pnl_str is not None and last_check is not None:
             try:
                 last_pnl = float(last_pnl_str)
@@ -411,8 +415,8 @@ class Messenger:
                 diff_line = "🕐 Last check: —"
         else:
             diff_line = "🆕 First check — no previous day PnL to compare."
-        self.db.set(shared_config.REDIS_KEY_BALANCE_LAST_DAY_PNL, f"{today_pnl:.2f}")
-        self.db.set(shared_config.REDIS_KEY_BALANCE_LAST_CHECK, now_iso)
+        self._set_setting(shared_config.SYSTEM_KEY_BALANCE_LAST_DAY_PNL, f"{today_pnl:.2f}")
+        self._set_setting(shared_config.SYSTEM_KEY_BALANCE_LAST_CHECK, now_iso)
         pnl_sign = "+" if today_pnl >= 0 else ""
         pnl_emoji = "📈" if today_pnl >= 0 else "📉" if today_pnl < 0 else "➡️"
         parts = [
@@ -498,7 +502,7 @@ class Messenger:
                 f"❌ Out of range. Use {shared_config.MAX_SYMBOLS_MIN}–{shared_config.MAX_SYMBOLS_MAX}.",
             )
             return
-        self.db.set(shared_config.REDIS_KEY_MAX_SYMBOLS, str(n))
+        self._set_setting(shared_config.SYSTEM_KEY_MAX_SYMBOLS, str(n))
         print(f"[{_ts()}] Messenger: max_symbols set to {n}")
         await self._safe_reply(update, f"✅ Symbols updated\n\n📈 Scout will fetch top {n} symbols by volume.")
 
@@ -520,7 +524,7 @@ class Messenger:
             )
             return
         name_upper = rest.upper()
-        self.db.set(shared_config.REDIS_KEY_STRATEGY, name_upper)
+        self._set_setting(shared_config.SYSTEM_KEY_STRATEGY, name_upper)
         print(f"[{_ts()}] Messenger: strategy set to {name_upper}")
         await self._safe_reply(update, f"🎯 Strategy changed to {name_upper}. Filters updated.")
 
@@ -555,7 +559,7 @@ class Messenger:
             await self._safe_reply(update, "❌ Out of range. Use between -12 and +14 hours.")
             return
         offset_min = int(hours * 60)
-        self.db.set(shared_config.REDIS_KEY_TIMEZONE_OFFSET_MIN, str(offset_min))
+        self._set_setting(shared_config.SYSTEM_KEY_TIMEZONE_OFFSET_MIN, str(offset_min))
         print(f"[{_ts()}] Messenger: timezone offset set to {offset_min} minutes")
         await self._safe_reply(
             update,
@@ -617,7 +621,7 @@ class Messenger:
             return
         text = (update.message.text or "").strip().lower()
         if text == "stop":
-            self.db.set(shared_config.REDIS_KEY_TRADING_PAUSED, "1")
+            self._set_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED, "1")
             print(f"[{_ts()}] Messenger: Pipeline PAUSED (Filter & Brain stopped)")
             await self._safe_reply(
                 update,
@@ -627,49 +631,50 @@ class Messenger:
                 "👉 Send \"start\" to resume.",
             )
         elif text == "start":
-            self.db.delete(shared_config.REDIS_KEY_TRADING_PAUSED)
+            self._set_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED, "0")
             print(f"[{_ts()}] Messenger: Pipeline RESUMED (Filter & Brain running)")
             await self._safe_reply(update, "▶️ Pipeline resumed\n\nFilter and Brain are running.")
         elif text == "clear redis":
             try:
                 n = self._clear_redis_data()
-                print(f"[{_ts()}] Messenger: Redis data cleared ({n} keys deleted), system settings kept")
+                print(f"[{_ts()}] Messenger: Redis data cleared ({n} keys deleted)")
                 await self._safe_reply(
                     update,
-                    f"🧹 Redis cleared\n\n{n} keys deleted.\n"
-                    "System settings (stop/start, autopilot) kept.",
+                    f"🧹 Redis cleared\n\n{n} keys deleted.",
                 )
             except Exception as e:
                 print(f"[{_ts()}] Messenger: clear redis failed: {e}")
                 await self._safe_reply(update, f"❌ Clear Redis failed\n\n{e}")
         elif text == "status":
             try:
-                paused = self.db.get(shared_config.REDIS_KEY_TRADING_PAUSED)
-                autopilot = self.db.get(shared_config.REDIS_KEY_AUTOPILOT)
-                symbols_val = self.db.get(shared_config.REDIS_KEY_MAX_SYMBOLS)
+                paused = self._get_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED)
+                autopilot = self._get_setting(shared_config.SYSTEM_KEY_AUTOPILOT)
+                symbols_val = self._get_setting(shared_config.SYSTEM_KEY_MAX_SYMBOLS)
                 symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else shared_config.MAX_SYMBOLS_DEFAULT
                 lines = [
                     "📊 Status",
                     "",
-                    "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused else "▶️ running"),
-                    "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot else "OFF (Buy button on signals)"),
+                    "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused == "1" else "▶️ running"),
+                    "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot == "1" else "OFF (Buy button on signals)"),
                     f"📈 Symbols: top {symbols_n} by volume",
                     "⚙️ Model: 3x leverage · 0.1% taker fee · 0.001%/h margin interest",
                 ]
-                strategy_val = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+                strategy_val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                 if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                     strategy_val = "CONSERVATIVE"
                 lines.append(f"🎯 Strategy: {strategy_val}")
                 max_open = self._get_max_open_orders()
                 open_count = self._get_open_order_count()
                 lines.append(f"📋 Open orders: {open_count} / {max_open}")
+                signal_wait = self._get_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT)
+                lines.append("📢 WAIT signals: " + ("ON" if signal_wait == "1" else "OFF"))
                 await self._safe_reply(update, "\n".join(lines))
             except Exception as e:
                 print(f"[{_ts()}] Messenger: status failed: {e}")
                 await self._safe_reply(update, f"❌ Status failed\n\n{e}")
         elif text == "autopilot on":
-            self.db.set(shared_config.REDIS_KEY_AUTOPILOT, "1")
-            self.db.delete(shared_config.REDIS_KEY_TRADING_PAUSED)
+            self._set_setting(shared_config.SYSTEM_KEY_AUTOPILOT, "1")
+            self._set_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED, "0")
             print(f"[{_ts()}] Messenger: Autopilot ON (pipeline resumed if was paused)")
             await self._safe_reply(
                 update,
@@ -678,7 +683,7 @@ class Messenger:
                 "Pipeline resumed if it was paused.",
             )
         elif text == "autopilot off":
-            self.db.delete(shared_config.REDIS_KEY_AUTOPILOT)
+            self._set_setting(shared_config.SYSTEM_KEY_AUTOPILOT, "0")
             print(f"[{_ts()}] Messenger: Autopilot OFF (Buy button restored on signals)")
             await self._safe_reply(
                 update,
@@ -703,6 +708,26 @@ class Messenger:
             await self._handle_set_symbols(update, text)
         elif text.startswith("set timezone "):
             await self._handle_set_timezone(update, text)
+        elif text == "signal wait on":
+            self._set_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT, "1")
+            print(f"[{_ts()}] Messenger: WAIT verdict notifications ON")
+            await self._safe_reply(
+                update,
+                "📢 WAIT signals ON\n\nYou will receive Telegram notifications for WAIT verdicts.",
+            )
+        elif text == "signal wait off":
+            self._set_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT, "0")
+            print(f"[{_ts()}] Messenger: WAIT verdict notifications OFF")
+            await self._safe_reply(
+                update,
+                "📢 WAIT signals OFF\n\nNo notifications for WAIT verdicts. BUY signals unchanged.",
+            )
+        elif text == "signal wait":
+            signal_wait = self._get_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT)
+            await self._safe_reply(
+                update,
+                "📢 WAIT signals: " + ("ON" if signal_wait == "1" else "OFF") + "\n\nUse *signal wait on* or *signal wait off* to change.",
+            )
         elif text == "stats" or text.startswith("stats "):
             await self._handle_stats(update, text)
         elif text == "help":
@@ -723,7 +748,7 @@ class Messenger:
             symbol = parts[1]
             stop_loss_pct = float(parts[2]) if len(parts) > 2 and parts[2] else None
             take_profit_pct = float(parts[3]) if len(parts) > 3 and parts[3] else None
-            strategy_name = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+            strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
             if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                 strategy_name = "CONSERVATIVE"
             command = {
@@ -876,6 +901,11 @@ class Messenger:
                     symbol = data['symbol']
                     verdict = data.get('verdict', 'WAIT')
 
+                    # Skip Telegram notification for WAIT verdicts unless "signal wait on"
+                    if verdict == "WAIT" and self._get_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT) != "1":
+                        print(f"[{_ts()}] Messenger: WAIT signal for {symbol} (notifications off, skipped)")
+                        continue
+
                     # When at max open orders, don't show BUY signals (no slot to trade); consume and skip
                     if verdict == "BUY":
                         open_count = self._get_open_order_count()
@@ -897,7 +927,7 @@ class Messenger:
                     low_24h = data.get("low_24h")
 
                     # Strategy for context
-                    strategy_val = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+                    strategy_val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                     if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                         strategy_val = "CONSERVATIVE"
 
@@ -934,9 +964,9 @@ class Messenger:
                     )
 
                     # Autopilot: no Buy button when on; BUY verdict triggers automatic order
-                    autopilot_on = self.db.get(shared_config.REDIS_KEY_AUTOPILOT)
+                    autopilot_on = self._get_setting(shared_config.SYSTEM_KEY_AUTOPILOT)
                     keyboard = None
-                    if verdict == "BUY" and not autopilot_on:
+                    if verdict == "BUY" and autopilot_on != "1":
                         if stop_loss_pct is not None and take_profit_pct is not None:
                             callback = f"buy:{symbol}:{stop_loss_pct}:{take_profit_pct}"
                         else:
@@ -946,7 +976,7 @@ class Messenger:
 
                     await self.send_telegram_msg(message, symbol, keyboard)
 
-                    if verdict == "BUY" and autopilot_on:
+                    if verdict == "BUY" and autopilot_on == "1":
                         open_count = self._get_open_order_count()
                         max_open = self._get_max_open_orders()
                         if open_count >= max_open:
@@ -971,7 +1001,7 @@ class Messenger:
                                         print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (already have open order)")
                                         # skip pushing command below
                                     else:
-                                        strategy_name = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+                                        strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                                         if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                                             strategy_name = "CONSERVATIVE"
                                         command = {
@@ -992,7 +1022,7 @@ class Messenger:
                                         print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
                             except Exception as e:
                                 print(f"[{_ts()}] Messenger: DB check for open order failed: {e}")
-                                strategy_name = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+                                strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                                 if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                                     strategy_name = "CONSERVATIVE"
                                 command = {"symbol": symbol, "strategy_name": strategy_name}

@@ -16,6 +16,7 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from shared import config as shared_config
+from shared import db as shared_db
 
 load_dotenv()
 
@@ -36,8 +37,8 @@ class Scout:
         })
         print(f"[{_ts()}] Scout: Binance client initialized (public API, rate limit enabled)")
     def _get_max_symbols(self):
-        """Read max_symbols from Redis (set by Messenger 'set symbols'); default from config, clamped."""
-        val = self.db.get(shared_config.REDIS_KEY_MAX_SYMBOLS)
+        """Read max_symbols from DB (set by Messenger 'set symbols'); default from config, clamped."""
+        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_MAX_SYMBOLS)
         if val is None:
             return shared_config.MAX_SYMBOLS_DEFAULT
         try:

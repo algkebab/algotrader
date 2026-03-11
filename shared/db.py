@@ -1,6 +1,6 @@
 """
-SQLite persistence for orders (trades) and balance.
-Used by Executor (insert order, sync balance) and Monitor (close order, update balance).
+SQLite persistence for orders (trades), balance, and system settings.
+Used by Executor, Monitor, Messenger, Filter, Brain, Scout.
 """
 import os
 import sqlite3
@@ -90,7 +90,35 @@ def init_schema(conn: sqlite3.Connection) -> None:
             amount REAL NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
     """)
+
+
+def get_setting(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:
+    """Return value for key from settings table, or default if missing."""
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Insert or update a setting."""
+    now = datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+        (key, value, now),
+    )
+
+
+def get_setting_value(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Convenience: open connection, return setting value, close. For services that read one key."""
+    with get_connection() as conn:
+        init_schema(conn)
+        return get_setting(conn, key, default)
 
 
 def insert_order(

@@ -71,8 +71,8 @@ class Filter:
         return round(rsi, 2)
 
     def _get_max_open_orders(self):
-        """Return max simultaneous open orders from Redis (default 10)."""
-        val = self.db.get(shared_config.REDIS_KEY_MAX_OPEN_ORDERS)
+        """Return max simultaneous open orders from DB (default 10)."""
+        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS)
         if val is None or not str(val).isdigit():
             return shared_config.MAX_OPEN_ORDERS_DEFAULT
         return max(shared_config.MAX_OPEN_ORDERS_MIN, min(shared_config.MAX_OPEN_ORDERS_MAX, int(val)))
@@ -88,7 +88,7 @@ class Filter:
 
     def _get_strategy(self):
         """Return current strategy name and profile. Default CONSERVATIVE."""
-        val = self.db.get(shared_config.REDIS_KEY_STRATEGY)
+        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_STRATEGY)
         name = (val or STRATEGY_DEFAULT).strip().upper()
         if name not in STRATEGY_PROFILES:
             name = STRATEGY_DEFAULT
@@ -105,10 +105,10 @@ class Filter:
 
     def run(self):
         print("🛡️ Filter: Analyzing Volume & RSI indicators...")
-        PAUSED_KEY = shared_config.REDIS_KEY_TRADING_PAUSED
+        PAUSED_KEY = shared_config.SYSTEM_KEY_TRADING_PAUSED
 
         while True:
-            if self.db.get(PAUSED_KEY):
+            if shared_db.get_setting_value(PAUSED_KEY) == "1":
                 time.sleep(5)
                 continue
 
