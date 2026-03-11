@@ -14,15 +14,11 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from shared import db as shared_db
+from shared import config as shared_config
 
 
 def _ts():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-# Must match Executor.paper_leverage for balance math (margin = order amount_usdt / this)
-PAPER_LEVERAGE = 3
-BINANCE_SPOT_FEE = 0.001  # 0.1% taker fee per side (entry and exit) in paper simulation
-HOURLY_MARGIN_INTEREST_RATE = 0.00001  # 0.001% per hour simulated margin interest
 
 
 class Monitor:
@@ -114,7 +110,7 @@ class Monitor:
             qty = float(row["quantity"])
             # amount_usdt in DB is notional; margin = notional / leverage
             notional_usdt = float(row["amount_usdt"])
-            margin_usdt = notional_usdt / PAPER_LEVERAGE
+            margin_usdt = notional_usdt / shared_config.LEVERAGE
         except Exception as e:
             print(f"[{_ts()}] ❌ Monitor: DB error in close_position: {e}")
             return
@@ -126,7 +122,7 @@ class Monitor:
         margin_interest_paid = 0.0
         # Fees and margin interest simulation for paper trades
         exit_notional_usdt = qty * price
-        exit_fee_usd = exit_notional_usdt * BINANCE_SPOT_FEE
+        exit_fee_usd = exit_notional_usdt * shared_config.BINANCE_SPOT_FEE
 
         # Use stored borrowed_amount and hourly_interest_rate from order when present (Executor saves at entry)
         borrowed_amount = row.get("borrowed_amount")
@@ -136,16 +132,16 @@ class Monitor:
             except (TypeError, ValueError):
                 borrowed_amount = None
         if borrowed_amount is None:
-            effective_total_balance = notional_usdt / PAPER_LEVERAGE
+            effective_total_balance = notional_usdt / shared_config.LEVERAGE
             borrowed_amount = max(0.0, notional_usdt - effective_total_balance)
         hourly_rate = row.get("hourly_interest_rate")
         if hourly_rate is not None:
             try:
                 hourly_rate = float(hourly_rate)
             except (TypeError, ValueError):
-                hourly_rate = HOURLY_MARGIN_INTEREST_RATE
+                hourly_rate = shared_config.HOURLY_MARGIN_INTEREST_RATE
         else:
-            hourly_rate = HOURLY_MARGIN_INTEREST_RATE
+            hourly_rate = shared_config.HOURLY_MARGIN_INTEREST_RATE
 
         # Hours held (rounded up as on Binance)
         try:

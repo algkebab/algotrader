@@ -17,15 +17,12 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from shared import db as shared_db
+from shared import config as shared_config
 
 load_dotenv()
 
 def _ts():
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
-
-# Redis key for max open orders (set by Messenger "orders set max"); default 10
-REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
-MAX_OPEN_ORDERS_DEFAULT = 10
 
 # AI system prompts per AI strategy (set via Telegram "set strategy <name>")
 STRATEGY_SYSTEM_MESSAGES = {
@@ -52,8 +49,6 @@ STRATEGY_SYSTEM_MESSAGES = {
     ),
 }
 
-# Filter strategy key (set by Messenger 'strategy <name>', used by Filter & Brain)
-REDIS_KEY_FILTER_STRATEGY = "system:filter_strategy"
 FILTER_STRATEGY_DEFAULT = "CONSERVATIVE"
 
 class Brain:
@@ -65,12 +60,10 @@ class Brain:
         # AI setup
         self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
-        # Sensitivity setting: 0.005 = 0.5%
-        self.price_change_threshold = 0.005
 
     def _get_strategy_system_content(self):
         """Read strategy from Redis (set by Messenger 'set strategy'); default conservative."""
-        val = self.db.get("system:strategy")
+        val = self.db.get(shared_config.REDIS_KEY_STRATEGY)
         if not val:
             return STRATEGY_SYSTEM_MESSAGES["conservative"]
         key = str(val).strip().lower()
@@ -78,7 +71,7 @@ class Brain:
 
     def _get_filter_strategy_name(self):
         """Return current filter strategy name used by Filter service (default CONSERVATIVE)."""
-        val = self.db.get(REDIS_KEY_FILTER_STRATEGY)
+        val = self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY)
         name = (val or FILTER_STRATEGY_DEFAULT).strip().upper()
         if name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
             name = FILTER_STRATEGY_DEFAULT
@@ -101,8 +94,8 @@ class Brain:
             last_price = float(cache_data)
             price_diff = abs(current_price - last_price) / last_price
             
-            if price_diff < self.price_change_threshold:
-                print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (Price change {price_diff:.2%} < {self.price_change_threshold:.2%})")
+            if price_diff < shared_config.PRICE_CHANGE_THRESHOLD:
+                print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (Price change {price_diff:.2%} < {shared_config.PRICE_CHANGE_THRESHOLD:.2%})")
                 return False
         
         # If no cache or price moved enough, we update and proceed
@@ -111,9 +104,9 @@ class Brain:
 
     def _get_max_open_orders(self):
         """Return max simultaneous open orders from Redis (default 10)."""
-        val = self.db.get(REDIS_KEY_MAX_OPEN_ORDERS)
+        val = self.db.get(shared_config.REDIS_KEY_MAX_OPEN_ORDERS)
         if val is None or not str(val).isdigit():
-            return MAX_OPEN_ORDERS_DEFAULT
+            return shared_config.MAX_OPEN_ORDERS_DEFAULT
         return max(1, min(50, int(val)))
 
     def _get_open_order_count(self):
@@ -203,7 +196,7 @@ Respond with ONLY the JSON object, no comments or additional text.
 
     def run(self):
         print(f"[{_ts()}] 🧠 Brain: AI Technical Analyst is online with Smart Cache...")
-        PAUSED_KEY = "system:trading_paused"
+        PAUSED_KEY = shared_config.REDIS_KEY_TRADING_PAUSED
 
         while True:
             if self.db.get(PAUSED_KEY):

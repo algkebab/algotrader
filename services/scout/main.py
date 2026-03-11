@@ -2,13 +2,21 @@
 import asyncio
 import json
 import os
+import sys
 from datetime import datetime, timezone
 
 import ccxt.async_support as ccxt
 import redis
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# Allow importing shared (project root or /app in Docker)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) == "scout" else _this_dir
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from shared import config as shared_config
+
 load_dotenv()
 
 
@@ -18,33 +26,25 @@ def _ts():
 
 class Scout:
     def __init__(self):
-        # Initialize asynchronous Binance exchange client
-        # Use environment variable to switch between 'localhost' and 'redis'
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
         self.db.ping()
         print(f"[{_ts()}] Scout: Connected to Redis at {redis_host}:6379")
         print(f"[{_ts()}] Scout: Redis ping OK")
-        # Public API only (no keys). Tickers/OHLCV are public; keys trigger signed requests
-        # and -1021 "Timestamp outside recvWindow" when container clock drifts.
         self.exchange = ccxt.binance({
             'enableRateLimit': True,
         })
         print(f"[{_ts()}] Scout: Binance client initialized (public API, rate limit enabled)")
-        self._max_symbols_default = 30
-        self._max_symbols_min = 5
-        self._max_symbols_max = 200
-
     def _get_max_symbols(self):
-        """Read max_symbols from Redis (set by Messenger 'set symbols'); default 30, clamped 5–200."""
-        val = self.db.get("system:max_symbols")
+        """Read max_symbols from Redis (set by Messenger 'set symbols'); default from config, clamped."""
+        val = self.db.get(shared_config.REDIS_KEY_MAX_SYMBOLS)
         if val is None:
-            return self._max_symbols_default
+            return shared_config.MAX_SYMBOLS_DEFAULT
         try:
             n = int(val)
-            return max(self._max_symbols_min, min(self._max_symbols_max, n))
+            return max(shared_config.MAX_SYMBOLS_MIN, min(shared_config.MAX_SYMBOLS_MAX, n))
         except (ValueError, TypeError):
-            return self._max_symbols_default
+            return shared_config.MAX_SYMBOLS_DEFAULT
 
     async def get_top_active_symbols(self):
         """Fetches TOP coins by 24h volume to ensure we track volatile assets.
@@ -139,8 +139,8 @@ class Scout:
 
             # Save active symbols list so other services know which keys to read
             try:
-                self.db.set('system:active_symbols', json.dumps(active_symbols))
-                print(f"[{_ts()}] Scout: Updated system:active_symbols ({len(active_symbols)} symbols)")
+                self.db.set(shared_config.REDIS_KEY_ACTIVE_SYMBOLS, json.dumps(active_symbols))
+                print(f"[{_ts()}] Scout: Updated {shared_config.REDIS_KEY_ACTIVE_SYMBOLS} ({len(active_symbols)} symbols)")
             except Exception as e:
                 print(f"[{_ts()}] Scout: Redis error saving active symbols: {e}")
 

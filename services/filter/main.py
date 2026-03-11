@@ -12,12 +12,8 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from shared import db as shared_db
+from shared import config as shared_config
 
-# Redis key for max open orders (set by Messenger "orders set max"); default 10
-REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
-MAX_OPEN_ORDERS_DEFAULT = 10
-# Redis key for filter strategy (set by Messenger "strategy <name>"); default CONSERVATIVE
-REDIS_KEY_FILTER_STRATEGY = "system:filter_strategy"
 
 # Hardcoded strategy profiles: min_24h_volume, rvol_threshold, rsi_max, min_change (%)
 # REVERSAL: rsi_max used as oversold threshold (RSI < 30), min_change negative (price drop)
@@ -76,10 +72,10 @@ class Filter:
 
     def _get_max_open_orders(self):
         """Return max simultaneous open orders from Redis (default 10)."""
-        val = self.db.get(REDIS_KEY_MAX_OPEN_ORDERS)
+        val = self.db.get(shared_config.REDIS_KEY_MAX_OPEN_ORDERS)
         if val is None or not str(val).isdigit():
-            return MAX_OPEN_ORDERS_DEFAULT
-        return max(1, min(50, int(val)))
+            return shared_config.MAX_OPEN_ORDERS_DEFAULT
+        return max(shared_config.MAX_OPEN_ORDERS_MIN, min(shared_config.MAX_OPEN_ORDERS_MAX, int(val)))
 
     def _get_open_order_count(self):
         """Return number of open orders in DB."""
@@ -92,7 +88,7 @@ class Filter:
 
     def _get_filter_strategy(self):
         """Return current filter strategy name and profile. Default CONSERVATIVE."""
-        val = self.db.get(REDIS_KEY_FILTER_STRATEGY)
+        val = self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY)
         name = (val or FILTER_STRATEGY_DEFAULT).strip().upper()
         if name not in FILTER_STRATEGY_PROFILES:
             name = FILTER_STRATEGY_DEFAULT
@@ -109,7 +105,7 @@ class Filter:
 
     def run(self):
         print("🛡️ Filter: Analyzing Volume & RSI indicators...")
-        PAUSED_KEY = "system:trading_paused"
+        PAUSED_KEY = shared_config.REDIS_KEY_TRADING_PAUSED
 
         while True:
             if self.db.get(PAUSED_KEY):
@@ -130,7 +126,7 @@ class Filter:
             # New data layout:
             # - system:active_symbols -> JSON list of symbols
             # - market_data:{symbol}  -> JSON per-symbol payload from Scout
-            raw_symbols = self.db.get("system:active_symbols")
+            raw_symbols = self.db.get(shared_config.REDIS_KEY_ACTIVE_SYMBOLS)
             if not raw_symbols:
                 time.sleep(5)
                 continue
