@@ -42,8 +42,6 @@ REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"
 REDIS_KEY_AUTOPILOT = "system:autopilot"
 # Redis key: when set, no alerts/notifications sent to Telegram (platform keeps working)
 REDIS_KEY_MUTED = "system:muted"
-# Redis key: "1" = paper trading (no exchange, DB only); "0" = live. Default when absent = paper.
-REDIS_KEY_PAPERTRADING = "system:papertrading"
 # Last balance check (for "balance" command: compare day PnL since last check)
 REDIS_KEY_BALANCE_LAST_DAY_PNL = "system:balance_last_day_pnl"
 REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
@@ -66,7 +64,6 @@ REDIS_SYSTEM_KEYS = frozenset({
     REDIS_KEY_SUPPRESS_WAIT_SIGNALS,
     REDIS_KEY_AUTOPILOT,
     REDIS_KEY_MUTED,
-    REDIS_KEY_PAPERTRADING,
     REDIS_KEY_MAX_SYMBOLS,
     REDIS_KEY_STRATEGY,
     REDIS_KEY_FILTER_STRATEGY,
@@ -142,9 +139,8 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 🔕 • *mute* — No alerts or notifications sent (platform keeps running).
 🔔 • *unmute* — Resume alerts and notifications.
 
-📄 *Paper / Live*
-📋 • *papertrading on* — No real orders; DB only. (Default.)
-🔥 • *papertrading off* — Live trading on exchange.
+📄 *Paper Trading*
+📋 • Always ON — no real orders; DB only.
 
 🧹 *Data*
 🗑️ • *clear redis* — Clear queues and cache. Keeps system settings.
@@ -300,40 +296,35 @@ class Messenger:
             gross_pnl_usdt = (close_price - entry_price) * qty
             gross_pnl_percent = ((close_price / entry_price) - 1) * 100
             reason = "Manual close"
-            paper = self.db.get("system:papertrading") != "0"
-            margin_usdt = notional_usdt / PAPER_LEVERAGE if paper else 0.0
+            margin_usdt = notional_usdt / PAPER_LEVERAGE
 
-            exit_fee_usd = 0.0
-            margin_interest_paid = 0.0
-            net_pnl_usdt = gross_pnl_usdt
-            net_pnl_pct = gross_pnl_percent
-            if paper:
-                exit_notional = qty * close_price
-                exit_fee_usd = exit_notional * BINANCE_SPOT_FEE
-                borrowed = row.get("borrowed_amount")
-                if borrowed is not None:
-                    try:
-                        borrowed = float(borrowed)
-                    except (TypeError, ValueError):
-                        borrowed = None
-                if borrowed is None:
-                    borrowed = max(0.0, notional_usdt - margin_usdt)
-                rate = row.get("hourly_interest_rate")
-                if rate is not None:
-                    try:
-                        rate = float(rate)
-                    except (TypeError, ValueError):
-                        rate = HOURLY_MARGIN_INTEREST_RATE
-                else:
-                    rate = HOURLY_MARGIN_INTEREST_RATE
+            # Paper-mode fees and interest for manual close
+            exit_notional = qty * close_price
+            exit_fee_usd = exit_notional * BINANCE_SPOT_FEE
+            borrowed = row.get("borrowed_amount")
+            if borrowed is not None:
                 try:
-                    opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", "+00:00"))
-                    hours_held = max(1, math.ceil((datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0))
-                except Exception:
-                    hours_held = 1
-                margin_interest_paid = borrowed * rate * hours_held
-                net_pnl_usdt = gross_pnl_usdt - exit_fee_usd - margin_interest_paid
-                net_pnl_pct = (net_pnl_usdt / margin_usdt * 100) if margin_usdt else 0.0
+                    borrowed = float(borrowed)
+                except (TypeError, ValueError):
+                    borrowed = None
+            if borrowed is None:
+                borrowed = max(0.0, notional_usdt - margin_usdt)
+            rate = row.get("hourly_interest_rate")
+            if rate is not None:
+                try:
+                    rate = float(rate)
+                except (TypeError, ValueError):
+                    rate = HOURLY_MARGIN_INTEREST_RATE
+            else:
+                rate = HOURLY_MARGIN_INTEREST_RATE
+            try:
+                opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", "+00:00"))
+                hours_held = max(1, math.ceil((datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0))
+            except Exception:
+                hours_held = 1
+            margin_interest_paid = borrowed * rate * hours_held
+            net_pnl_usdt = gross_pnl_usdt - exit_fee_usd - margin_interest_paid
+            net_pnl_pct = (net_pnl_usdt / margin_usdt * 100) if margin_usdt else 0.0
 
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
@@ -348,9 +339,6 @@ class Messenger:
                 )
                 bal = shared_db.get_balance(conn, "USDT")
                 shared_db.set_balance(conn, "USDT", bal + margin_usdt + net_pnl_usdt)
-
-            if not paper:
-                self.db.hdel("active_trades", symbol)
 
             self.db.rpush("notifications", json.dumps({
                 "type": "trade_closed",
@@ -810,23 +798,6 @@ class Messenger:
             except Exception as e:
                 print(f"[{_ts()}] Messenger: clear redis failed: {e}")
                 await self._safe_reply(update, f"❌ Clear Redis failed\n\n{e}")
-        elif text == "papertrading on":
-            self.db.set(REDIS_KEY_PAPERTRADING, "1")
-            print(f"[{_ts()}] Messenger: Paper trading ON (no exchange orders, DB only)")
-            await self._safe_reply(
-                update,
-                "📄 Paper trading on\n\n"
-                "No real orders on exchange. Orders written to DB only.\n"
-                "Monitor uses DB. 👉 Send \"papertrading off\" for live.",
-            )
-        elif text == "papertrading off":
-            self.db.set(REDIS_KEY_PAPERTRADING, "0")
-            print(f"[{_ts()}] Messenger: Paper trading OFF (live trading)")
-            await self._safe_reply(
-                update,
-                "🔴 Paper trading off\n\n"
-                "Live trading: real orders on exchange. Monitor uses Redis.",
-            )
         elif text == "status":
             try:
                 paused = self.db.get(REDIS_KEY_TRADING_PAUSED)
@@ -835,8 +806,6 @@ class Messenger:
                 suppress_wait = suppress_wait_val != "0"
                 autopilot = self.db.get(REDIS_KEY_AUTOPILOT)
                 muted = self.db.get(REDIS_KEY_MUTED)
-                paper_val = self.db.get(REDIS_KEY_PAPERTRADING)
-                paper_on = paper_val != "0"
                 symbols_val = self.db.get(REDIS_KEY_MAX_SYMBOLS)
                 symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else MAX_SYMBOLS_DEFAULT
                 lines = [
@@ -846,7 +815,6 @@ class Messenger:
                     "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot else "OFF (Buy button on signals)"),
                     "🔔 WAIT signals: " + ("suppressed (only BUY)" if suppress_wait else "on (BUY + WAIT)"),
                     "📱 Telegram: " + ("🔇 muted" if muted else "🔔 unmuted"),
-                    "📄 Paper: " + ("ON (DB only)" if paper_on else "OFF (live)"),
                     f"📈 Symbols: top {symbols_n} by volume",
                     "⚙️ Paper model: 3x leverage · 0.1% taker fee · 0.001%/h margin interest",
                 ]

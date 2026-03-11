@@ -83,39 +83,19 @@ class Executor:
         self.exchange.load_markets()
         return float(self.exchange.price_to_precision(symbol, price))
 
-    def get_free_usdt_balance(self):
-        """Checks available USDT balance on Binance Spot account."""
-        try:
-            balance = self.exchange.fetch_balance()
-            # На Binance використовуємо balance['free']
-            return float(balance['free'].get('USDT', 0))
-        except Exception as e:
-            print(f"[{_ts()}] ❌ Error fetching balance: {e}")
-            return 0.0
-
-    def _is_paper_trading(self):
-        """Paper trading is ON when key is absent or '1'; OFF when '0'."""
-        val = self.db.get("system:papertrading")
-        return val != "0"
-
     def can_open_position(self, symbol):
-        """Checks if we already have an active trade for this symbol (Redis in live, DB in paper)."""
-        if self._is_paper_trading():
-            try:
-                with shared_db.get_connection() as conn:
-                    shared_db.init_schema(conn)
-                    return shared_db.get_open_order_id_for_symbol(conn, symbol) is None
-            except Exception:
-                return True
-        return not self.db.hexists('active_trades', symbol)
+        """Checks if we already have an active trade for this symbol in paper mode (DB only)."""
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                return shared_db.get_open_order_id_for_symbol(conn, symbol) is None
+        except Exception:
+            return True
 
     def place_smart_order(self, symbol, amount_usdt=10, risk_percent=0.02, stop_loss_pct=None, take_profit_pct=None, strategy_name=None):
-        """
-        Executes a market buy on Binance Spot (live) or writes order to DB only (paper).
-        """
+        """Writes paper order to DB only (no live trading)."""
         try:
-            paper = self._is_paper_trading()
-            print(f"[{_ts()}] 🛒 Executor: Processing order for {symbol}" + (" (paper)" if paper else ""))
+            print(f"[{_ts()}] 🛒 Executor: Processing paper order for {symbol}")
 
             if not self.can_open_position(symbol):
                 print(f"[{_ts()}] ⚠️ Already monitoring {symbol}. Skipping.")
@@ -125,70 +105,7 @@ class Executor:
                 }))
                 return {"status": "error", "msg": "Position exists"}
 
-            if paper:
-                return self._place_paper_order(symbol, amount_usdt, stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct, strategy_name=strategy_name)
-
-            # --- LIVE TRADING ---
-            # 1. Risk Management
-            total_usdt = self.get_free_usdt_balance()
-            print(f"[{_ts()}] 💰 Current Balance: {total_usdt} USDT")
-            
-            calc_amount = max(total_usdt * risk_percent, 10.5) 
-            if total_usdt < 10:
-                 return {"status": "error", "msg": "Insufficient funds on Binance"}
-            final_amount_usdt = min(calc_amount, total_usdt)
-
-            # 2. Market Data
-            ticker = self.exchange.fetch_ticker(symbol)
-            entry_price = ticker['last']
-            # Use AI-provided TP/SL percentages when available; otherwise fall back to defaults
-            if stop_loss_pct is not None and stop_loss_pct > 0:
-                sl_price = self.get_precision_price(symbol, entry_price * (1 - stop_loss_pct / 100.0))
-            else:
-                sl_price = self.get_precision_price(symbol, entry_price * self.sl_percent)
-            if take_profit_pct is not None and take_profit_pct > 0:
-                tp_price = self.get_precision_price(symbol, entry_price * (1 + take_profit_pct / 100.0))
-            else:
-                tp_price = self.get_precision_price(symbol, entry_price * self.tp_percent)
-            raw_qty = final_amount_usdt / entry_price
-            qty = self.get_precision_amount(symbol, raw_qty)
-
-            print(f"[{_ts()}] 🚀 SENDING MARKET BUY: {qty} {symbol}")
-            order = self.exchange.create_market_buy_order(symbol, qty)
-            actual_entry = order.get('average', entry_price)
-
-            result = {
-                "status": "success",
-                "order_id": order.get('id'),
-                "symbol": symbol,
-                "entry": float(actual_entry),
-                "qty": float(qty),
-                "tp": float(tp_price),
-                "sl": float(sl_price),
-                "timestamp": time.time()
-            }
-            self.db.hset('active_trades', symbol, json.dumps(result))
-            self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
-
-            session = get_trading_session()
-            try:
-                with shared_db.get_connection() as conn:
-                    shared_db.init_schema(conn)
-                    shared_db.insert_order(
-                        conn, symbol=symbol, side="buy", amount_usdt=final_amount_usdt,
-                        entry_price=float(actual_entry), quantity=float(qty),
-                        tp_price=float(tp_price), sl_price=float(sl_price),
-                        entry_fee_usd=0.0,
-                        exchange_order_id=str(order["id"]) if order.get("id") else None,
-                        strategy_name=strategy_name,
-                        session=session,
-                    )
-                    shared_db.sync_balance_from_exchange(conn, self.exchange)
-            except Exception as db_err:
-                print(f"[{_ts()}] ⚠️ DB write failed (order still on exchange): {db_err}")
-
-            print(f"[{_ts()}] ✅ Order confirmed on Binance! ID: {order.get('id')} | Session: {session}")
-            return result
+            return self._place_paper_order(symbol, amount_usdt, stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct, strategy_name=strategy_name)
 
         except Exception as e:
             print(f"[{_ts()}] ❌ Binance Order Error: {e}")
