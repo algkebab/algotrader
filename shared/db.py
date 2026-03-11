@@ -28,6 +28,7 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
         ("borrowed_amount", "REAL NOT NULL DEFAULT 0"),
         ("hourly_interest_rate", "REAL"),
         ("strategy_name", "TEXT"),
+        ("session", "TEXT"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
@@ -75,6 +76,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             borrowed_amount REAL NOT NULL DEFAULT 0,
             hourly_interest_rate REAL,
             strategy_name TEXT,
+            session TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_orders_symbol_status ON orders(symbol, status);
@@ -105,12 +107,13 @@ def insert_order(
     borrowed_amount: float = 0.0,
     hourly_interest_rate: Optional[float] = None,
     strategy_name: Optional[str] = None,
+    session: Optional[str] = None,
 ) -> int:
     now = datetime.utcnow().isoformat() + "Z"
     cur = conn.execute(
-        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)""",
-        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name),
+        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)""",
+        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session),
     )
     return cur.lastrowid
 

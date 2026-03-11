@@ -21,6 +21,23 @@ def _ts():
     """Returns current timestamp for logging."""
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
+
+def get_trading_session():
+    """Return current trading session(s) based on UTC time.
+    ASIA 00-09 UTC, EUROPE 08-17 UTC, NORTH_AMERICA 13-22 UTC.
+    Overlaps return e.g. 'EUROPE/NORTH_AMERICA'; else 'LATE_NIGHT'."""
+    now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
+    sessions = []
+    if 0 <= hour < 9:
+        sessions.append("ASIA")
+    if 8 <= hour < 17:
+        sessions.append("EUROPE")
+    if 13 <= hour < 22:
+        sessions.append("NORTH_AMERICA")
+    return "/".join(sessions) if sessions else "LATE_NIGHT"
+
+
 class Executor:
     def __init__(self):
         # Redis setup
@@ -153,6 +170,7 @@ class Executor:
             self.db.hset('active_trades', symbol, json.dumps(result))
             self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
 
+            session = get_trading_session()
             try:
                 with shared_db.get_connection() as conn:
                     shared_db.init_schema(conn)
@@ -163,12 +181,13 @@ class Executor:
                         entry_fee_usd=0.0,
                         exchange_order_id=str(order["id"]) if order.get("id") else None,
                         strategy_name=strategy_name,
+                        session=session,
                     )
                     shared_db.sync_balance_from_exchange(conn, self.exchange)
             except Exception as db_err:
                 print(f"[{_ts()}] ⚠️ DB write failed (order still on exchange): {db_err}")
 
-            print(f"[{_ts()}] ✅ Order confirmed on Binance! ID: {order.get('id')}")
+            print(f"[{_ts()}] ✅ Order confirmed on Binance! ID: {order.get('id')} | Session: {session}")
             return result
 
         except Exception as e:
@@ -241,6 +260,7 @@ class Executor:
 
                 # Lock margin and pay entry fee from virtual balance
                 shared_db.set_balance(conn, "USDT", current_bal - total_entry_cost)
+                session = get_trading_session()
                 order_id = shared_db.insert_order(
                     conn,
                     symbol=symbol,
@@ -255,6 +275,7 @@ class Executor:
                     borrowed_amount=float(borrowed_amount),
                     hourly_interest_rate=float(self.HOURLY_MARGIN_INTEREST_RATE),
                     strategy_name=strategy_name,
+                    session=session,
                 )
             print(f"[{_ts()}] 📊 Risking ${risk_amount:.2f} to buy ${final_notional_usdt:.2f} worth of {symbol} (Leverage: {self.paper_leverage}x)")
             result = {
@@ -268,7 +289,7 @@ class Executor:
                 "timestamp": time.time()
             }
             self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
-            print(f"[{_ts()}] ✅ Paper order written to DB (id={order_id}, {self.paper_leverage}x leverage)")
+            print(f"[{_ts()}] ✅ Paper order written to DB (id={order_id}, {self.paper_leverage}x leverage) | Session: {session}")
             return result
         except Exception as e:
             print(f"[{_ts()}] ❌ Paper order error: {e}")
