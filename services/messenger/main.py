@@ -37,12 +37,12 @@ SEND_MESSAGE_RETRY_DELAY = 2.0
 
 # Keys we never delete on "clear redis" (system settings; all from shared.config)
 REDIS_SYSTEM_KEYS = frozenset({
-    shared_config.shared_config.REDIS_KEY_TRADING_PAUSED,
-    shared_config.shared_config.REDIS_KEY_AUTOPILOT,
-    shared_config.shared_config.REDIS_KEY_MAX_SYMBOLS,
-    shared_config.shared_config.REDIS_KEY_STRATEGY,
-    shared_config.shared_config.REDIS_KEY_MAX_OPEN_ORDERS,
-    shared_config.shared_config.REDIS_KEY_TIMEZONE_OFFSET_MIN,
+    shared_config.REDIS_KEY_TRADING_PAUSED,
+    shared_config.REDIS_KEY_AUTOPILOT,
+    shared_config.REDIS_KEY_MAX_SYMBOLS,
+    shared_config.REDIS_KEY_STRATEGY,
+    shared_config.REDIS_KEY_MAX_OPEN_ORDERS,
+    shared_config.REDIS_KEY_TIMEZONE_OFFSET_MIN,
 })
 
 # Allowed values for "strategy <name>"
@@ -58,8 +58,8 @@ REDIS_DATA_KEYS = [
     "trade_commands",
     "active_trades",
     "notifications",
-    shared_config.shared_config.REDIS_KEY_BALANCE_LAST_DAY_PNL,
-    shared_config.shared_config.REDIS_KEY_BALANCE_LAST_CHECK,
+    shared_config.REDIS_KEY_BALANCE_LAST_DAY_PNL,
+    shared_config.REDIS_KEY_BALANCE_LAST_CHECK,
 ]
 REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
