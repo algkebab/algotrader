@@ -74,7 +74,7 @@ def _normalize_symbol(s: str) -> str:
         return s[:-4] + "/USDT"
     return s + "/USDT"
 
-HELP_MESSAGE = """🛠 *Algotrader — Commands*
+HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 
 📌 *Pipeline*
 ⏸️ • *stop* — Pause Filter & Brain (no filtering, no AI). Scout, Executor, Monitor keep running.
@@ -91,10 +91,10 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 📈 • *status* — Pipeline, autopilot.
 📋 • *orders* — List open orders from DB.
 🔒 • *orders close* <symbol> — Manually close open order (e.g. orders close BTC/USDT). Updates balance.
-🔢 • *orders set max* <number> — Max open orders for autopilot (e.g. orders set max 15). Default 10.
+🔢 • *orders set max* <number> — Max open orders for autopilot (e.g. orders set max 15). Default {shared_config.MAX_OPEN_ORDERS_DEFAULT}. Min {shared_config.MAX_OPEN_ORDERS_MIN}, max {shared_config.MAX_OPEN_ORDERS_MAX}.
 💰 • *balance* — Wallet, today PnL, and change since last check.
 💵 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
-📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols 50). Min 5, max 200.
+📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols {shared_config.MAX_SYMBOLS_DEFAULT}). Min {shared_config.MAX_SYMBOLS_MIN}, max {shared_config.MAX_SYMBOLS_MAX}. Default {shared_config.MAX_SYMBOLS_DEFAULT}.
 🛡️ • *strategy* <name> — Strategy: conservative, aggressive, reversal. Default: CONSERVATIVE.
 🕒 • *set timezone* <offset> — Local timezone offset vs UTC in hours (e.g. set timezone +2, set timezone -5, set timezone 5.5). Affects timestamps in bot messages only.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
