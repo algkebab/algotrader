@@ -17,7 +17,7 @@ from shared import config as shared_config
 
 # Hardcoded strategy profiles: min_24h_volume, rvol_threshold, rsi_max, min_change (%)
 # REVERSAL: rsi_max used as oversold threshold (RSI < 30), min_change negative (price drop)
-FILTER_STRATEGY_PROFILES = {
+STRATEGY_PROFILES = {
     "CONSERVATIVE": {
         "min_24h_volume": 10_000_000,
         "rvol_threshold": 2.0,
@@ -37,7 +37,7 @@ FILTER_STRATEGY_PROFILES = {
         "min_change": -5.0,  # negative: look for price drop >= 5%
     },
 }
-FILTER_STRATEGY_DEFAULT = "CONSERVATIVE"
+STRATEGY_DEFAULT = "CONSERVATIVE"
 
 
 class Filter:
@@ -86,13 +86,13 @@ class Filter:
         except Exception:
             return 0
 
-    def _get_filter_strategy(self):
-        """Return current filter strategy name and profile. Default CONSERVATIVE."""
-        val = self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY)
-        name = (val or FILTER_STRATEGY_DEFAULT).strip().upper()
-        if name not in FILTER_STRATEGY_PROFILES:
-            name = FILTER_STRATEGY_DEFAULT
-        return name, FILTER_STRATEGY_PROFILES[name]
+    def _get_strategy(self):
+        """Return current strategy name and profile. Default CONSERVATIVE."""
+        val = self.db.get(shared_config.REDIS_KEY_STRATEGY)
+        name = (val or STRATEGY_DEFAULT).strip().upper()
+        if name not in STRATEGY_PROFILES:
+            name = STRATEGY_DEFAULT
+        return name, STRATEGY_PROFILES[name]
 
     def calculate_rvol(self, current_vol_24h):
         """
@@ -120,7 +120,7 @@ class Filter:
                 time.sleep(10)
                 continue
 
-            strategy_name, profile = self._get_filter_strategy()
+            strategy_name, profile = self._get_strategy()
             print(f"🛡️ Filter: Scan cycle — strategy: {strategy_name}")
 
             # New data layout:

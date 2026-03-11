@@ -38,20 +38,15 @@ SEND_MESSAGE_RETRY_DELAY = 2.0
 # Keys we never delete on "clear redis" (system settings; all from shared.config)
 REDIS_SYSTEM_KEYS = frozenset({
     shared_config.shared_config.REDIS_KEY_TRADING_PAUSED,
-    shared_config.shared_config.REDIS_KEY_SUPPRESS_WAIT_SIGNALS,
     shared_config.shared_config.REDIS_KEY_AUTOPILOT,
-    shared_config.shared_config.REDIS_KEY_MUTED,
     shared_config.shared_config.REDIS_KEY_MAX_SYMBOLS,
     shared_config.shared_config.REDIS_KEY_STRATEGY,
-    shared_config.shared_config.REDIS_KEY_FILTER_STRATEGY,
     shared_config.shared_config.REDIS_KEY_MAX_OPEN_ORDERS,
     shared_config.shared_config.REDIS_KEY_TIMEZONE_OFFSET_MIN,
 })
 
-# Allowed values for "set strategy" (AI)
-STRATEGY_VALUES = frozenset({"conservative", "moderate", "aggressive", "active_day"})
-# Allowed values for "strategy <name>" (Filter)
-FILTER_STRATEGY_VALUES = frozenset({"conservative", "aggressive", "reversal"})
+# Allowed values for "strategy <name>"
+STRATEGY_VALUES = frozenset({"conservative", "aggressive", "reversal"})
 # Allowed values for "stats <value>"
 STATS_VALUES = frozenset({"today", "yesterday", "week", "month", "all"})
 
@@ -89,27 +84,18 @@ HELP_MESSAGE = """🛠 *Algotrader — Commands*
 🟢 • *autopilot on* — Auto-place orders on BUY (max set by orders set max). No Buy button. Resumes pipeline if paused.
 🔴 • *autopilot off* — Stop auto orders. Buy button shown again on BUY signals.
 
-🔔 *Signals*
-🔇 • *stop wait* — Only BUY signals sent; WAIT verdicts hidden.
-🔊 • *start wait* — Send both BUY and WAIT signals.
-
-📱 *Notifications*
-🔕 • *mute* — No alerts or notifications sent (platform keeps running).
-🔔 • *unmute* — Resume alerts and notifications.
-
 🧹 *Data*
 🗑️ • *clear redis* — Clear queues and cache. Keeps system settings.
 
 📊 *Info & Trading*
-📈 • *status* — Pipeline, autopilot, mute.
+📈 • *status* — Pipeline, autopilot.
 📋 • *orders* — List open orders from DB.
 🔒 • *orders close* <symbol> — Manually close open order (e.g. orders close BTC/USDT). Updates balance.
 🔢 • *orders set max* <number> — Max open orders for autopilot (e.g. orders set max 15). Default 10.
 💰 • *balance* — Wallet, today PnL, and change since last check.
 💵 • *set balance* <amount> — Set USDT in DB (e.g. set balance 100.50).
 📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols 50). Min 5, max 200.
-🎯 • *set strategy* <name> — AI strategy: conservative, moderate, aggressive, active_day. Default: conservative.
-🛡️ • *strategy* <name> — Filter strategy: conservative, aggressive, reversal. Default: CONSERVATIVE.
+🛡️ • *strategy* <name> — Strategy: conservative, aggressive, reversal. Default: CONSERVATIVE.
 🕒 • *set timezone* <offset> — Local timezone offset vs UTC in hours (e.g. set timezone +2, set timezone -5, set timezone 5.5). Affects timestamps in bot messages only.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 ❓ • *help* — This message."""
@@ -516,47 +502,26 @@ class Messenger:
         print(f"[{_ts()}] Messenger: max_symbols set to {n}")
         await self._safe_reply(update, f"✅ Symbols updated\n\n📈 Scout will fetch top {n} symbols by volume.")
 
-    async def _handle_set_strategy(self, update, text: str) -> None:
-        """Set AI strategy. Usage: set strategy <name>. Values: conservative, moderate, aggressive, active_day."""
-        rest = text[len("set strategy "):].strip().lower()
+    async def _handle_strategy(self, update, text: str) -> None:
+        """Set strategy. Usage: strategy <name>. Values: conservative, aggressive, reversal."""
+        rest = text[len("strategy "):].strip().lower() if text.startswith("strategy ") else ""
         if not rest:
             await self._safe_reply(
                 update,
-                "🎯 Set strategy\n\nUsage: set strategy <name>\n"
-                "Values: conservative, moderate, aggressive, active_day.\n"
-                "Default: conservative.",
+                "🎯 Strategy\n\nUsage: strategy <name>\n"
+                "Values: conservative, aggressive, reversal.\n"
+                "Default: CONSERVATIVE.",
             )
             return
         if rest not in STRATEGY_VALUES:
             await self._safe_reply(
                 update,
-                f"❌ Invalid strategy. Use one of: conservative, moderate, aggressive, active_day.",
-            )
-            return
-        self.db.set(shared_config.REDIS_KEY_STRATEGY, rest)
-        print(f"[{_ts()}] Messenger: strategy set to {rest}")
-        await self._safe_reply(update, f"✅ Strategy updated\n\n🎯 AI strategy: {rest}")
-
-    async def _handle_filter_strategy(self, update, text: str) -> None:
-        """Set Filter strategy. Usage: strategy <name>. Values: conservative, aggressive, reversal."""
-        rest = text[len("strategy "):].strip().lower() if text.startswith("strategy ") else ""
-        if not rest:
-            await self._safe_reply(
-                update,
-                "🎯 Filter strategy\n\nUsage: strategy <name>\n"
-                "Values: conservative, aggressive, reversal.\n"
-                "Default: CONSERVATIVE.",
-            )
-            return
-        if rest not in FILTER_STRATEGY_VALUES:
-            await self._safe_reply(
-                update,
-                f"❌ Invalid filter strategy. Use one of: conservative, aggressive, reversal.",
+                f"❌ Invalid strategy. Use one of: conservative, aggressive, reversal.",
             )
             return
         name_upper = rest.upper()
-        self.db.set(shared_config.REDIS_KEY_FILTER_STRATEGY, name_upper)
-        print(f"[{_ts()}] Messenger: filter strategy set to {name_upper}")
+        self.db.set(shared_config.REDIS_KEY_STRATEGY, name_upper)
+        print(f"[{_ts()}] Messenger: strategy set to {name_upper}")
         await self._safe_reply(update, f"🎯 Strategy changed to {name_upper}. Filters updated.")
 
     async def _handle_set_timezone(self, update, text: str) -> None:
@@ -665,35 +630,6 @@ class Messenger:
             self.db.delete(shared_config.REDIS_KEY_TRADING_PAUSED)
             print(f"[{_ts()}] Messenger: Pipeline RESUMED (Filter & Brain running)")
             await self._safe_reply(update, "▶️ Pipeline resumed\n\nFilter and Brain are running.")
-        elif text == "stop wait":
-            self.db.set(shared_config.REDIS_KEY_SUPPRESS_WAIT_SIGNALS, "1")
-            print(f"[{_ts()}] Messenger: WAIT signals disabled (only BUY alerts will be sent)")
-            await self._safe_reply(
-                update,
-                "🔇 WAIT verdicts off\n\n"
-                "Only BUY signals will be sent.\n"
-                "👉 Send \"start wait\" to send WAIT again.",
-            )
-        elif text == "start wait":
-            self.db.delete(shared_config.REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
-            print(f"[{_ts()}] Messenger: WAIT signals enabled (BUY and WAIT alerts sent)")
-            await self._safe_reply(
-                update,
-                "🔔 WAIT verdicts on\n\nBoth BUY and WAIT signals will be sent.",
-            )
-        elif text == "mute":
-            self.db.set(shared_config.REDIS_KEY_MUTED, "1")
-            print(f"[{_ts()}] Messenger: Telegram muted (no alerts/notifications sent)")
-            await self._safe_reply(
-                update,
-                "🔇 Muted\n\n"
-                "No alerts or notifications until you send \"unmute\".\n"
-                "Platform keeps running (signals, autopilot, executor unchanged).",
-            )
-        elif text == "unmute":
-            self.db.delete(shared_config.REDIS_KEY_MUTED)
-            print(f"[{_ts()}] Messenger: Telegram unmuted (alerts/notifications enabled)")
-            await self._safe_reply(update, "🔔 Unmuted\n\nAlerts and notifications are on again.")
         elif text == "clear redis":
             try:
                 n = self._clear_redis_data()
@@ -701,7 +637,7 @@ class Messenger:
                 await self._safe_reply(
                     update,
                     f"🧹 Redis cleared\n\n{n} keys deleted.\n"
-                    "System settings (stop/start, autopilot, mute) kept.",
+                    "System settings (stop/start, autopilot) kept.",
                 )
             except Exception as e:
                 print(f"[{_ts()}] Messenger: clear redis failed: {e}")
@@ -709,11 +645,7 @@ class Messenger:
         elif text == "status":
             try:
                 paused = self.db.get(shared_config.REDIS_KEY_TRADING_PAUSED)
-                # "0" = send WAIT; missing or "1" = suppress (default after deploy)
-                suppress_wait_val = self.db.get(shared_config.REDIS_KEY_SUPPRESS_WAIT_SIGNALS)
-                suppress_wait = suppress_wait_val != "0"
                 autopilot = self.db.get(shared_config.REDIS_KEY_AUTOPILOT)
-                muted = self.db.get(shared_config.REDIS_KEY_MUTED)
                 symbols_val = self.db.get(shared_config.REDIS_KEY_MAX_SYMBOLS)
                 symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else shared_config.MAX_SYMBOLS_DEFAULT
                 lines = [
@@ -721,19 +653,13 @@ class Messenger:
                     "",
                     "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused else "▶️ running"),
                     "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot else "OFF (Buy button on signals)"),
-                    "🔔 WAIT signals: " + ("suppressed (only BUY)" if suppress_wait else "on (BUY + WAIT)"),
-                    "📱 Telegram: " + ("🔇 muted" if muted else "🔔 unmuted"),
                     f"📈 Symbols: top {symbols_n} by volume",
                     "⚙️ Model: 3x leverage · 0.1% taker fee · 0.001%/h margin interest",
                 ]
-                strategy_val = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "conservative").strip().lower()
-                if strategy_val not in STRATEGY_VALUES:
-                    strategy_val = "conservative"
+                strategy_val = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+                if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                    strategy_val = "CONSERVATIVE"
                 lines.append(f"🎯 Strategy: {strategy_val}")
-                filter_strategy_val = (self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
-                if filter_strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                    filter_strategy_val = "CONSERVATIVE"
-                lines.append(f"🛡️ Filter strategy: {filter_strategy_val}")
                 max_open = self._get_max_open_orders()
                 open_count = self._get_open_order_count()
                 lines.append(f"📋 Open orders: {open_count} / {max_open}")
@@ -766,17 +692,15 @@ class Messenger:
         elif text.startswith("orders set max "):
             await self._handle_orders_set_max(update, text)
         elif text == "strategy":
-            await self._handle_filter_strategy(update, "strategy ")
+            await self._handle_strategy(update, "strategy ")
         elif text.startswith("strategy "):
-            await self._handle_filter_strategy(update, text)
+            await self._handle_strategy(update, text)
         elif text == "balance":
             await self._reply_balance(update)
         elif text.startswith("set balance "):
             await self._handle_set_balance(update, text)
         elif text.startswith("set symbols "):
             await self._handle_set_symbols(update, text)
-        elif text.startswith("set strategy "):
-            await self._handle_set_strategy(update, text)
         elif text.startswith("set timezone "):
             await self._handle_set_timezone(update, text)
         elif text == "stats" or text.startswith("stats "):
@@ -799,7 +723,7 @@ class Messenger:
             symbol = parts[1]
             stop_loss_pct = float(parts[2]) if len(parts) > 2 and parts[2] else None
             take_profit_pct = float(parts[3]) if len(parts) > 3 and parts[3] else None
-            strategy_name = (self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+            strategy_name = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
             if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                 strategy_name = "CONSERVATIVE"
             command = {
@@ -820,10 +744,7 @@ class Messenger:
                 print(f"[{_ts()}] Messenger: edit_message_text error: {e}")
 
     async def send_telegram_msg(self, text, symbol=None, keyboard=None):
-        """Helper to send Markdown messages with optional keyboards. Retries on timeout.
-        When system:muted is set, no message is sent (platform keeps working)."""
-        if self.db.get(shared_config.REDIS_KEY_MUTED):
-            return
+        """Helper to send Markdown messages with optional keyboards. Retries on timeout."""
         last_error = None
         for attempt in range(SEND_MESSAGE_RETRIES + 1):
             try:
@@ -968,12 +889,6 @@ class Messenger:
                     tv_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{clean_symbol}"
                     binance_url = f"https://www.binance.com/en/trade/{symbol.replace('/', '_')}"
 
-                    # AI Verdict handling: only send WAIT when explicitly enabled ("start wait").
-                    # When key is missing (e.g. after deploy) we suppress WAIT so deploy doesn't re-enable it.
-                    if verdict == "WAIT" and self.db.get(shared_config.REDIS_KEY_SUPPRESS_WAIT_SIGNALS) != "0":
-                        print(f"[{_ts()}] Messenger: Skipped WAIT signal for {symbol} (suppress enabled or default)")
-                        continue
-
                     emoji = "🚀" if verdict == "BUY" else "⚠️"
 
                     stop_loss_pct = data.get("stop_loss_pct")
@@ -981,13 +896,10 @@ class Messenger:
                     high_24h = data.get("high_24h")
                     low_24h = data.get("low_24h")
 
-                    # Strategies for context
-                    ai_strategy_val = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "conservative").strip().lower()
-                    if ai_strategy_val not in STRATEGY_VALUES:
-                        ai_strategy_val = "conservative"
-                    filter_strategy_val = (self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
-                    if filter_strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                        filter_strategy_val = "CONSERVATIVE"
+                    # Strategy for context
+                    strategy_val = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+                    if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                        strategy_val = "CONSERVATIVE"
 
                     # Format TP/SL line
                     sl_str = None
@@ -1017,7 +929,7 @@ class Messenger:
                         f"• RSI: `{data.get('rsi')}` · RVOL: `{data.get('rvol')}x`\n"
                         f"{tp_sl_line}"
                         f"{range_line}"
-                        f"• AI strategy: `{ai_strategy_val}` · Filter: `{filter_strategy_val}`\n\n"
+                        f"• Strategy: `{strategy_val}`\n\n"
                         f"🔗 [TradingView]({tv_url}) · [Binance]({binance_url})"
                     )
 
@@ -1059,7 +971,7 @@ class Messenger:
                                         print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (already have open order)")
                                         # skip pushing command below
                                     else:
-                                        strategy_name = (self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+                                        strategy_name = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                                         if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                                             strategy_name = "CONSERVATIVE"
                                         command = {
@@ -1080,7 +992,7 @@ class Messenger:
                                         print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
                             except Exception as e:
                                 print(f"[{_ts()}] Messenger: DB check for open order failed: {e}")
-                                strategy_name = (self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY) or "CONSERVATIVE").strip().upper()
+                                strategy_name = (self.db.get(shared_config.REDIS_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                                 if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                                     strategy_name = "CONSERVATIVE"
                                 command = {"symbol": symbol, "strategy_name": strategy_name}

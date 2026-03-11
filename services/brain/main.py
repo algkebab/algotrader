@@ -49,7 +49,7 @@ STRATEGY_SYSTEM_MESSAGES = {
     ),
 }
 
-FILTER_STRATEGY_DEFAULT = "CONSERVATIVE"
+STRATEGY_DEFAULT = "CONSERVATIVE"
 
 class Brain:
     def __init__(self):
@@ -61,20 +61,12 @@ class Brain:
         self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
         
 
-    def _get_strategy_system_content(self):
-        """Read strategy from Redis (set by Messenger 'set strategy'); default conservative."""
+    def _get_strategy_name(self):
+        """Return current strategy name (default CONSERVATIVE)."""
         val = self.db.get(shared_config.REDIS_KEY_STRATEGY)
-        if not val:
-            return STRATEGY_SYSTEM_MESSAGES["conservative"]
-        key = str(val).strip().lower()
-        return STRATEGY_SYSTEM_MESSAGES.get(key, STRATEGY_SYSTEM_MESSAGES["conservative"])
-
-    def _get_filter_strategy_name(self):
-        """Return current filter strategy name used by Filter service (default CONSERVATIVE)."""
-        val = self.db.get(shared_config.REDIS_KEY_FILTER_STRATEGY)
-        name = (val or FILTER_STRATEGY_DEFAULT).strip().upper()
+        name = (val or STRATEGY_DEFAULT).strip().upper()
         if name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-            name = FILTER_STRATEGY_DEFAULT
+            name = STRATEGY_DEFAULT
         return name
 
     def should_analyze(self, symbol, current_price):
@@ -127,7 +119,7 @@ class Brain:
         high_str = "N/A" if high_24h is None else f"{high_24h}"
         low_str = "N/A" if low_24h is None else f"{low_24h}"
 
-        filter_strategy = self._get_filter_strategy_name()
+        strategy = self._get_strategy_name()
 
         symbol_base = symbol.split("/")[0] if "/" in symbol else symbol
         is_major = symbol_base in {"BTC", "ETH"}
@@ -140,7 +132,7 @@ Analyze this crypto trade setup for {symbol} in the context of the current marke
 - RSI (14): {rsi}
 - Relative Volume (RVOL): {rvol}
 - Recent Price Action (Last 5 candles): {', '.join(candle_summary) if candle_summary else 'N/A'}
-- Active filter strategy from the pipeline: {filter_strategy}
+- Active strategy from the pipeline: {strategy}
 
 You must act as a strategic architect for entries and exits, not just a simple yes/no filter.
 
@@ -161,17 +153,18 @@ Rules for stop_loss_pct (very important):
 - Avoid unrealistically tight stops that will be hit by normal intraday noise.
 
 Rules for take_profit_pct:
-- Choose a realistic take_profit_pct that gives a favorable risk/reward vs the stop loss, consistent with the active filter strategy {filter_strategy}.
+- Choose a realistic take_profit_pct that gives a favorable risk/reward vs the stop loss, consistent with the active strategy {strategy}.
 
 Behavior by strategy:
-- When filter strategy is CONSERVATIVE, prefer WAIT unless the setup is very clean with strong confirmation and a clear invalidation level.
-- When filter strategy is AGGRESSIVE, you may accept more marginal setups if momentum and volume are strong, but still respect the stop loss rules above.
-- When filter strategy is REVERSAL, focus on oversold exhaustion, RSI below 30, rejection from lows, and bounces from support; avoid chasing late bounces that are far from the recent lows.
+- When strategy is CONSERVATIVE, prefer WAIT unless the setup is very clean with strong confirmation and a clear invalidation level.
+- When strategy is AGGRESSIVE, you may accept more marginal setups if momentum and volume are strong, but still respect the stop loss rules above.
+- When strategy is REVERSAL, focus on oversold exhaustion, RSI below 30, rejection from lows, and bounces from support; avoid chasing late bounces that are far from the recent lows.
 
 Respond with ONLY the JSON object, no comments or additional text.
 """
 
-        system_content = self._get_strategy_system_content()
+        strategy_key = self._get_strategy_name().lower()
+        system_content = STRATEGY_SYSTEM_MESSAGES.get(strategy_key, STRATEGY_SYSTEM_MESSAGES["conservative"])
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o",

@@ -16,7 +16,7 @@ POSITION_RISK_PCT = 0.01  # 1% of balance risked per position (Executor position
 # --- Orders / autopilot (Brain, Filter, Messenger) ---
 MAX_OPEN_ORDERS_DEFAULT = 4
 MAX_OPEN_ORDERS_MIN = 1
-MAX_OPEN_ORDERS_MAX = 50
+MAX_OPEN_ORDERS_MAX = 10
 
 # --- Brain (AI analysis) ---
 PRICE_CHANGE_THRESHOLD = 0.005  # 0.5% min price move to re-analyze (skip if change < this)
@@ -30,12 +30,9 @@ MAX_SYMBOLS_MAX = 200
 REDIS_KEY_MAX_OPEN_ORDERS = "system:max_open_orders"
 REDIS_KEY_MAX_SYMBOLS = "system:max_symbols"
 REDIS_KEY_TRADING_PAUSED = "system:trading_paused"
-REDIS_KEY_SUPPRESS_WAIT_SIGNALS = "system:suppress_wait_signals"
 REDIS_KEY_AUTOPILOT = "system:autopilot"
-REDIS_KEY_MUTED = "system:muted"
 REDIS_KEY_BALANCE_LAST_DAY_PNL = "system:balance_last_day_pnl"
 REDIS_KEY_BALANCE_LAST_CHECK = "system:balance_last_check"
 REDIS_KEY_STRATEGY = "system:strategy"
-REDIS_KEY_FILTER_STRATEGY = "system:filter_strategy"
 REDIS_KEY_TIMEZONE_OFFSET_MIN = "system:timezone_offset_min"
 REDIS_KEY_ACTIVE_SYMBOLS = "system:active_symbols"
