@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 import redis
@@ -111,7 +112,12 @@ class Brain:
             return 0
 
     def get_ai_verdict(self, symbol, price, rsi, rvol, candles, high_24h, low_24h):
-        """Sends technical data to GPT for a high-level trading verdict with TP/SL targets."""
+        """Sends technical data to GPT for a high-level trading verdict with TP/SL targets.
+
+        Returns a tuple: (parsed_response_dict, signal_id).
+        """
+        signal_id = str(uuid.uuid4())
+
         recent_candles = candles[-5:] if candles else []
         candle_summary = [f"Close: {c[4]}, Vol: {c[5]}" for c in recent_candles]
 
@@ -165,6 +171,17 @@ Respond with ONLY the JSON object, no comments or additional text.
 
         strategy_key = self._get_strategy_name().lower()
         system_content = STRATEGY_SYSTEM_MESSAGES.get(strategy_key, STRATEGY_SYSTEM_MESSAGES["conservative"])
+        stats = {
+            "symbol": symbol,
+            "price": price,
+            "rsi": rsi,
+            "rvol": rvol,
+            "high_24h": high_24h,
+            "low_24h": low_24h,
+            "strategy": strategy,
+            "recent_candles": recent_candles,
+            "is_major": is_major,
+        }
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o",
@@ -176,10 +193,9 @@ Respond with ONLY the JSON object, no comments or additional text.
             )
             content = response.choices[0].message.content
             data = json.loads(content)
-            return data
         except Exception as e:
             print(f"[{_ts()}] ❌ AI Error: {e}")
-            return {
+            data = {
                 "verdict": "WAIT",
                 "stop_loss_pct": 0.0,
                 "take_profit_pct": 0.0,
@@ -187,12 +203,28 @@ Respond with ONLY the JSON object, no comments or additional text.
                 "confidence": "0%",
             }
 
+        # Persist signal (stats we sent to AI, prompt, parsed response) with generated signal_id
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                shared_db.insert_signal(
+                    conn,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    stats=stats,
+                    prompt=prompt,
+                    response=data,
+                )
+        except Exception as e:
+            print(f"[{_ts()}] 🧠 Brain: Failed to persist signal {signal_id} for {symbol}: {e}")
+
+        return data, signal_id
+
     def run(self):
         print(f"[{_ts()}] 🧠 Brain: AI Technical Analyst is online with Smart Cache...")
-        PAUSED_KEY = shared_config.SYSTEM_KEY_TRADING_PAUSED
 
         while True:
-            if shared_db.get_setting_value(PAUSED_KEY) == "1":
+            if shared_db.get_setting_value(shared_config.SYSTEM_KEY_TRADING_PAUSED) == "1":
                 time.sleep(5)
                 continue
 
@@ -245,8 +277,8 @@ Respond with ONLY the JSON object, no comments or additional text.
                     break
 
                 print(f"[{_ts()}] 🔍 Analyzing {symbol} with AI...")
-                
-                analysis = self.get_ai_verdict(
+
+                analysis, signal_id = self.get_ai_verdict(
                     symbol,
                     current_price,
                     item['rsi'],
@@ -261,8 +293,8 @@ Respond with ONLY the JSON object, no comments or additional text.
                     wait_key = f"cache:brain_wait:{symbol}"
                     self.db.set(wait_key, "1", ex=1800)
 
-                # Merge AI verdict with market data
-                final_signal = {**item, **analysis}
+                # Merge AI verdict with market data and attach unique signal_id
+                final_signal = {**item, **analysis, "signal_id": signal_id}
 
                 # Never send a signal if at max open orders or already have open order for this symbol
                 if self._get_open_order_count() >= self._get_max_open_orders():

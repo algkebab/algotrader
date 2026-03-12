@@ -743,11 +743,12 @@ class Messenger:
             print(f"[{_ts()}] Messenger: query.answer() failed (continuing): {e}")
 
         if query.data.startswith("buy:"):
-            # Format: buy:SYMBOL[:stop_loss_pct:take_profit_pct]
+            # Format: buy:SYMBOL:SIGNAL_ID[:stop_loss_pct:take_profit_pct]
             parts = query.data.split(":")
             symbol = parts[1]
-            stop_loss_pct = float(parts[2]) if len(parts) > 2 and parts[2] else None
-            take_profit_pct = float(parts[3]) if len(parts) > 3 and parts[3] else None
+            signal_id = parts[2] if len(parts) > 2 and parts[2] else None
+            stop_loss_pct = float(parts[3]) if len(parts) > 3 and parts[3] else None
+            take_profit_pct = float(parts[4]) if len(parts) > 4 and parts[4] else None
             strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
             if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                 strategy_name = "CONSERVATIVE"
@@ -756,6 +757,7 @@ class Messenger:
                 "stop_loss_pct": stop_loss_pct,
                 "take_profit_pct": take_profit_pct,
                 "strategy_name": strategy_name,
+                "signal_id": signal_id,
             }
             self.db.rpush("trade_commands", json.dumps(command))
             
@@ -925,6 +927,7 @@ class Messenger:
                     take_profit_pct = data.get("take_profit_pct")
                     high_24h = data.get("high_24h")
                     low_24h = data.get("low_24h")
+                    signal_id = data.get("signal_id")
 
                     # Strategy for context
                     strategy_val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
@@ -968,9 +971,9 @@ class Messenger:
                     keyboard = None
                     if verdict == "BUY" and autopilot_on != "1":
                         if stop_loss_pct is not None and take_profit_pct is not None:
-                            callback = f"buy:{symbol}:{stop_loss_pct}:{take_profit_pct}"
+                            callback = f"buy:{symbol}:{signal_id}:{stop_loss_pct}:{take_profit_pct}"
                         else:
-                            callback = f"buy:{symbol}"
+                            callback = f"buy:{symbol}:{signal_id}"
                         kb = [[InlineKeyboardButton("🚀 Buy", callback_data=callback)]]
                         keyboard = InlineKeyboardMarkup(kb)
 
@@ -1009,6 +1012,7 @@ class Messenger:
                                             "stop_loss_pct": stop_loss_pct,
                                             "take_profit_pct": take_profit_pct,
                                             "strategy_name": strategy_name,
+                                            "signal_id": signal_id,
                                         }
                                         self.db.rpush("trade_commands", json.dumps(command))
                                         sl_info = f"{float(stop_loss_pct):.2f}%" if isinstance(stop_loss_pct, (int, float)) else str(stop_loss_pct)
@@ -1025,7 +1029,7 @@ class Messenger:
                                 strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                                 if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                                     strategy_name = "CONSERVATIVE"
-                                command = {"symbol": symbol, "strategy_name": strategy_name}
+                                command = {"symbol": symbol, "strategy_name": strategy_name, "signal_id": signal_id}
                                 self.db.rpush("trade_commands", json.dumps(command))
                                 await self.send_telegram_msg(
                                     f"🤖 *Autopilot order sent*\n\n"

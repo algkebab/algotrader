@@ -1,9 +1,10 @@
 """
-SQLite persistence for orders (trades), balance, and system settings.
+SQLite persistence for orders (trades), balance, system settings, and AI signals.
 Used by Executor, Monitor, Messenger, Filter, Brain, Scout.
 """
 import os
 import sqlite3
+import json
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, List, Optional
@@ -29,10 +30,19 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
         ("hourly_interest_rate", "REAL"),
         ("strategy_name", "TEXT"),
         ("session", "TEXT"),
+        ("signal_id", "TEXT"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
             existing.add(col)
+
+
+def _add_signals_columns_if_missing(conn: sqlite3.Connection) -> None:
+    """Add new signal columns for existing DBs that were created before these columns existed."""
+    cur = conn.execute("PRAGMA table_info(signals)")
+    existing = {row[1] for row in cur.fetchall()}
+    if "verdict" not in existing:
+        conn.execute("ALTER TABLE signals ADD COLUMN verdict TEXT")
 
 
 @contextmanager
@@ -95,7 +105,17 @@ def init_schema(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS signals (
+            id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            verdict TEXT,
+            stats_json TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
     """)
+    _add_signals_columns_if_missing(conn)
 
 
 def get_setting(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:
@@ -136,14 +156,37 @@ def insert_order(
     hourly_interest_rate: Optional[float] = None,
     strategy_name: Optional[str] = None,
     session: Optional[str] = None,
+    signal_id: Optional[str] = None,
 ) -> int:
     now = datetime.utcnow().isoformat() + "Z"
     cur = conn.execute(
-        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)""",
-        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session),
+        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session, signal_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session, signal_id),
     )
     return cur.lastrowid
+
+
+def insert_signal(
+    conn: sqlite3.Connection,
+    signal_id: str,
+    symbol: str,
+    stats: dict,
+    prompt: str,
+    response: dict,
+) -> None:
+    """Insert one AI signal row (stats we sent to AI, prompt, parsed response)."""
+    now = datetime.utcnow().isoformat() + "Z"
+    verdict = None
+    try:
+        verdict = str(response.get("verdict", "")).upper()
+    except Exception:
+        verdict = None
+    conn.execute(
+        """INSERT OR REPLACE INTO signals (id, symbol, verdict, stats_json, prompt, response_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (signal_id, symbol, verdict, json.dumps(stats), prompt, json.dumps(response), now),
+    )
 
 
 def get_open_orders(conn: sqlite3.Connection) -> List[Any]:

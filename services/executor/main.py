@@ -80,10 +80,10 @@ class Executor:
         except Exception:
             return True
 
-    def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None):
+    def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None):
         """Writes paper order to DB only (no live trading). Position size is derived from balance and risk (POSITION_RISK_PCT, stop loss)."""
         try:
-            print(f"[{_ts()}] 🛒 Executor: Processing paper order for {symbol}")
+            print(f"[{_ts()}] 🛒 Executor: Processing paper order for {symbol} (signal_id={signal_id})")
 
             if not self.can_open_position(symbol):
                 print(f"[{_ts()}] ⚠️ Already monitoring {symbol}. Skipping.")
@@ -93,13 +93,19 @@ class Executor:
                 }))
                 return {"status": "error", "msg": "Position exists"}
 
-            return self._place_paper_order(symbol, stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct, strategy_name=strategy_name)
+            return self._place_paper_order(
+                symbol,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                strategy_name=strategy_name,
+                signal_id=signal_id,
+            )
 
         except Exception as e:
             print(f"[{_ts()}] ❌ Binance Order Error: {e}")
             return {"status": "error", "message": str(e)}
 
-    def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None):
+    def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None):
         """Write order to DB only; no exchange, no Redis active_trades.
         Position size is derived from balance, POSITION_RISK_PCT, and stop loss (no external amount)."""
         try:
@@ -181,6 +187,7 @@ class Executor:
                     hourly_interest_rate=float(shared_config.HOURLY_MARGIN_INTEREST_RATE),
                     strategy_name=strategy_name,
                     session=session,
+                    signal_id=signal_id,
                 )
             print(f"[{_ts()}] 📊 Risking ${risk_amount:.2f} to buy ${final_notional_usdt:.2f} worth of {symbol} (Leverage: {shared_config.LEVERAGE}x)")
             result = {
@@ -213,6 +220,7 @@ class Executor:
                         stop_loss_pct=data.get("stop_loss_pct"),
                         take_profit_pct=data.get("take_profit_pct"),
                         strategy_name=data.get("strategy_name"),
+                        signal_id=data.get("signal_id"),
                     )
                 except Exception as e:
                     print(f"[{_ts()}] ❌ Parsing error: {e}")
