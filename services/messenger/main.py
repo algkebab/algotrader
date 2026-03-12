@@ -876,6 +876,24 @@ class Messenger:
                     )
                     msg = "\n".join(lines)
                     await self.send_telegram_msg(msg)
+
+                elif note['type'] == 'risk_guard_adjustment':
+                    d = note.get('data', {})
+                    symbol = d.get('symbol', '—')
+                    orig_sl = d.get('original_stop_loss_pct')
+                    new_sl = d.get('adjusted_stop_loss_pct')
+                    orig_tp = d.get('original_take_profit_pct')
+                    new_tp = d.get('adjusted_take_profit_pct')
+                    rr = d.get('min_rr_ratio')
+                    max_sl = d.get('max_allowed_sl')
+                    lines = [
+                        "🛡️ *RiskGuard adjustment*",
+                        "",
+                        f"📌 {symbol}",
+                        f"🛑 SL: `{orig_sl}` → `{new_sl}` (max {max_sl}%)",
+                        f"🎯 TP: `{orig_tp}` → `{new_tp}` (RR≥{rr}x)",
+                    ]
+                    await self.send_telegram_msg("\n".join(lines))
             
             await asyncio.sleep(1)
 

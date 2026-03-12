@@ -18,6 +18,11 @@ if _root not in sys.path:
 from shared import db as shared_db
 from shared import config as shared_config
 
+# RiskGuard configuration
+MAX_ALLOWED_SL = 2.5  # percent
+MIN_RR_RATIO = 1.5    # take_profit_pct / stop_loss_pct
+
+
 def _ts():
     """Returns current timestamp for logging."""
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -80,8 +85,63 @@ class Executor:
         except Exception:
             return True
 
+    def _apply_risk_guard(self, symbol, stop_loss_pct, take_profit_pct, signal_id=None):
+        """Apply RiskGuard caps and RR adjustments. Returns (adjusted_sl, adjusted_tp)."""
+        original_sl = stop_loss_pct
+        original_tp = take_profit_pct
+        adjusted_sl = stop_loss_pct
+        adjusted_tp = take_profit_pct
+        adjustments = []
+
+        # Cap SL at MAX_ALLOWED_SL (and set when missing/invalid)
+        if adjusted_sl is None or adjusted_sl <= 0 or adjusted_sl > MAX_ALLOWED_SL:
+            adjusted_sl = MAX_ALLOWED_SL
+            adjustments.append(
+                f"SL capped at {MAX_ALLOWED_SL:.2f}% "
+                f"(was {original_sl if original_sl is not None else 'None'})"
+            )
+
+        # Enforce minimum risk/reward ratio
+        if adjusted_tp is None or adjusted_tp <= 0 or adjusted_sl <= 0 or (adjusted_tp / adjusted_sl) < MIN_RR_RATIO:
+            new_tp = adjusted_sl * MIN_RR_RATIO
+            adjustments.append(
+                f"TP set to {new_tp:.2f}% to keep RR={MIN_RR_RATIO:.2f} "
+                f"(was {adjusted_tp if adjusted_tp is not None else 'None'})"
+            )
+            adjusted_tp = new_tp
+
+        if adjustments:
+            joined = "; ".join(adjustments)
+            print(f"[{_ts()}] 🛡️ RiskGuard for {symbol} (signal_id={signal_id}): {joined}")
+            # Push notification so Messenger can surface this adjustment
+            try:
+                self.db.rpush(
+                    "notifications",
+                    json.dumps({
+                        "type": "risk_guard_adjustment",
+                        "data": {
+                            "symbol": symbol,
+                            "signal_id": signal_id,
+                            "original_stop_loss_pct": original_sl,
+                            "adjusted_stop_loss_pct": adjusted_sl,
+                            "original_take_profit_pct": original_tp,
+                            "adjusted_take_profit_pct": adjusted_tp,
+                            "max_allowed_sl": MAX_ALLOWED_SL,
+                            "min_rr_ratio": MIN_RR_RATIO,
+                        },
+                    }),
+                )
+            except Exception as e:
+                print(f"[{_ts()}] ⚠️ RiskGuard notification failed for {symbol}: {e}")
+
+        return adjusted_sl, adjusted_tp
+
     def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None):
-        """Writes paper order to DB only (no live trading). Position size is derived from balance and risk (POSITION_RISK_PCT, stop loss)."""
+        """Writes paper order to DB only (no live trading).
+
+        RiskGuard caps stop-loss and enforces a minimum risk/reward ratio
+        before the existing paper-trading and DB logic runs.
+        """
         try:
             print(f"[{_ts()}] 🛒 Executor: Processing paper order for {symbol} (signal_id={signal_id})")
 
@@ -93,10 +153,18 @@ class Executor:
                 }))
                 return {"status": "error", "msg": "Position exists"}
 
-            return self._place_paper_order(
+            # Apply RiskGuard before sizing and placement
+            guarded_sl, guarded_tp = self._apply_risk_guard(
                 symbol,
                 stop_loss_pct=stop_loss_pct,
                 take_profit_pct=take_profit_pct,
+                signal_id=signal_id,
+            )
+
+            return self._place_paper_order(
+                symbol,
+                stop_loss_pct=guarded_sl,
+                take_profit_pct=guarded_tp,
                 strategy_name=strategy_name,
                 signal_id=signal_id,
             )
