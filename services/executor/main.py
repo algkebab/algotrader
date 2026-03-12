@@ -18,10 +18,6 @@ if _root not in sys.path:
 from shared import db as shared_db
 from shared import config as shared_config
 
-# RiskGuard configuration
-MAX_ALLOWED_SL = 2.5  # percent
-MIN_RR_RATIO = 1.5    # take_profit_pct / stop_loss_pct
-
 
 def _ts():
     """Returns current timestamp for logging."""
@@ -94,18 +90,18 @@ class Executor:
         adjustments = []
 
         # Cap SL at MAX_ALLOWED_SL (and set when missing/invalid)
-        if adjusted_sl is None or adjusted_sl <= 0 or adjusted_sl > MAX_ALLOWED_SL:
-            adjusted_sl = MAX_ALLOWED_SL
+        if adjusted_sl is None or adjusted_sl <= 0 or adjusted_sl > shared_config.RISK_GUARD_MAX_SL:
+            adjusted_sl = shared_config.RISK_GUARD_MAX_SL
             adjustments.append(
-                f"SL capped at {MAX_ALLOWED_SL:.2f}% "
+                f"SL capped at {shared_config.RISK_GUARD_MAX_SL:.2f}% "
                 f"(was {original_sl if original_sl is not None else 'None'})"
             )
 
         # Enforce minimum risk/reward ratio
-        if adjusted_tp is None or adjusted_tp <= 0 or adjusted_sl <= 0 or (adjusted_tp / adjusted_sl) < MIN_RR_RATIO:
-            new_tp = adjusted_sl * MIN_RR_RATIO
+        if adjusted_tp is None or adjusted_tp <= 0 or adjusted_sl <= 0 or (adjusted_tp / adjusted_sl) < shared_config.RISK_GUARD_MIN_RR:
+            new_tp = adjusted_sl * shared_config.RISK_GUARD_MIN_RR
             adjustments.append(
-                f"TP set to {new_tp:.2f}% to keep RR={MIN_RR_RATIO:.2f} "
+                f"TP set to {new_tp:.2f}% to keep RR={shared_config.RISK_GUARD_MIN_RR:.2f} "
                 f"(was {adjusted_tp if adjusted_tp is not None else 'None'})"
             )
             adjusted_tp = new_tp
@@ -126,8 +122,8 @@ class Executor:
                             "adjusted_stop_loss_pct": adjusted_sl,
                             "original_take_profit_pct": original_tp,
                             "adjusted_take_profit_pct": adjusted_tp,
-                            "max_allowed_sl": MAX_ALLOWED_SL,
-                            "min_rr_ratio": MIN_RR_RATIO,
+                            "max_allowed_sl": shared_config.RISK_GUARD_MAX_SL,
+                            "min_rr_ratio": shared_config.RISK_GUARD_MIN_RR,
                         },
                     }),
                 )

@@ -12,6 +12,8 @@ LIQUIDATION_THRESHOLD_PCT = 33.0  # For 3x leverage, skip SL beyond ~33% drop (E
 TP_PERCENT = 1.05  # +5% take-profit (Executor default)
 SL_PERCENT = 0.98  # -2% stop-loss (Executor default)
 POSITION_RISK_PCT = 0.01  # 1% of balance risked per position (Executor position sizing)
+RISK_GUARD_MAX_SL = 2.5  # Max allowed stop-loss percent (RiskGuard)
+RISK_GUARD_MIN_RR = 1.5  # Min risk/reward ratio (TP/SL) for RiskGuard
 
 # --- Orders / autopilot (Brain, Filter, Messenger) ---
 MAX_OPEN_ORDERS_DEFAULT = 4
