@@ -153,8 +153,7 @@ Return a STRICT JSON object with this exact schema:
 
 Rules for stop_loss_pct (very important):
 - stop_loss_pct is the percentage distance BELOW the entry price where the stop should be placed.
-- For BTC/USDT and ETH/USDT you MUST use stop_loss_pct >= 0.8 (never tighter than 0.8%).
-- For ALL other symbols you MUST use stop_loss_pct >= 1.2 (never tighter than 1.2%).
+- For ALL symbols you MUST use stop_loss_pct >= 1.2 (never tighter than 1.2%).
 - Place the stop loss below the recent local support or the lowest wick of the last 5 candles when possible.
 - Avoid unrealistically tight stops that will be hit by normal intraday noise.
 
