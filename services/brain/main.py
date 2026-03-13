@@ -260,7 +260,7 @@ Respond with ONLY the JSON object, no comments or additional text.
                 time.sleep(5)
                 continue
 
-            raw_data = self.db.get('filtered_candidates')
+            raw_data = self.db.getset('filtered_candidates', json.dumps([]))
             if not raw_data:
                 time.sleep(5)
                 continue
@@ -350,8 +350,6 @@ Respond with ONLY the JSON object, no comments or additional text.
 
                 self.db.rpush('signals', json.dumps(final_signal))
 
-            # Clear candidates after processing
-            self.db.delete('filtered_candidates')
             time.sleep(5)
 
 if __name__ == "__main__":
