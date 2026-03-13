@@ -11,6 +11,11 @@ import redis
 from dotenv import load_dotenv
 from openai import OpenAI
 
+WAIT_CACHE_TTL_RSI_LOW = 3600  # 60 min (RSI < 60)
+WAIT_CACHE_TTL_RSI_MID = 1800  # 30 min (RSI 60-65)
+WAIT_CACHE_TTL_RSI_HOT = 900   # 15 min (RSI > 65)
+PRICE_SPIKE_BYPASS_PCT = 1.0   # 1% move bypasses cache
+
 # Allow importing shared.db (project root or /app in Docker)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 _root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) == "brain" else _this_dir
@@ -75,9 +80,22 @@ class Brain:
         Implements smart caching to save money.
         Returns True if price moved significantly or cache expired.
         """
-        # Skip symbols that recently received a WAIT verdict (negative cache)
+        # WAIT cache: negative cache keyed by symbol with last WAIT price
         wait_key = f"cache:brain_wait:{symbol}"
-        if self.db.get(wait_key):
+        wait_raw = self.db.get(wait_key)
+        if wait_raw:
+            try:
+                payload = json.loads(wait_raw)
+                last_wait_price = float(payload.get("price"))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                last_wait_price = None
+
+            if last_wait_price and last_wait_price > 0:
+                price_change_pct = ((current_price - last_wait_price) / last_wait_price) * 100
+                if price_change_pct > PRICE_SPIKE_BYPASS_PCT:
+                    print(f"[{_ts()}] 🧠 Brain: [Spike detected] {symbol} moved {price_change_pct:.2f}% since WAIT, bypassing cache")
+                    return True
+
             print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (recent WAIT verdict cache active)")
             return False
 
@@ -94,6 +112,21 @@ class Brain:
         # If no cache or price moved enough, we update and proceed
         self.db.set(f"cache:brain_price:{symbol}", current_price, ex=1800)
         return True
+
+    def _wait_cache_ttl_seconds(self, rsi):
+        """Return WAIT cache TTL in seconds based on RSI band."""
+        try:
+            if rsi is None:
+                raise TypeError
+            rsi_value = float(rsi)
+        except (TypeError, ValueError):
+            return WAIT_CACHE_TTL_RSI_MID
+
+        if rsi_value < 60:
+            return WAIT_CACHE_TTL_RSI_LOW
+        if rsi_value <= 65:
+            return WAIT_CACHE_TTL_RSI_MID
+        return WAIT_CACHE_TTL_RSI_HOT
 
     def _get_max_open_orders(self):
         """Return max simultaneous open orders from DB (default 10)."""
@@ -290,7 +323,13 @@ Respond with ONLY the JSON object, no comments or additional text.
                 # Negative cache: when AI says WAIT, cache symbol to avoid re-analyzing flat charts
                 if str(analysis.get("verdict", "")).upper() == "WAIT":
                     wait_key = f"cache:brain_wait:{symbol}"
-                    self.db.set(wait_key, "1", ex=1800)
+                    ttl = self._wait_cache_ttl_seconds(item.get("rsi"))
+                    self.db.set(
+                        wait_key,
+                        json.dumps({"price": current_price}),
+                        ex=ttl,
+                    )
+                    print(f"[{_ts()}] [Brain] WAIT for {symbol}. Cache active for {ttl // 60} min.")
 
                 # Merge AI verdict with market data and attach unique signal_id
                 final_signal = {**item, **analysis, "signal_id": signal_id}
