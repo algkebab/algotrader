@@ -16,8 +16,9 @@ _root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from shared import db as shared_db
+from shared import analytics as shared_analytics
 from shared import config as shared_config
+from shared import db as shared_db
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TimedOut
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
@@ -43,6 +44,8 @@ REDIS_SYSTEM_KEYS = frozenset()
 STRATEGY_VALUES = frozenset({"conservative", "aggressive", "reversal"})
 # Allowed values for "stats <value>"
 STATS_VALUES = frozenset({"today", "yesterday", "week", "month", "all"})
+# Allowed values for "analytics <period>"
+ANALYTICS_VALUES = frozenset({"last", "today", "week", "month"})
 
 # Data keys and patterns to clear on "clear redis"
 REDIS_DATA_KEYS = [
@@ -92,6 +95,7 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 🛡️ • *strategy* <name> — Strategy: conservative, aggressive, reversal. Default: CONSERVATIVE.
 🕒 • *set timezone* <offset> — Local timezone offset vs UTC in hours (e.g. set timezone +2, set timezone -5, set timezone 5.5). Affects timestamps in bot messages only.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
+📊 • *analytics* <period> — AI performance report: last, today, week, month. Win rate, PnL, insights, recommended tweaks.
 ❓ • *help* — This message."""
 
 def _ts():
@@ -604,6 +608,23 @@ class Messenger:
         ]
         await self._safe_reply(update, "\n".join(parts))
 
+    async def _handle_analytics(self, update, text: str) -> None:
+        """Reply with AI-generated performance report. Usage: analytics [last|today|week|month]. Default: today."""
+        rest = text[len("analytics"):].strip().lower() if text.startswith("analytics") else ""
+        period = rest if rest in ANALYTICS_VALUES else "today"
+        period_label = {"last": "Last day", "today": "Today", "week": "Weekly", "month": "Monthly"}[period]
+        await self._safe_reply(
+            update,
+            f"📊 Generating AI {period_label} Report… please wait.",
+        )
+        try:
+            report = await asyncio.to_thread(shared_analytics.generate_performance_report, period)
+        except Exception as e:
+            print(f"[{_ts()}] Messenger: analytics failed: {e}")
+            await self._safe_reply(update, f"❌ Analytics failed\n\n{e}")
+            return
+        await self._safe_reply(update, report)
+
     def _clear_redis_data(self) -> int:
         """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
         deleted = 0
@@ -730,6 +751,8 @@ class Messenger:
             )
         elif text == "stats" or text.startswith("stats "):
             await self._handle_stats(update, text)
+        elif text == "analytics" or text.startswith("analytics "):
+            await self._handle_analytics(update, text)
         elif text == "help":
             await self._safe_reply(update, HELP_MESSAGE)
 

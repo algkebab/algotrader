@@ -91,6 +91,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_orders_symbol_status ON orders(symbol, status);
         CREATE INDEX IF NOT EXISTS idx_orders_opened_at ON orders(opened_at);
+        CREATE INDEX IF NOT EXISTS idx_orders_closed_at ON orders(closed_at);
+        CREATE INDEX IF NOT EXISTS idx_orders_signal_id ON orders(signal_id);
     """)
     _add_orders_columns_if_missing(conn)
 
@@ -256,22 +258,93 @@ def get_today_closed_pnl(conn: sqlite3.Connection) -> float:
     return float(row["total"]) if row else 0.0
 
 
+def _closed_orders_where(period: str) -> str:
+    """Return SQL WHERE fragment for closed orders by period."""
+    if period == "today":
+        return "status = 'closed' AND date(closed_at) = date('now')"
+    if period == "yesterday" or period == "last":
+        return "status = 'closed' AND date(closed_at) = date('now', '-1 day')"
+    if period == "week":
+        return "status = 'closed' AND closed_at >= datetime('now', '-7 days')"
+    if period == "month":
+        return "status = 'closed' AND closed_at >= datetime('now', '-30 days')"
+    return "status = 'closed'"
+
+
+def get_closed_orders_with_signals(
+    conn: sqlite3.Connection,
+    period: str,
+) -> List[dict]:
+    """Fetch closed orders joined with their AI signals by signal_id for analytics.
+    period: 'today'|'yesterday'|'last'|'week'|'month'|'all'.
+    Returns list of dicts with: symbol, strategy_name, ai_reason, rsi_at_entry, rvol_at_entry,
+    entry_price, exit_price (derived), pnl_usdt, pnl_percent, close_reason, opened_at, closed_at,
+    mfe_pct (None when intratrade high not stored). Orders without a matching signal still appear
+    with ai_reason/rsi/rvol as None."""
+    where = _closed_orders_where(period)
+    cur = conn.execute(
+        f"""
+        SELECT
+            o.id, o.symbol, o.strategy_name, o.entry_price, o.quantity, o.tp_price, o.sl_price,
+            o.opened_at, o.closed_at, o.pnl_usdt, o.pnl_percent, o.close_reason, o.signal_id,
+            s.stats_json, s.response_json
+        FROM orders o
+        LEFT JOIN signals s ON o.signal_id = s.id
+        WHERE {where}
+        ORDER BY o.closed_at DESC
+        """
+    )
+    rows = []
+    for row in cur.fetchall():
+        row_dict = dict(row)
+        entry = float(row_dict["entry_price"])
+        pnl_pct = row_dict["pnl_percent"]
+        if pnl_pct is not None:
+            pnl_pct = float(pnl_pct)
+            exit_price = entry * (1 + pnl_pct / 100.0)
+        else:
+            exit_price = None
+        rsi_at_entry = None
+        rvol_at_entry = None
+        ai_reason = None
+        try:
+            if row_dict.get("stats_json"):
+                stats = json.loads(row_dict["stats_json"])
+                rsi_at_entry = stats.get("rsi")
+                rvol_at_entry = stats.get("rvol")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
+            if row_dict.get("response_json"):
+                resp = json.loads(row_dict["response_json"])
+                ai_reason = resp.get("reason")
+        except (json.JSONDecodeError, TypeError):
+            pass
+        rows.append({
+            "symbol": row_dict["symbol"],
+            "strategy_name": row_dict.get("strategy_name"),
+            "ai_reason": ai_reason,
+            "rsi_at_entry": rsi_at_entry,
+            "rvol_at_entry": rvol_at_entry,
+            "entry_price": entry,
+            "exit_price": exit_price,
+            "pnl_usdt": float(row_dict["pnl_usdt"]) if row_dict.get("pnl_usdt") is not None else None,
+            "pnl_percent": pnl_pct,
+            "close_reason": row_dict.get("close_reason"),
+            "opened_at": row_dict.get("opened_at"),
+            "closed_at": row_dict.get("closed_at"),
+            "mfe_pct": None,
+        })
+    return rows
+
+
 def get_closed_orders_stats(
     conn: sqlite3.Connection,
     period: str,
 ) -> dict:
     """Stats for closed orders in the given period. period: 'today'|'yesterday'|'week'|'month'|'all'.
     Returns dict: total_pnl, count, count_sl, count_tp, count_manual, count_successful."""
-    if period == "today":
-        where = "status = 'closed' AND date(closed_at) = date('now')"
-    elif period == "yesterday":
-        where = "status = 'closed' AND date(closed_at) = date('now', '-1 day')"
-    elif period == "week":
-        where = "status = 'closed' AND closed_at >= datetime('now', '-7 days')"
-    elif period == "month":
-        where = "status = 'closed' AND closed_at >= datetime('now', '-30 days')"
-    else:
-        where = "status = 'closed'"
+    where = _closed_orders_where(period)
     row = conn.execute(
         f"""
         SELECT
