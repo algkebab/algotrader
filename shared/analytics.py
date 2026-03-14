@@ -25,12 +25,21 @@ def _period_label(period: str) -> str:
     }.get(period, period)
 
 
-ANALYTICS_SYSTEM_PROMPT = (
-    "You are a Senior Quant Researcher. Your mission is to perform a post-trade analysis. "
-    "Compare the AI's original 'reason' for entry with the actual market outcome. "
-    "Identify systematic flaws (e.g., entering during high RSI, tight stops, or fake breakouts). "
-    "Provide 3 actionable changes to the bot's configuration to improve the Profit Factor."
-)
+ANALYTICS_SYSTEM_PROMPT = """You are a Senior Quant Researcher and Market Microstructure Expert. Your mission is to perform a rigorous post-trade forensic analysis.
+
+For each trade, you must synthesize the 'AI Signal Reason', the 'Market Context at Entry', and the 'Trade Outcome' to identify structural edges or flaws.
+
+CRITICAL ANALYSIS DIMENSIONS:
+1. MARKET REGIME: Analyze if the trade occurred during high-volatility expansion, low-liquidity weekend range, or a trending/mean-reverting environment.
+2. TIMING & SESSION: Evaluate the impact of the trading session (Asia, London, NY) and time of day on the trade's success.
+3. ADVERSE EXCURSION: Analyze the 'Max Adverse Excursion' (how deep the price went against the trade) vs. the 'Stop Loss' to see if stops are being hunted or are mathematically too tight for the asset's ATR.
+4. AI REASONING VALIDITY: Cross-reference the AI's technical justification (e.g., "Volume expansion") with the actual candle data during the trade. Detect 'AI Hallucinations' where the AI saw a pattern that the market immediately invalidated.
+5. CORRELATION: Check if multiple losses occurred simultaneously across different assets (systemic market dump vs. idiosyncratic asset failure).
+
+OUTPUT REQUIREMENTS:
+- PERFORMANCE METRICS: Win Rate, Profit Factor, and Average Drawdown.
+- SYSTEMIC FLAWS: Identify exactly which market conditions (e.g., "Post-pump RSI > 65 on 1H") lead to the most toxic trades.
+- 3 ACTIONABLE UPDATES: Provide precise, data-driven changes to filter.py (thresholds) or brain.py (logic) to filter out these specific losing patterns."""
 
 
 def generate_performance_report(period: str = "today") -> str:
@@ -86,6 +95,7 @@ def generate_performance_report(period: str = "today") -> str:
     }
 
     payload_str = json.dumps(summary, indent=2)
+    print("[Analytics] Data sent to AI (JSON):\n" + payload_str)
 
     try:
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -96,9 +106,10 @@ def generate_performance_report(period: str = "today") -> str:
                 {
                     "role": "user",
                     "content": (
-                        "Post-trade summary below. Identify the Top 3 Profit Killers and suggest "
-                        "specific code/parameter adjustments for filter.py and brain.py. "
-                        "Reply in clear sections: Strategic Insights, then Recommended Tweaks (bulleted).\n\n"
+                        "Post-trade summary below. Perform the forensic analysis per your instructions. "
+                        "Output: (1) PERFORMANCE METRICS — Win Rate, Profit Factor, Average Drawdown; "
+                        "(2) SYSTEMIC FLAWS — market conditions that produced the worst trades; "
+                        "(3) 3 ACTIONABLE UPDATES — precise changes to filter.py or brain.py.\n\n"
                         + payload_str
                     ),
                 },
