@@ -246,6 +246,14 @@ def update_order_closed(
     )
 
 
+def update_order_sl_price(conn: sqlite3.Connection, order_id: int, new_sl_price: float) -> None:
+    """Move the stop-loss price upward for a trailing stop (only updates open orders)."""
+    conn.execute(
+        "UPDATE orders SET sl_price = ? WHERE id = ? AND status = 'open'",
+        (new_sl_price, order_id),
+    )
+
+
 def get_balance(conn: sqlite3.Connection, currency: str) -> float:
     row = conn.execute("SELECT amount FROM balance WHERE currency = ?", (currency,)).fetchone()
     return float(row["amount"]) if row else 0.0

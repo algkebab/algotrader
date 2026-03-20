@@ -37,6 +37,7 @@ class Monitor:
                 rows = shared_db.get_open_orders(conn)
             return [
                 (r["symbol"], {
+                    "id": r["id"],
                     "entry": float(r["entry_price"]),
                     "qty": float(r["quantity"]),
                     "tp": float(r["tp_price"]),
@@ -73,6 +74,7 @@ class Monitor:
                     entry_price = trade['entry']
                     sl_price = trade['sl']
                     tp_price = trade['tp']
+                    order_id = trade['id']
 
                     # Time-stop: close positions open longer than 48 hours (paper only)
                     try:
@@ -83,6 +85,26 @@ class Monitor:
                             continue
                     except Exception:
                         pass
+
+                    # Trailing stop-loss: trail distance = original SL% from entry.
+                    # SL only ever moves up — if price hasn't risen, nothing changes.
+                    # Only write to DB when new SL is at least 0.1% higher (reduces writes).
+                    trail_pct = (entry_price - sl_price) / entry_price * 100
+                    if trail_pct > 0:
+                        new_sl = current_price * (1 - trail_pct / 100)
+                        if new_sl > sl_price * 1.001:
+                            try:
+                                with shared_db.get_connection() as conn:
+                                    shared_db.init_schema(conn)
+                                    shared_db.update_order_sl_price(conn, order_id, new_sl)
+                                log.info(
+                                    f"Monitor: Trailing SL {symbol}: "
+                                    f"{sl_price:.6g} -> {new_sl:.6g} "
+                                    f"(price={current_price:.6g}, trail={trail_pct:.2f}%)"
+                                )
+                                sl_price = new_sl  # use updated value for the check below
+                            except Exception as e:
+                                log.warning(f"Monitor: Failed to update trailing SL for {symbol}: {e}")
 
                     if current_price <= sl_price:
                         self.close_position(symbol, current_price, "STOP-LOSS")
