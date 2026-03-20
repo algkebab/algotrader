@@ -95,7 +95,6 @@ def generate_performance_report(period: str = "today") -> str:
     }
 
     payload_str = json.dumps(summary, indent=2)
-    print("[Analytics] Data sent to AI (JSON):\n" + payload_str)
 
     try:
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))

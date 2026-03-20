@@ -5,15 +5,17 @@ import time
 
 import redis
 
-# Allow importing shared.db (project root or /app in Docker)
+# Allow importing shared (project root or /app in Docker)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 _root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) == "filter" else _this_dir
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from shared import db as shared_db
 from shared import config as shared_config
+from shared import db as shared_db
+from shared import logger as shared_logger
 
+log = shared_logger.get_logger("filter")
 
 # Hardcoded strategy profiles: min_24h_volume, rvol_threshold, rsi_max, min_change (%)
 # REVERSAL: rsi_max used as oversold threshold (RSI < 30), min_change negative (price drop)
@@ -53,22 +55,41 @@ class Filter:
         """
         if len(candles) < self.rsi_period + 1:
             return 50  # Neutral if not enough data
-        
-        closes = [c[4] for c in candles] # Extract close prices
+
+        closes = [c[4] for c in candles]  # Extract close prices
         deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-        
+
         gains = [d if d > 0 else 0 for d in deltas]
         losses = [-d if d < 0 else 0 for d in deltas]
-        
+
         avg_gain = sum(gains[-self.rsi_period:]) / self.rsi_period
         avg_loss = sum(losses[-self.rsi_period:]) / self.rsi_period
-        
+
         if avg_loss == 0:
             return 100
-        
+
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
         return round(rsi, 2)
+
+    def _compute_rvol(self, current_vol_24h: float, prev_vol: float | None) -> float:
+        """Pure RVOL computation: minutes of average daily volume added since last scan.
+
+        Returns 0.0 on first observation (no baseline). Negative values indicate shrinking volume.
+        """
+        if prev_vol is None:
+            return 0.0
+        added_vol = current_vol_24h - prev_vol
+        avg_vol_per_min = current_vol_24h / 1440
+        return added_vol / avg_vol_per_min if avg_vol_per_min > 0 else 0.0
+
+    def _calculate_rvol(self, symbol: str, current_vol_24h: float) -> float:
+        """Fetch previous volume from Redis, compute RVOL, store current volume (TTL 5 min)."""
+        last_vol_key = f"last_vol:{symbol}"
+        prev_vol_raw = self.db.get(last_vol_key)
+        self.db.set(last_vol_key, current_vol_24h, ex=300)
+        prev_vol = float(prev_vol_raw) if prev_vol_raw is not None else None
+        return self._compute_rvol(current_vol_24h, prev_vol)
 
     def _get_max_open_orders(self):
         """Return max simultaneous open orders from DB (default 10)."""
@@ -94,17 +115,8 @@ class Filter:
             name = STRATEGY_DEFAULT
         return name, STRATEGY_PROFILES[name]
 
-    def calculate_rvol(self, current_vol_24h):
-        """
-        Simplified Relative Volume calculation.
-        In a real app, we would compare current 1m vol vs average 1m vol.
-        Here, we track changes in the 24h volume key over time.
-        """
-        # We'll use Redis to store the 'previous' volume to see the delta
-        return 1.0 # Placeholder for the logic below
-
     def run(self):
-        print("🛡️ Filter: Analyzing Volume & RSI indicators...")
+        log.info("Filter: Analyzing Volume & RSI indicators...")
         PAUSED_KEY = shared_config.SYSTEM_KEY_TRADING_PAUSED
 
         while True:
@@ -116,12 +128,12 @@ class Filter:
             open_count = self._get_open_order_count()
             max_open = self._get_max_open_orders()
             if open_count >= max_open:
-                print(f"🛡️ Filter: Idle (max open orders reached: {open_count}/{max_open})")
+                log.info(f"Filter: Idle (max open orders reached: {open_count}/{max_open})")
                 time.sleep(10)
                 continue
 
             strategy_name, profile = self._get_strategy()
-            print(f"🛡️ Filter: Scan cycle — strategy: {strategy_name}")
+            log.info(f"Filter: Scan cycle — strategy: {strategy_name}")
 
             # New data layout:
             # - system:active_symbols -> JSON list of symbols
@@ -158,21 +170,13 @@ class Filter:
                     data = json.loads(raw_data)
                 except json.JSONDecodeError:
                     continue
+
                 # 1. Volume Check
                 if data.get('volume_24h') is None or data['volume_24h'] < profile['min_24h_volume']:
                     continue
 
                 # 2. RVOL Calculation (Relative Volume)
-                last_vol_key = f"last_vol:{symbol}"
-                prev_vol = self.db.get(last_vol_key)
-                rvol = 0
-                
-                if prev_vol:
-                    added_vol = data['volume_24h'] - float(prev_vol)
-                    avg_vol_per_min = data['volume_24h'] / 1440
-                    rvol = added_vol / avg_vol_per_min if avg_vol_per_min > 0 else 0
-                
-                self.db.set(last_vol_key, data['volume_24h'], ex=300)
+                rvol = self._calculate_rvol(symbol, data['volume_24h'])
 
                 # 3. RSI Indicator
                 rsi = self.calculate_rsi(data.get('candles', []))
@@ -204,7 +208,7 @@ class Filter:
                                 continue
                     except Exception:
                         pass
-                    print(f"✅ Filter Match: {symbol} | RVOL: {rvol:.2f} | RSI: {rsi}")
+                    log.info(f"Filter Match: {symbol} | RVOL: {rvol:.2f} | RSI: {rsi}")
                     data['symbol'] = symbol
                     data['rvol'] = round(rvol, 2)
                     data['rsi'] = rsi
@@ -216,8 +220,9 @@ class Filter:
                     pass  # Don't write; next cycle Filter will stay idle
                 else:
                     self.db.set('filtered_candidates', json.dumps(filtered_candidates))
-            
+
             time.sleep(10)
+
 
 if __name__ == "__main__":
     f = Filter()

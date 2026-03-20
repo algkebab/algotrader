@@ -15,13 +15,11 @@ _root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from shared import db as shared_db
 from shared import config as shared_config
+from shared import db as shared_db
+from shared import logger as shared_logger
 
-
-def _ts():
-    """Returns current timestamp for logging."""
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+log = shared_logger.get_logger("executor")
 
 
 def get_trading_session():
@@ -45,22 +43,21 @@ class Executor:
         # Redis setup
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
-        
+
         # Binance API setup
         self.exchange = ccxt.binance({
             'apiKey': os.getenv('BINANCE_API_KEY'),
             'secret': os.getenv('BINANCE_SECRET'),
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'} 
+            'options': {'defaultType': 'spot'}
         })
-        
-        # 3. Активація Sandbox (Binance Spot Testnet)
+
+        # Activation of Sandbox (Binance Spot Testnet)
         if os.getenv('IS_TESTNET', 'true').lower() == 'true':
             self.exchange.set_sandbox_mode(True)
-            print(f"[{_ts()}] ⚠️ EXECUTOR: Running in BINANCE SPOT TESTNET mode")
+            log.warning("Executor: Running in BINANCE SPOT TESTNET mode")
         else:
-            print(f"[{_ts()}] ⚡ EXECUTOR: Running in BINANCE REAL SPOT mode")
-        
+            log.info("Executor: Running in BINANCE REAL SPOT mode")
 
     def get_precision_amount(self, symbol, amount):
         """Adjusts the coin amount to the exchange's required precision."""
@@ -108,7 +105,7 @@ class Executor:
 
         if adjustments:
             joined = "; ".join(adjustments)
-            print(f"[{_ts()}] 🛡️ RiskGuard for {symbol} (signal_id={signal_id}): {joined}")
+            log.info(f"Executor: RiskGuard for {symbol} (signal_id={signal_id}): {joined}")
             # Push notification so Messenger can surface this adjustment
             try:
                 self.db.rpush(
@@ -128,7 +125,7 @@ class Executor:
                     }),
                 )
             except Exception as e:
-                print(f"[{_ts()}] ⚠️ RiskGuard notification failed for {symbol}: {e}")
+                log.warning(f"Executor: RiskGuard notification failed for {symbol}: {e}")
 
         return adjusted_sl, adjusted_tp
 
@@ -139,10 +136,10 @@ class Executor:
         before the existing paper-trading and DB logic runs.
         """
         try:
-            print(f"[{_ts()}] 🛒 Executor: Processing paper order for {symbol} (signal_id={signal_id})")
+            log.info(f"Executor: Processing paper order for {symbol} (signal_id={signal_id})")
 
             if not self.can_open_position(symbol):
-                print(f"[{_ts()}] ⚠️ Already monitoring {symbol}. Skipping.")
+                log.warning(f"Executor: Already monitoring {symbol}. Skipping.")
                 self.db.rpush("notifications", json.dumps({
                     "type": "trade_skipped",
                     "data": {"symbol": symbol, "reason": "Already have open order for this symbol"},
@@ -166,7 +163,7 @@ class Executor:
             )
 
         except Exception as e:
-            print(f"[{_ts()}] ❌ Binance Order Error: {e}")
+            log.error(f"Executor: Order Error: {e}")
             return {"status": "error", "message": str(e)}
 
     def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None):
@@ -177,7 +174,7 @@ class Executor:
                 shared_db.init_schema(conn)
                 current_bal = shared_db.get_balance(conn, "USDT")
                 if current_bal <= 0:
-                    print(f"[{_ts()}] ❌ Paper order skipped: non-positive balance ({current_bal:.2f} USDT)")
+                    log.error(f"Executor: Paper order skipped: non-positive balance ({current_bal:.2f} USDT)")
                     return {"status": "error", "message": "Insufficient balance for paper order"}
 
                 # Position sizing: risk POSITION_RISK_PCT of balance per trade
@@ -187,12 +184,12 @@ class Executor:
                 if effective_stop_loss_pct is None or effective_stop_loss_pct <= 0:
                     effective_stop_loss_pct = (1 - shared_config.SL_PERCENT) * 100  # e.g. 2% when SL_PERCENT = 0.98
                 if effective_stop_loss_pct <= 0:
-                    print(f"[{_ts()}] ❌ Invalid stop loss percent ({effective_stop_loss_pct}%), aborting paper order")
+                    log.error(f"Executor: Invalid stop loss percent ({effective_stop_loss_pct}%), aborting paper order")
                     return {"status": "error", "message": "Invalid stop loss percent"}
 
                 # Liquidation safety: for 3x leverage, liquidation ~33% drop; skip if SL would trigger liquidation first
                 if effective_stop_loss_pct >= shared_config.LIQUIDATION_THRESHOLD_PCT:
-                    print(f"[{_ts()}] ⚠️ Order skipped: stop loss {effective_stop_loss_pct:.1f}% >= liquidation threshold {shared_config.LIQUIDATION_THRESHOLD_PCT}% ({shared_config.LEVERAGE}x leverage)")
+                    log.warning(f"Executor: Order skipped: stop loss {effective_stop_loss_pct:.1f}% >= liquidation threshold {shared_config.LIQUIDATION_THRESHOLD_PCT}% ({shared_config.LEVERAGE}x leverage)")
                     return {"status": "error", "message": "Stop loss too wide; would liquidate before SL"}
 
                 # Position notional in USDT from risk amount and stop loss distance
@@ -200,7 +197,7 @@ class Executor:
                 max_notional = current_bal * shared_config.LEVERAGE
                 position_size_usdt = min(position_size_usdt, max_notional)
                 if position_size_usdt <= 0:
-                    print(f"[{_ts()}] ❌ Paper order skipped: zero position size after risk sizing")
+                    log.error("Executor: Paper order skipped: zero position size after risk sizing")
                     return {"status": "error", "message": "Zero position size"}
 
                 # Public ticker for entry/tp/sl (no account interaction)
@@ -229,8 +226,8 @@ class Executor:
                 entry_fee_usd = final_notional_usdt * shared_config.BINANCE_SPOT_FEE
                 total_entry_cost = margin_usdt + entry_fee_usd
                 if current_bal < total_entry_cost:
-                    print(f"[{_ts()}] ❌ Paper order skipped: insufficient balance for margin+fee "
-                          f"({current_bal:.2f} < {total_entry_cost:.2f} USDT)")
+                    log.error(f"Executor: Paper order skipped: insufficient balance for margin+fee "
+                              f"({current_bal:.2f} < {total_entry_cost:.2f} USDT)")
                     return {"status": "error", "message": "Insufficient balance for paper order"}
 
                 # Lock margin and pay entry fee from virtual balance
@@ -253,7 +250,7 @@ class Executor:
                     session=session,
                     signal_id=signal_id,
                 )
-            print(f"[{_ts()}] 📊 Risking ${risk_amount:.2f} to buy ${final_notional_usdt:.2f} worth of {symbol} (Leverage: {shared_config.LEVERAGE}x)")
+            log.info(f"Executor: Risking ${risk_amount:.2f} to buy ${final_notional_usdt:.2f} worth of {symbol} (Leverage: {shared_config.LEVERAGE}x)")
             result = {
                 "status": "success",
                 "order_id": f"paper-{order_id}",
@@ -265,14 +262,14 @@ class Executor:
                 "timestamp": time.time()
             }
             self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
-            print(f"[{_ts()}] ✅ Paper order written to DB (id={order_id}, {shared_config.LEVERAGE}x leverage) | Session: {session}")
+            log.info(f"Executor: Paper order written to DB (id={order_id}, {shared_config.LEVERAGE}x leverage) | Session: {session}")
             return result
         except Exception as e:
-            print(f"[{_ts()}] ❌ Paper order error: {e}")
+            log.error(f"Executor: Paper order error: {e}")
             return {"status": "error", "message": str(e)}
 
     def run(self):
-        print(f"[{_ts()}] ⚡ Executor: Waiting for trade commands from Redis...")
+        log.info("Executor: Waiting for trade commands from Redis...")
         while True:
             command_data = self.db.blpop('trade_commands', timeout=10)
             if command_data:
@@ -287,7 +284,8 @@ class Executor:
                         signal_id=data.get("signal_id"),
                     )
                 except Exception as e:
-                    print(f"[{_ts()}] ❌ Parsing error: {e}")
+                    log.error(f"Executor: Parsing error: {e}")
+
 
 if __name__ == "__main__":
     executor = Executor()

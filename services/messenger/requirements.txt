@@ -1,5 +1,5 @@
+ccxt==4.2.42
+openai==1.55.3
+python-dotenv==1.0.1
 python-telegram-bot==20.8
-redis
-python-dotenv
-ccxt
-openai
+redis==5.0.1

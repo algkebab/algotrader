@@ -19,12 +19,15 @@ if _root not in sys.path:
 from shared import analytics as shared_analytics
 from shared import config as shared_config
 from shared import db as shared_db
+from shared import logger as shared_logger
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TimedOut
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 load_dotenv()
+
+log = shared_logger.get_logger("messenger")
 
 # Longer timeouts for Telegram API (default is 5s; avoids TimedOut on slow networks)
 TELEGRAM_READ_TIMEOUT = 30.0
@@ -98,9 +101,6 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 📊 • *analytics* <period> — AI performance report: last, today, week, month. Win rate, PnL, insights, recommended tweaks.
 ❓ • *help* — This message."""
 
-def _ts():
-    """Returns current UTC timestamp for logging."""
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 class Messenger:
     def __init__(self):
@@ -108,12 +108,12 @@ class Messenger:
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
         self.db.ping()
-        print(f"[{_ts()}] Messenger: Connected to Redis at {redis_host}:6379")
-        
+        log.info(f"Messenger: Connected to Redis at {redis_host}:6379")
+
         # Telegram setup
         self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
-        
+
         if not self.bot_token or not self.chat_id:
             raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in environment variables")
 
@@ -130,7 +130,7 @@ class Messenger:
         self._request_app = HTTPXRequest(**_req_opts)
         self._request_bot = HTTPXRequest(**_req_opts)
         self.bot = Bot(token=self.bot_token, request=self._request_bot)
-        print(f"[{_ts()}] Messenger: Bot initialized (chat_id={self.chat_id}, timeouts={TELEGRAM_READ_TIMEOUT}s)")
+        log.info(f"Messenger: Bot initialized (chat_id={self.chat_id}, timeouts={TELEGRAM_READ_TIMEOUT}s)")
 
         # Exchange for current price (orders command); public API only
         self.exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
@@ -164,7 +164,7 @@ class Messenger:
         try:
             await update.message.reply_text(text)
         except TimedOut as e:
-            print(f"[{_ts()}] Messenger: reply_text timed out (state already updated): {e}")
+            log.warning(f"Messenger: reply_text timed out (state already updated): {e}")
 
     async def _reply_orders(self, update) -> None:
         """Reply with list of current (open) orders from SQLite."""
@@ -299,7 +299,7 @@ class Messenger:
                     "reason": reason,
                 },
             }))
-            print(f"[{_ts()}] Messenger: Manual close {symbol} at {close_price}. PnL: {net_pnl_usdt:.2f} USDT")
+            log.info(f"Messenger: Manual close {symbol} at {close_price}. PnL: {net_pnl_usdt:.2f} USDT")
             await self._safe_reply(
                 update,
                 f"✅ Order closed\n\n{symbol}\n"
@@ -307,7 +307,7 @@ class Messenger:
                 f"Exit: {close_price}",
             )
         except Exception as e:
-            print(f"[{_ts()}] Messenger: orders close failed: {e}")
+            log.error(f"Messenger: orders close failed: {e}")
             await self._safe_reply(update, f"❌ Close failed\n\n{e}")
 
     def _get_open_order_count(self) -> int:
@@ -353,7 +353,7 @@ class Messenger:
             )
             return
         self._set_setting(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS, str(n))
-        print(f"[{_ts()}] Messenger: max_open_orders set to {n}")
+        log.info(f"Messenger: max_open_orders set to {n}")
         await self._safe_reply(
             update,
             f"✅ Max open orders updated\n\n📋 Autopilot will allow up to {n} simultaneous open orders.",
@@ -480,7 +480,7 @@ class Messenger:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
                 shared_db.set_balance(conn, "USDT", amount)
-            print(f"[{_ts()}] Messenger: Balance set to {amount:.2f} USDT")
+            log.info(f"Messenger: Balance set to {amount:.2f} USDT")
             await self._safe_reply(update, f"✅ Balance updated\n\n💰 USDT: {amount:.2f}")
         except Exception as e:
             await self._safe_reply(update, f"❌ Could not set balance\n\n{e}")
@@ -507,7 +507,7 @@ class Messenger:
             )
             return
         self._set_setting(shared_config.SYSTEM_KEY_MAX_SYMBOLS, str(n))
-        print(f"[{_ts()}] Messenger: max_symbols set to {n}")
+        log.info(f"Messenger: max_symbols set to {n}")
         await self._safe_reply(update, f"✅ Symbols updated\n\n📈 Scout will fetch top {n} symbols by volume.")
 
     async def _handle_strategy(self, update, text: str) -> None:
@@ -529,7 +529,7 @@ class Messenger:
             return
         name_upper = rest.upper()
         self._set_setting(shared_config.SYSTEM_KEY_STRATEGY, name_upper)
-        print(f"[{_ts()}] Messenger: strategy set to {name_upper}")
+        log.info(f"Messenger: strategy set to {name_upper}")
         await self._safe_reply(update, f"🎯 Strategy changed to {name_upper}. Filters updated.")
 
     async def _handle_set_timezone(self, update, text: str) -> None:
@@ -564,7 +564,7 @@ class Messenger:
             return
         offset_min = int(hours * 60)
         self._set_setting(shared_config.SYSTEM_KEY_TIMEZONE_OFFSET_MIN, str(offset_min))
-        print(f"[{_ts()}] Messenger: timezone offset set to {offset_min} minutes")
+        log.info(f"Messenger: timezone offset set to {offset_min} minutes")
         await self._safe_reply(
             update,
             f"✅ Timezone updated\n\n🕒 New offset: UTC{hours:+.1f}",
@@ -620,7 +620,7 @@ class Messenger:
         try:
             report = await asyncio.to_thread(shared_analytics.generate_performance_report, period)
         except Exception as e:
-            print(f"[{_ts()}] Messenger: analytics failed: {e}")
+            log.error(f"Messenger: analytics failed: {e}")
             await self._safe_reply(update, f"❌ Analytics failed\n\n{e}")
             return
         await self._safe_reply(update, report)
@@ -643,7 +643,7 @@ class Messenger:
         text = (update.message.text or "").strip().lower()
         if text == "stop":
             self._set_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED, "1")
-            print(f"[{_ts()}] Messenger: Pipeline PAUSED (Filter & Brain stopped)")
+            log.info("Messenger: Pipeline PAUSED (Filter & Brain stopped)")
             await self._safe_reply(
                 update,
                 "⏸️ Pipeline paused\n\n"
@@ -653,18 +653,18 @@ class Messenger:
             )
         elif text == "start":
             self._set_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED, "0")
-            print(f"[{_ts()}] Messenger: Pipeline RESUMED (Filter & Brain running)")
+            log.info("Messenger: Pipeline RESUMED (Filter & Brain running)")
             await self._safe_reply(update, "▶️ Pipeline resumed\n\nFilter and Brain are running.")
         elif text == "clear redis":
             try:
                 n = self._clear_redis_data()
-                print(f"[{_ts()}] Messenger: Redis data cleared ({n} keys deleted)")
+                log.info(f"Messenger: Redis data cleared ({n} keys deleted)")
                 await self._safe_reply(
                     update,
                     f"🧹 Redis cleared\n\n{n} keys deleted.",
                 )
             except Exception as e:
-                print(f"[{_ts()}] Messenger: clear redis failed: {e}")
+                log.error(f"Messenger: clear redis failed: {e}")
                 await self._safe_reply(update, f"❌ Clear Redis failed\n\n{e}")
         elif text == "status":
             try:
@@ -691,12 +691,12 @@ class Messenger:
                 lines.append("📢 WAIT signals: " + ("ON" if signal_wait == "1" else "OFF"))
                 await self._safe_reply(update, "\n".join(lines))
             except Exception as e:
-                print(f"[{_ts()}] Messenger: status failed: {e}")
+                log.error(f"Messenger: status failed: {e}")
                 await self._safe_reply(update, f"❌ Status failed\n\n{e}")
         elif text == "autopilot on":
             self._set_setting(shared_config.SYSTEM_KEY_AUTOPILOT, "1")
             self._set_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED, "0")
-            print(f"[{_ts()}] Messenger: Autopilot ON (pipeline resumed if was paused)")
+            log.info("Messenger: Autopilot ON (pipeline resumed if was paused)")
             await self._safe_reply(
                 update,
                 "🤖 Autopilot on\n\n"
@@ -705,7 +705,7 @@ class Messenger:
             )
         elif text == "autopilot off":
             self._set_setting(shared_config.SYSTEM_KEY_AUTOPILOT, "0")
-            print(f"[{_ts()}] Messenger: Autopilot OFF (Buy button restored on signals)")
+            log.info("Messenger: Autopilot OFF (Buy button restored on signals)")
             await self._safe_reply(
                 update,
                 "🛑 Autopilot off\n\n"
@@ -731,14 +731,14 @@ class Messenger:
             await self._handle_set_timezone(update, text)
         elif text == "signal wait on":
             self._set_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT, "1")
-            print(f"[{_ts()}] Messenger: WAIT verdict notifications ON")
+            log.info("Messenger: WAIT verdict notifications ON")
             await self._safe_reply(
                 update,
                 "📢 WAIT signals ON\n\nYou will receive Telegram notifications for WAIT verdicts.",
             )
         elif text == "signal wait off":
             self._set_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT, "0")
-            print(f"[{_ts()}] Messenger: WAIT verdict notifications OFF")
+            log.info("Messenger: WAIT verdict notifications OFF")
             await self._safe_reply(
                 update,
                 "📢 WAIT signals OFF\n\nNo notifications for WAIT verdicts. BUY signals unchanged.",
@@ -759,11 +759,11 @@ class Messenger:
     async def handle_callback(self, update, context):
         """Handles button clicks (Buy commands) from Telegram UI."""
         query = update.callback_query
-        print(f"[{_ts()}] Messenger: Callback received, data={query.data!r}")
+        log.info(f"Messenger: Callback received, data={query.data!r}")
         try:
             await query.answer()
         except Exception as e:
-            print(f"[{_ts()}] Messenger: query.answer() failed (continuing): {e}")
+            log.warning(f"Messenger: query.answer() failed (continuing): {e}")
 
         if query.data.startswith("buy:"):
             # Format: buy:SYMBOL:SIGNAL_ID[:stop_loss_pct:take_profit_pct]
@@ -783,15 +783,15 @@ class Messenger:
                 "signal_id": signal_id,
             }
             self.db.rpush("trade_commands", json.dumps(command))
-            
-            print(f"[{_ts()}] Messenger: Pushed trade_command to Redis: {symbol}")
+
+            log.info(f"Messenger: Pushed trade_command to Redis: {symbol}")
             try:
                 await query.edit_message_text(
                     text=f"{query.message.text}\n\n✅ _Command sent to Executor_",
                     parse_mode="Markdown",
                 )
             except Exception as e:
-                print(f"[{_ts()}] Messenger: edit_message_text error: {e}")
+                log.warning(f"Messenger: edit_message_text error: {e}")
 
     async def send_telegram_msg(self, text, symbol=None, keyboard=None):
         """Helper to send Markdown messages with optional keyboards. Retries on timeout."""
@@ -810,17 +810,17 @@ class Messenger:
             except TimedOut as e:
                 last_error = e
                 if attempt < SEND_MESSAGE_RETRIES:
-                    print(f"[{_ts()}] Messenger: Telegram timeout (attempt {attempt + 1}), retrying in {SEND_MESSAGE_RETRY_DELAY}s...")
+                    log.warning(f"Messenger: Telegram timeout (attempt {attempt + 1}), retrying in {SEND_MESSAGE_RETRY_DELAY}s...")
                     await asyncio.sleep(SEND_MESSAGE_RETRY_DELAY)
             except Exception as e:
-                print(f"[{_ts()}] Messenger: Telegram API Error: {e}")
+                log.error(f"Messenger: Telegram API Error: {e}")
                 return
         if last_error:
-            print(f"[{_ts()}] Messenger: Telegram API Error (timed out after {SEND_MESSAGE_RETRIES + 1} attempts): {last_error}")
+            log.error(f"Messenger: Telegram API Error (timed out after {SEND_MESSAGE_RETRIES + 1} attempts): {last_error}")
 
     async def listen_for_notifications(self):
         """Background task: Listens for trade execution results from Executor."""
-        print(f"[{_ts()}] Messenger: Notification listener started (waiting for Executor updates)")
+        log.info("Messenger: Notification listener started (waiting for Executor updates)")
         while True:
             # BLPOP blocks until a notification appears in the queue
             notification = self.db.blpop('notifications', timeout=5)
@@ -917,7 +917,7 @@ class Messenger:
                         f"🎯 TP: `{orig_tp}` → `{new_tp}` (RR≥{rr}x)",
                     ]
                     await self.send_telegram_msg("\n".join(lines))
-            
+
             await asyncio.sleep(1)
 
     async def run(self):
@@ -926,27 +926,27 @@ class Messenger:
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling()
-        
+
         # Start background listener for Executor notifications
         asyncio.create_task(self.listen_for_notifications())
-        
-        print(f"[{_ts()}] Messenger: Monitoring 'signals' from Brain every 5s...")
+
+        log.info("Messenger: Monitoring 'signals' from Brain every 5s...")
 
         while True:
             try:
                 # Run blocking blpop in thread so event loop can process Telegram callbacks
                 signal_data = await asyncio.to_thread(self.db.blpop, "signals", 10)
-                
+
                 if signal_data:
                     _, payload = signal_data
                     data = json.loads(payload)
-                    
+
                     symbol = data['symbol']
                     verdict = data.get('verdict', 'WAIT')
 
                     # Skip Telegram notification for WAIT verdicts unless "signal wait on"
                     if verdict == "WAIT" and self._get_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT) != "1":
-                        print(f"[{_ts()}] Messenger: WAIT signal for {symbol} (notifications off, skipped)")
+                        log.info(f"Messenger: WAIT signal for {symbol} (notifications off, skipped)")
                         continue
 
                     # When at max open orders, don't show BUY signals (no slot to trade); consume and skip
@@ -954,7 +954,7 @@ class Messenger:
                         open_count = self._get_open_order_count()
                         max_open = self._get_max_open_orders()
                         if open_count >= max_open:
-                            print(f"[{_ts()}] Messenger: Dropping BUY signal for {symbol} (max open orders: {open_count}/{max_open})")
+                            log.info(f"Messenger: Dropping BUY signal for {symbol} (max open orders: {open_count}/{max_open})")
                             continue
 
                     # Formatting external links
@@ -1030,7 +1030,7 @@ class Messenger:
                                 f"Max {max_open} open orders reached ({open_count}).\n"
                                 f"Close a position or wait for TP/SL to free a slot."
                             )
-                            print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (open orders: {open_count})")
+                            log.info(f"Messenger: Autopilot skipped for {symbol} (open orders: {open_count})")
                         else:
                             # Do not send order if we already have an open position for this symbol
                             try:
@@ -1042,8 +1042,7 @@ class Messenger:
                                             f"📌 {symbol}\n\n"
                                             f"Already have an open order for this symbol."
                                         )
-                                        print(f"[{_ts()}] Messenger: Autopilot skipped for {symbol} (already have open order)")
-                                        # skip pushing command below
+                                        log.info(f"Messenger: Autopilot skipped for {symbol} (already have open order)")
                                     else:
                                         strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                                         if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
@@ -1064,9 +1063,9 @@ class Messenger:
                                             f"🎯 Strategy: `{strategy_name}` · SL/TP: `{sl_info}` / `{tp_info}`\n\n"
                                             f"_Executor will confirm shortly._"
                                         )
-                                        print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
+                                        log.info(f"Messenger: Autopilot order pushed for {symbol}")
                             except Exception as e:
-                                print(f"[{_ts()}] Messenger: DB check for open order failed: {e}")
+                                log.error(f"Messenger: DB check for open order failed: {e}")
                                 strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
                                 if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                                     strategy_name = "CONSERVATIVE"
@@ -1078,14 +1077,15 @@ class Messenger:
                                     f"🎯 Strategy: `{strategy_name}`\n\n"
                                     f"_Executor will confirm shortly._"
                                 )
-                                print(f"[{_ts()}] Messenger: Autopilot order pushed for {symbol}")
+                                log.info(f"Messenger: Autopilot order pushed for {symbol}")
 
-                    print(f"[{_ts()}] Messenger: Signal alert sent for {symbol} (Verdict: {verdict})")
+                    log.info(f"Messenger: Signal alert sent for {symbol} (Verdict: {verdict})")
 
             except Exception as e:
-                print(f"[{_ts()}] Messenger Loop Error: {e}")
-            
+                log.error(f"Messenger Loop Error: {e}")
+
             await asyncio.sleep(1)
+
 
 if __name__ == "__main__":
     messenger = Messenger()

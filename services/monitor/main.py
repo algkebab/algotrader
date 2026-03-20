@@ -4,7 +4,7 @@ import sys
 import time
 import redis
 import ccxt
-from datetime import datetime, timezone
+from datetime import datetime
 import math
 
 # Allow importing shared.db
@@ -13,12 +13,11 @@ _root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from shared import db as shared_db
 from shared import config as shared_config
+from shared import db as shared_db
+from shared import logger as shared_logger
 
-
-def _ts():
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+log = shared_logger.get_logger("monitor")
 
 
 class Monitor:
@@ -47,11 +46,11 @@ class Monitor:
                 for r in rows
             ]
         except Exception as e:
-            print(f"[{_ts()}] ❌ Monitor: DB error: {e}")
+            log.error(f"Monitor: DB error: {e}")
             return []
 
     def run(self):
-        print(f"[{_ts()}] 🛰️ Monitor: Tracking active positions...")
+        log.info("Monitor: Tracking active positions...")
         while True:
             positions = self._get_positions_to_monitor()
             if not positions:
@@ -62,7 +61,7 @@ class Monitor:
             try:
                 tickers = self.exchange.fetch_tickers(symbols)
             except Exception as e:
-                print(f"[{_ts()}] ❌ Monitor: fetch_tickers error: {e}")
+                log.error(f"Monitor: fetch_tickers error: {e}")
                 tickers = {}
 
             for symbol, trade in positions:
@@ -80,20 +79,17 @@ class Monitor:
                         opened_at = datetime.fromisoformat(trade["opened_at"].replace("Z", ""))
                         hours_open = (datetime.utcnow() - opened_at).total_seconds() / 3600.0
                         if hours_open >= 48:
-                            self.close_position(symbol, current_price, "TIME-STOP ⏱️")
+                            self.close_position(symbol, current_price, "TIME-STOP")
                             continue
                     except Exception:
                         pass
 
                     if current_price <= sl_price:
-                        self.close_position(symbol, current_price, "STOP-LOSS 🔴")
+                        self.close_position(symbol, current_price, "STOP-LOSS")
                     elif current_price >= tp_price:
-                        self.close_position(symbol, current_price, "TAKE-PROFIT 🟢")
-                    else:
-                        # No trailing stop in paper mode
-                        pass
+                        self.close_position(symbol, current_price, "TAKE-PROFIT")
                 except Exception as e:
-                    print(f"[{_ts()}] ❌ Error monitoring {symbol}: {e}")
+                    log.error(f"Monitor: Error monitoring {symbol}: {e}")
 
             time.sleep(2)
 
@@ -112,7 +108,7 @@ class Monitor:
             notional_usdt = float(row["amount_usdt"])
             margin_usdt = notional_usdt / shared_config.LEVERAGE
         except Exception as e:
-            print(f"[{_ts()}] ❌ Monitor: DB error in close_position: {e}")
+            log.error(f"Monitor: DB error in close_position: {e}")
             return
 
         gross_pnl_usdt = (price - entry_price) * qty
@@ -158,11 +154,11 @@ class Monitor:
         equity_usdt = margin_usdt if margin_usdt else notional_usdt
         net_pnl_pct = (net_pnl_usdt / equity_usdt) * 100 if equity_usdt else 0.0
 
-        print(
-            f"[{_ts()}] 🚩 CLOSING {symbol} at {price}. "
+        log.info(
+            f"Monitor: Closing {symbol} at {price}. "
             f"Gross PnL: {gross_pnl_usdt:.2f} USDT ({gross_pnl_percent:.2f}%), "
             f"Fees/Interest: {total_costs:.2f} USDT "
-            f"→ Net PnL: {net_pnl_usdt:.2f} USDT ({net_pnl_pct:.2f}%) (paper)"
+            f"-> Net PnL: {net_pnl_usdt:.2f} USDT ({net_pnl_pct:.2f}%) [{reason}] (paper)"
         )
 
         # Extra metadata for Messenger (fees, interest, strategy, holding time)
@@ -208,7 +204,8 @@ class Monitor:
                     new_balance = bal + margin_usdt + gross_pnl_usdt - exit_fee_usd - margin_interest_paid
                     shared_db.set_balance(conn, "USDT", new_balance)
         except Exception as db_err:
-            print(f"[{_ts()}] ⚠️ DB update failed: {db_err}")
+            log.warning(f"Monitor: DB update failed: {db_err}")
+
 
 if __name__ == "__main__":
     monitor = Monitor()

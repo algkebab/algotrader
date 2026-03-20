@@ -1,11 +1,9 @@
 """Brain service: strategy execution and GPT analysis."""
-import asyncio
 import json
 import os
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
 
 import redis
 from dotenv import load_dotenv
@@ -22,13 +20,13 @@ _root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from shared import db as shared_db
 from shared import config as shared_config
+from shared import db as shared_db
+from shared import logger as shared_logger
 
 load_dotenv()
 
-def _ts():
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+log = shared_logger.get_logger("brain")
 
 # AI system prompts per AI strategy (set via Telegram "set strategy <name>")
 STRATEGY_SYSTEM_MESSAGES = {
@@ -57,15 +55,15 @@ STRATEGY_SYSTEM_MESSAGES = {
 
 STRATEGY_DEFAULT = "CONSERVATIVE"
 
+
 class Brain:
     def __init__(self):
         # Redis setup
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
-        
+
         # AI setup
         self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        
 
     def _get_strategy_name(self):
         """Return current strategy name (default CONSERVATIVE)."""
@@ -93,22 +91,22 @@ class Brain:
             if last_wait_price and last_wait_price > 0:
                 price_change_pct = ((current_price - last_wait_price) / last_wait_price) * 100
                 if price_change_pct > PRICE_SPIKE_BYPASS_PCT:
-                    print(f"[{_ts()}] 🧠 Brain: [Spike detected] {symbol} moved {price_change_pct:.2f}% since WAIT, bypassing cache")
+                    log.info(f"Brain: [Spike detected] {symbol} moved {price_change_pct:.2f}% since WAIT, bypassing cache")
                     return True
 
-            print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (recent WAIT verdict cache active)")
+            log.info(f"Brain: Skipping {symbol} (recent WAIT verdict cache active)")
             return False
 
         cache_data = self.db.get(f"cache:brain_price:{symbol}")
-        
+
         if cache_data:
             last_price = float(cache_data)
             price_diff = abs(current_price - last_price) / last_price
-            
+
             if price_diff < shared_config.PRICE_CHANGE_THRESHOLD:
-                print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (Price change {price_diff:.2%} < {shared_config.PRICE_CHANGE_THRESHOLD:.2%})")
+                log.info(f"Brain: Skipping {symbol} (Price change {price_diff:.2%} < {shared_config.PRICE_CHANGE_THRESHOLD:.2%})")
                 return False
-        
+
         # If no cache or price moved enough, we update and proceed
         self.db.set(f"cache:brain_price:{symbol}", current_price, ex=1800)
         return True
@@ -226,7 +224,7 @@ Respond with ONLY the JSON object, no comments or additional text.
             content = response.choices[0].message.content
             data = json.loads(content)
         except Exception as e:
-            print(f"[{_ts()}] ❌ AI Error: {e}")
+            log.error(f"Brain: AI Error: {e}")
             data = {
                 "verdict": "WAIT",
                 "stop_loss_pct": 0.0,
@@ -248,12 +246,12 @@ Respond with ONLY the JSON object, no comments or additional text.
                     response=data,
                 )
         except Exception as e:
-            print(f"[{_ts()}] 🧠 Brain: Failed to persist signal {signal_id} for {symbol}: {e}")
+            log.error(f"Brain: Failed to persist signal {signal_id} for {symbol}: {e}")
 
         return data, signal_id
 
     def run(self):
-        print(f"[{_ts()}] 🧠 Brain: AI Technical Analyst is online with Smart Cache...")
+        log.info("Brain: AI Technical Analyst is online with Smart Cache...")
 
         while True:
             if shared_db.get_setting_value(shared_config.SYSTEM_KEY_TRADING_PAUSED) == "1":
@@ -271,7 +269,7 @@ Respond with ONLY the JSON object, no comments or additional text.
             open_count = self._get_open_order_count()
             max_open = self._get_max_open_orders()
             if open_count >= max_open:
-                print(f"[{_ts()}] 🧠 Brain: Skipping AI (max open orders reached: {open_count}/{max_open})")
+                log.info(f"Brain: Skipping AI (max open orders reached: {open_count}/{max_open})")
                 self.db.delete('filtered_candidates')
                 time.sleep(5)
                 continue
@@ -281,7 +279,7 @@ Respond with ONLY the JSON object, no comments or additional text.
                 open_count = self._get_open_order_count()
                 max_open = self._get_max_open_orders()
                 if open_count >= max_open:
-                    print(f"[{_ts()}] 🧠 Brain: Stopping (max open orders reached: {open_count}/{max_open})")
+                    log.info(f"Brain: Stopping (max open orders reached: {open_count}/{max_open})")
                     break
 
                 symbol = item['symbol']
@@ -292,12 +290,12 @@ Respond with ONLY the JSON object, no comments or additional text.
                     with shared_db.get_connection() as conn:
                         shared_db.init_schema(conn)
                         if shared_db.get_open_order_id_for_symbol(conn, symbol) is not None:
-                            print(f"[{_ts()}] 🧠 Brain: Skipping {symbol} (already have open order)")
+                            log.info(f"Brain: Skipping {symbol} (already have open order)")
                             continue
                 except Exception as e:
-                    print(f"[{_ts()}] 🧠 Brain: DB check failed for {symbol}: {e}")
+                    log.error(f"Brain: DB check failed for {symbol}: {e}")
                     # Proceed with analysis if DB check fails
-                
+
                 # --- SMART CACHE START ---
                 if not self.should_analyze(symbol, current_price):
                     continue
@@ -305,10 +303,10 @@ Respond with ONLY the JSON object, no comments or additional text.
 
                 # Re-check again right before calling AI (no API call when at capacity)
                 if self._get_open_order_count() >= self._get_max_open_orders():
-                    print(f"[{_ts()}] 🧠 Brain: Skipping AI for {symbol} (max open orders reached)")
+                    log.info(f"Brain: Skipping AI for {symbol} (max open orders reached)")
                     break
 
-                print(f"[{_ts()}] 🔍 Analyzing {symbol} with AI...")
+                log.info(f"Brain: Analyzing {symbol} with AI...")
 
                 analysis, signal_id = self.get_ai_verdict(
                     symbol,
@@ -329,30 +327,30 @@ Respond with ONLY the JSON object, no comments or additional text.
                         json.dumps({"price": current_price}),
                         ex=ttl,
                     )
-                    print(f"[{_ts()}] [Brain] WAIT for {symbol}. Cache active for {ttl // 60} min.")
+                    log.info(f"Brain: WAIT for {symbol}. Cache active for {ttl // 60} min.")
 
                 # Merge AI verdict with market data and attach unique signal_id
                 final_signal = {**item, **analysis, "signal_id": signal_id}
 
                 # Never send a signal if at max open orders or already have open order for this symbol
                 if self._get_open_order_count() >= self._get_max_open_orders():
-                    print(f"[{_ts()}] 🧠 Brain: Not sending signal for {symbol} (max open orders reached)")
+                    log.info(f"Brain: Not sending signal for {symbol} (max open orders reached)")
                     continue
                 try:
                     with shared_db.get_connection() as conn:
                         shared_db.init_schema(conn)
                         if shared_db.get_open_order_id_for_symbol(conn, symbol) is not None:
-                            print(f"[{_ts()}] 🧠 Brain: Not sending signal for {symbol} (open order exists)")
+                            log.info(f"Brain: Not sending signal for {symbol} (open order exists)")
                             continue
                 except Exception as e:
-                    print(f"[{_ts()}] 🧠 Brain: DB check before push failed for {symbol}: {e}")
+                    log.error(f"Brain: DB check before push failed for {symbol}: {e}")
                     continue
 
                 self.db.rpush('signals', json.dumps(final_signal))
 
             time.sleep(5)
 
+
 if __name__ == "__main__":
     brain = Brain()
-    # Fixed: run is not an async function, using standard loop or calling directly
     brain.run()
