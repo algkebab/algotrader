@@ -495,8 +495,6 @@ Apply these rules strictly:
 - NEUTRAL: raise selectivity by one level — prefer A-grade setups, flag uncertainty in reason.
 - BEARISH_HEADWIND: require A-grade setup minimum; reduce TP to nearest visible resistance \
   (do not reach for extended targets); lean towards WAIT on any marginal setup.
-- STRONG_BEARISH: verdict must be WAIT regardless of the altcoin's own setup. \
-  Document BTC as the reason. Do not override this rule.
 
 **Step 8 — Final Verdict:**
 Apply the {strategy} strategy criteria from your system instructions \
@@ -568,20 +566,31 @@ Respond with ONLY the JSON object.
             # Full indicator dicts for completeness
             "indicators": indicators,
         }
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                temperature=0,  # deterministic — same input always produces same verdict
-                messages=[
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-            )
-            content = response.choices[0].message.content
-            data = json.loads(content)
-        except Exception as e:
-            log.error(f"Brain: AI Error: {e}")
+        last_err = None
+        data = None
+        for attempt in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    temperature=0,  # deterministic — same input always produces same verdict
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    timeout=30,
+                )
+                content = response.choices[0].message.content
+                data = json.loads(content)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    log.warning(f"Brain: AI call failed (attempt 1), retrying in 3s: {e}")
+                    time.sleep(3)
+        if last_err is not None:
+            log.error(f"Brain: AI Error after retry: {last_err}")
             data = {
                 "trend_1h": "UNKNOWN",
                 "setup_15m": "NONE",
