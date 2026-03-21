@@ -4,6 +4,9 @@ import sys
 import time
 
 import redis
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Allow importing shared (project root or /app in Docker)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -381,22 +384,6 @@ class Filter:
             f"| VWAP: {vwap_str}"
         )
 
-    def _get_max_open_orders(self):
-        """Return max simultaneous open orders from DB (default 10)."""
-        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS)
-        if val is None or not str(val).isdigit():
-            return shared_config.MAX_OPEN_ORDERS_DEFAULT
-        return max(shared_config.MAX_OPEN_ORDERS_MIN, min(shared_config.MAX_OPEN_ORDERS_MAX, int(val)))
-
-    def _get_open_order_count(self):
-        """Return number of open orders in DB."""
-        try:
-            with shared_db.get_connection() as conn:
-                shared_db.init_schema(conn)
-                return len(shared_db.get_open_orders(conn))
-        except Exception:
-            return 0
-
     def _get_strategy(self):
         """Return current strategy name and profile. Default CONSERVATIVE."""
         val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_STRATEGY)
@@ -415,8 +402,8 @@ class Filter:
                 continue
 
             # Stop filtering when at max open orders (no new orders would be placed)
-            open_count = self._get_open_order_count()
-            max_open = self._get_max_open_orders()
+            open_count = shared_db.get_open_order_count()
+            max_open = shared_db.get_max_open_orders()
             if open_count >= max_open:
                 log.info(f"Filter: Idle (max open orders reached: {open_count}/{max_open})")
                 time.sleep(10)
@@ -444,10 +431,9 @@ class Filter:
                 continue
 
             # Fetch all per-symbol market data in one pipeline for performance
+            keys = list(symbols)
             pipe = self.db.pipeline()
-            keys = []
-            for symbol in symbols:
-                keys.append(symbol)
+            for symbol in keys:
                 pipe.get(f"market_data:{symbol}")
             results = pipe.execute()
 
@@ -535,7 +521,7 @@ class Filter:
                 # when max_open_orders is hit mid-batch
                 filtered_candidates.sort(key=lambda c: c.get('filter_score', 0), reverse=True)
                 # Re-check before writing (avoid race: 10th order opened during this loop)
-                if self._get_open_order_count() >= self._get_max_open_orders():
+                if shared_db.get_open_order_count() >= shared_db.get_max_open_orders():
                     pass  # Don't write; next cycle Filter will stay idle
                 else:
                     self.db.set('filtered_candidates', json.dumps(filtered_candidates))

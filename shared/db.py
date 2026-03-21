@@ -564,3 +564,22 @@ def sync_balance_from_exchange(conn: sqlite3.Connection, exchange) -> None:
         set_balance(conn, "USDT", free)
     except Exception:
         pass
+
+
+def get_open_order_count() -> int:
+    """Return number of currently open orders. Returns 0 on DB error."""
+    try:
+        with get_connection() as conn:
+            init_schema(conn)
+            return len(get_open_orders(conn))
+    except Exception:
+        return 0
+
+
+def get_max_open_orders() -> int:
+    """Return max simultaneous open orders from settings (clamped to config bounds)."""
+    from shared import config as _cfg  # local import avoids circular dependency at module level
+    val = get_setting_value(_cfg.SYSTEM_KEY_MAX_OPEN_ORDERS)
+    if val is None or not str(val).isdigit():
+        return _cfg.MAX_OPEN_ORDERS_DEFAULT
+    return max(_cfg.MAX_OPEN_ORDERS_MIN, min(_cfg.MAX_OPEN_ORDERS_MAX, int(val)))

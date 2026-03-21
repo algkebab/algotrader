@@ -143,6 +143,11 @@ class Messenger:
             shared_db.init_schema(conn)
             shared_db.set_setting(conn, key, value)
 
+    def _get_strategy_name(self) -> str:
+        """Return current strategy name (validated, default CONSERVATIVE)."""
+        val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+        return val if val in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"} else "CONSERVATIVE"
+
     async def _safe_reply(self, update, text: str) -> None:
         """Reply to the user; log and continue on timeout so handler doesn't crash."""
         try:
@@ -313,23 +318,6 @@ class Messenger:
         except Exception as e:
             log.error(f"Messenger: orders close failed: {e}")
             await self._safe_reply(update, f"❌ Close failed\n\n{e}")
-
-    def _get_open_order_count(self) -> int:
-        """Return number of open orders from DB (for autopilot cap)."""
-        try:
-            with shared_db.get_connection() as conn:
-                shared_db.init_schema(conn)
-                return len(shared_db.get_open_orders(conn))
-        except Exception:
-            return 0
-
-    def _get_max_open_orders(self) -> int:
-        """Return max simultaneous open orders (from DB, default shared_config.MAX_OPEN_ORDERS_DEFAULT)."""
-        val = self._get_setting(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS)
-        if val is None or not str(val).isdigit():
-            return shared_config.MAX_OPEN_ORDERS_DEFAULT
-        n = int(val)
-        return max(shared_config.MAX_OPEN_ORDERS_MIN, min(shared_config.MAX_OPEN_ORDERS_MAX, n))
 
     async def _handle_orders_set_max(self, update, text: str) -> None:
         """Set max simultaneous open orders. Usage: orders set max <number> (e.g. orders set max 15)."""
@@ -655,11 +643,9 @@ class Messenger:
                 autopilot = self._get_setting(shared_config.SYSTEM_KEY_AUTOPILOT)
                 symbols_val = self._get_setting(shared_config.SYSTEM_KEY_MAX_SYMBOLS)
                 symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else shared_config.MAX_SYMBOLS_DEFAULT
-                strategy_val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
-                if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                    strategy_val = "CONSERVATIVE"
+                strategy_val = self._get_strategy_name()
                 signal_wait = self._get_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT)
-                max_open = self._get_max_open_orders()
+                max_open = shared_db.get_max_open_orders()
 
                 # DB: balance, today PnL, open orders, bot version
                 try:
@@ -836,12 +822,10 @@ class Messenger:
             signal_id = parts[2] if len(parts) > 2 and parts[2] else None
             stop_loss_pct = float(parts[3]) if len(parts) > 3 and parts[3] else None
             take_profit_pct = float(parts[4]) if len(parts) > 4 and parts[4] else None
-            strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
-            if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                strategy_name = "CONSERVATIVE"
+            strategy_name = self._get_strategy_name()
 
-            open_count = self._get_open_order_count()
-            max_open = self._get_max_open_orders()
+            open_count = shared_db.get_open_order_count()
+            max_open = shared_db.get_max_open_orders()
             if open_count >= max_open:
                 log.info(f"Messenger: Manual Buy for {symbol} blocked (max open orders: {open_count}/{max_open})")
                 try:
@@ -1037,8 +1021,8 @@ class Messenger:
 
                     # When at max open orders, notify but don't show a Buy button
                     if verdict == "BUY":
-                        open_count = self._get_open_order_count()
-                        max_open = self._get_max_open_orders()
+                        open_count = shared_db.get_open_order_count()
+                        max_open = shared_db.get_max_open_orders()
                         if open_count >= max_open:
                             log.info(f"Messenger: BUY signal for {symbol} skipped (max open orders: {open_count}/{max_open})")
                             await self.send_telegram_msg(
@@ -1063,9 +1047,7 @@ class Messenger:
                     signal_id = data.get("signal_id")
 
                     # Strategy for context
-                    strategy_val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
-                    if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                        strategy_val = "CONSERVATIVE"
+                    strategy_val = self._get_strategy_name()
 
                     # Format TP/SL line
                     sl_str = None
@@ -1113,8 +1095,8 @@ class Messenger:
                     await self.send_telegram_msg(message, symbol, keyboard)
 
                     if verdict == "BUY" and autopilot_on == "1":
-                        open_count = self._get_open_order_count()
-                        max_open = self._get_max_open_orders()
+                        open_count = shared_db.get_open_order_count()
+                        max_open = shared_db.get_max_open_orders()
                         if open_count >= max_open:
                             await self.send_telegram_msg(
                                 f"⏸️ *Autopilot skipped*\n\n"
@@ -1136,9 +1118,7 @@ class Messenger:
                                         )
                                         log.info(f"Messenger: Autopilot skipped for {symbol} (already have open order)")
                                     else:
-                                        strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
-                                        if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                                            strategy_name = "CONSERVATIVE"
+                                        strategy_name = self._get_strategy_name()
                                         command = {
                                             "symbol": symbol,
                                             "stop_loss_pct": stop_loss_pct,
@@ -1158,9 +1138,7 @@ class Messenger:
                                         log.info(f"Messenger: Autopilot order pushed for {symbol}")
                             except Exception as e:
                                 log.error(f"Messenger: DB check for open order failed: {e}")
-                                strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
-                                if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                                    strategy_name = "CONSERVATIVE"
+                                strategy_name = self._get_strategy_name()
                                 command = {"symbol": symbol, "strategy_name": strategy_name, "signal_id": signal_id}
                                 self.db.rpush("trade_commands", json.dumps(command))
                                 await self.send_telegram_msg(

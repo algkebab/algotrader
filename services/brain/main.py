@@ -171,22 +171,6 @@ class Brain:
             return WAIT_CACHE_TTL_RSI_MID
         return WAIT_CACHE_TTL_RSI_HOT
 
-    def _get_max_open_orders(self):
-        """Return max simultaneous open orders from DB (default 10)."""
-        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_MAX_OPEN_ORDERS)
-        if val is None or not str(val).isdigit():
-            return shared_config.MAX_OPEN_ORDERS_DEFAULT
-        return max(1, min(50, int(val)))
-
-    def _get_open_order_count(self):
-        """Return number of open orders in DB."""
-        try:
-            with shared_db.get_connection() as conn:
-                shared_db.init_schema(conn)
-                return len(shared_db.get_open_orders(conn))
-        except Exception:
-            return 0
-
     def _get_performance_section(self) -> str:
         """Build a self-calibration block from the last 20 resolved BUY signals.
 
@@ -229,6 +213,26 @@ class Brain:
             f"- Avg Net PnL: {avg_pnl:+.2f} USDT per trade\n"
             f"- Self-calibration directive: {directive}\n\n"
         )
+
+    def _get_btc_bias(self, btc_ctx: dict) -> str:
+        """Return only the bias label from BTC context without building the formatted text."""
+        ema_1h = (btc_ctx.get("ema_stack_1h") or {})
+        ema_15m = (btc_ctx.get("ema_stack_15m") or {})
+        macd = (btc_ctx.get("macd_15m") or {})
+        rsi = btc_ctx.get("rsi")
+        ema_1h_align = ema_1h.get("alignment", "MIXED")
+        ema_15m_align = ema_15m.get("alignment", "MIXED")
+        macd_bullish = (macd.get("histogram") or 0) > 0
+        rsi_val = float(rsi) if rsi is not None else 50.0
+        bearish = {"BEARISH", "WEAKENING"}
+        bullish = {"BULLISH", "RECOVERING"}
+        if ema_1h_align in bearish and ema_15m_align in bearish and rsi_val < 40:
+            return "STRONG_BEARISH"
+        if ema_1h_align in bearish and not macd_bullish:
+            return "BEARISH_HEADWIND"
+        if ema_1h_align in bullish and macd_bullish:
+            return "BULLISH_TAILWIND"
+        return "NEUTRAL"
 
     def _get_btc_context(self) -> dict | None:
         """Read BTC market context from Redis (published by Filter each cycle).
@@ -650,7 +654,7 @@ Respond with ONLY the JSON object.
             # The AI cannot override this — if conditions aren't met, no GPT calls are made.
             btc_ctx = self._get_btc_context()
             if btc_ctx:
-                _, btc_bias_now = self._format_btc_context_for_prompt(btc_ctx)
+                btc_bias_now = self._get_btc_bias(btc_ctx)
                 if btc_bias_now == "STRONG_BEARISH":
                     log.info(
                         "Brain: STRONG_BEARISH BTC — blocking all altcoin analysis "
@@ -662,8 +666,8 @@ Respond with ONLY the JSON object.
                 btc_bias_now = "NEUTRAL"
 
             # Do not call OpenAI when at max open orders (no new orders would be placed)
-            open_count = self._get_open_order_count()
-            max_open = self._get_max_open_orders()
+            open_count = shared_db.get_open_order_count()
+            max_open = shared_db.get_max_open_orders()
 
             # Under BEARISH_HEADWIND, halve the effective position limit to reduce
             # simultaneous correlated exposure (all alts will fall together with BTC)
@@ -682,8 +686,8 @@ Respond with ONLY the JSON object.
 
             for item in candidates:
                 # Re-check at max capacity before each item (avoids race: 10th order opened after batch start)
-                open_count = self._get_open_order_count()
-                max_open = self._get_max_open_orders()
+                open_count = shared_db.get_open_order_count()
+                max_open = shared_db.get_max_open_orders()
                 if open_count >= max_open:
                     log.info(f"Brain: Stopping (max open orders reached: {open_count}/{max_open})")
                     break
@@ -750,7 +754,7 @@ Respond with ONLY the JSON object.
                 final_signal = {**item, **analysis, "signal_id": signal_id}
 
                 # Never send a signal if at max open orders or already have open order for this symbol
-                if self._get_open_order_count() >= self._get_max_open_orders():
+                if shared_db.get_open_order_count() >= shared_db.get_max_open_orders():
                     log.info(f"Brain: Not sending signal for {symbol} (max open orders reached)")
                     continue
                 try:

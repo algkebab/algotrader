@@ -1,11 +1,15 @@
 import json
+import math
 import os
 import sys
 import time
-import redis
+
 import ccxt
-from datetime import datetime
-import math
+import redis
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Allow importing shared.db
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -108,8 +112,8 @@ class Monitor:
 
                     # Time-stop: close positions open longer than 48 hours (paper only)
                     try:
-                        opened_at = datetime.fromisoformat(trade["opened_at"].replace("Z", ""))
-                        hours_open = (datetime.utcnow() - opened_at).total_seconds() / 3600.0
+                        opened_at = datetime.fromisoformat(trade["opened_at"].replace("Z", "+00:00"))
+                        hours_open = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0
                         if hours_open >= 48:
                             self.close_position(symbol, current_price, "TIME-STOP")
                             continue
@@ -145,152 +149,135 @@ class Monitor:
 
             time.sleep(2)
 
-    def close_position(self, symbol, price, reason):
-        """Close position: update DB and notify (paper mode only, DB-backed)."""
-        margin_usdt = 0.0  # add back locked margin on close
-        order_id_for_close = None
-        try:
-            with shared_db.get_connection() as conn:
-                shared_db.init_schema(conn)
-                row = shared_db.get_open_order_for_symbol(conn, symbol)
-            if not row:
-                return
-            order_id_for_close = row["id"]
-            entry_price = float(row["entry_price"])
-            qty = float(row["quantity"])
-            # amount_usdt in DB is notional; margin = notional / leverage
-            notional_usdt = float(row["amount_usdt"])
-            margin_usdt = notional_usdt / shared_config.LEVERAGE
-        except Exception as e:
-            log.error(f"Monitor: DB error in close_position: {e}")
-            return
+    def _calculate_close_financials(self, row: dict, price: float) -> dict:
+        """Calculate all financial metrics for closing a position.
+
+        Extracted from close_position for testability. Returns a flat dict of
+        all computed values needed for DB writes and notifications.
+        """
+        entry_price = float(row["entry_price"])
+        qty = float(row["quantity"])
+        notional_usdt = float(row["amount_usdt"])
+        margin_usdt = notional_usdt / shared_config.LEVERAGE
 
         gross_pnl_usdt = (price - entry_price) * qty
         gross_pnl_percent = ((price / entry_price) - 1) * 100
+        exit_fee_usd = qty * price * shared_config.BINANCE_TAKER_FEE
 
-        exit_fee_usd = 0.0
-        margin_interest_paid = 0.0
-        # Fees and margin interest simulation for paper trades
-        exit_notional_usdt = qty * price
-        exit_fee_usd = exit_notional_usdt * shared_config.BINANCE_TAKER_FEE
-
-        # Use stored borrowed_amount and hourly_interest_rate from order when present (Executor saves at entry)
         borrowed_amount = row.get("borrowed_amount")
-        if borrowed_amount is not None:
-            try:
-                borrowed_amount = float(borrowed_amount)
-            except (TypeError, ValueError):
-                borrowed_amount = None
+        try:
+            borrowed_amount = float(borrowed_amount) if borrowed_amount is not None else None
+        except (TypeError, ValueError):
+            borrowed_amount = None
         if borrowed_amount is None:
-            effective_total_balance = notional_usdt / shared_config.LEVERAGE
-            borrowed_amount = max(0.0, notional_usdt - effective_total_balance)
-        hourly_rate = row.get("hourly_interest_rate")
-        if hourly_rate is not None:
-            try:
-                hourly_rate = float(hourly_rate)
-            except (TypeError, ValueError):
-                hourly_rate = shared_config.HOURLY_MARGIN_INTEREST_RATE
-        else:
+            borrowed_amount = max(0.0, notional_usdt - margin_usdt)
+
+        try:
+            hourly_rate = float(row.get("hourly_interest_rate"))
+        except (TypeError, ValueError):
             hourly_rate = shared_config.HOURLY_MARGIN_INTEREST_RATE
 
-        # Hours held (rounded up as on Binance)
         try:
-            opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", ""))
-            now = datetime.utcnow()
-            hours_held = max(1, math.ceil((now - opened_at).total_seconds() / 3600.0))
+            opened_at = datetime.fromisoformat(row["opened_at"].replace("Z", "+00:00"))
+            hours_held = max(1, math.ceil((datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0))
         except Exception:
             hours_held = 1
 
         margin_interest_paid = borrowed_amount * hourly_rate * hours_held
-        total_costs = exit_fee_usd + margin_interest_paid
-        net_pnl_usdt = gross_pnl_usdt - total_costs
-        # Net PnL percent vs margin (ROE after all fees and interest)
-        equity_usdt = margin_usdt if margin_usdt else notional_usdt
-        net_pnl_pct = (net_pnl_usdt / equity_usdt) * 100 if equity_usdt else 0.0
+        net_pnl_usdt = gross_pnl_usdt - exit_fee_usd - margin_interest_paid
+        net_pnl_pct = (net_pnl_usdt / margin_usdt) * 100 if margin_usdt else 0.0
 
-        log.info(
-            f"Monitor: Closing {symbol} at {price}. "
-            f"Gross PnL: {gross_pnl_usdt:.2f} USDT ({gross_pnl_percent:.2f}%), "
-            f"Fees/Interest: {total_costs:.2f} USDT "
-            f"-> Net PnL: {net_pnl_usdt:.2f} USDT ({net_pnl_pct:.2f}%) [{reason}] (paper margin simulation)"
-        )
-
-        # Extra metadata for Messenger (fees, interest, strategy, holding time)
-        data_payload = {
-            "symbol": symbol,
-            "entry": entry_price,
-            "exit": price,
-            "pnl_usdt": round(net_pnl_usdt, 2),
-            "pnl_percent": round(net_pnl_pct, 2),
-            "reason": reason,
-            "gross_pnl_usdt": round(gross_pnl_usdt, 2),
-            "gross_pnl_percent": round(gross_pnl_percent, 2),
-            "exit_fee_usd": round(exit_fee_usd, 4),
-            "margin_interest_paid": round(margin_interest_paid, 4),
-            "net_pnl_pct": round(net_pnl_pct, 2),
+        return {
+            "margin_usdt": margin_usdt,
+            "gross_pnl_usdt": gross_pnl_usdt,
+            "gross_pnl_percent": gross_pnl_percent,
+            "exit_fee_usd": exit_fee_usd,
+            "margin_interest_paid": margin_interest_paid,
+            "net_pnl_usdt": net_pnl_usdt,
+            "net_pnl_pct": net_pnl_pct,
             "hours_held": hours_held,
-            "strategy_name": row.get("strategy_name"),
         }
 
-        notification = {
-            "type": "trade_closed",
-            "data": data_payload,
-        }
-        self.db.rpush('notifications', json.dumps(notification))
-
-        # Retrieve final MFE/MAE from memory (populated during the monitoring loop)
-        trade_mfe = self._extremes.get(order_id_for_close, {}).get('mfe') if order_id_for_close else None
-        trade_mae = self._extremes.get(order_id_for_close, {}).get('mae') if order_id_for_close else None
-
+    def close_position(self, symbol, price, reason):
+        """Close position: update DB and notify (paper mode only, DB-backed)."""
+        order_id = None
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
-                order_id = shared_db.get_open_order_id_for_symbol(conn, symbol)
-                if order_id is not None:
-                    shared_db.update_order_closed(
-                        conn,
-                        order_id,
-                        pnl_usdt=round(net_pnl_usdt, 2),
-                        pnl_percent=round(net_pnl_pct, 2),
-                        close_reason=reason,
-                        exit_fee_usd=float(exit_fee_usd),
-                        margin_interest_paid=float(margin_interest_paid),
-                        net_pnl_pct=round(net_pnl_pct, 2),
-                        exit_price=float(price),
-                        hours_held=float(hours_held),
-                        mfe_pct=round(trade_mfe, 3) if trade_mfe is not None else None,
-                        mae_pct=round(trade_mae, 3) if trade_mae is not None else None,
-                    )
-                    bal = shared_db.get_balance(conn, "USDT")
-                    # Paper: new_balance = balance + margin + gross_pnl - exit_fee - interest
-                    new_balance = bal + margin_usdt + gross_pnl_usdt - exit_fee_usd - margin_interest_paid
-                    shared_db.set_balance(conn, "USDT", new_balance)
-                    shared_db.record_daily_pnl(conn, round(net_pnl_usdt, 2))
-        except Exception as db_err:
-            log.warning(f"Monitor: DB update failed: {db_err}")
+                row = shared_db.get_open_order_for_symbol(conn, symbol)
+                if not row:
+                    return
+                order_id = row["id"]
+                fin = self._calculate_close_financials(row, price)
 
-        # Clean up in-memory extremes for closed order
-        if order_id_for_close is not None:
-            self._extremes.pop(order_id_for_close, None)
+                log.info(
+                    f"Monitor: Closing {symbol} at {price}. "
+                    f"Gross PnL: {fin['gross_pnl_usdt']:.2f} USDT ({fin['gross_pnl_percent']:.2f}%), "
+                    f"Fees/Interest: {fin['exit_fee_usd'] + fin['margin_interest_paid']:.2f} USDT "
+                    f"-> Net PnL: {fin['net_pnl_usdt']:.2f} USDT ({fin['net_pnl_pct']:.2f}%) "
+                    f"[{reason}] (paper margin simulation)"
+                )
 
-        # Write trade outcome back to the originating AI signal for self-calibration
-        signal_id = row.get("signal_id")
-        if signal_id:
-            outcome = "WIN" if net_pnl_usdt > 0 else ("BREAKEVEN" if net_pnl_usdt == 0 else "LOSS")
-            try:
-                with shared_db.get_connection() as conn:
-                    shared_db.init_schema(conn)
-                    shared_db.update_signal_outcome(
-                        conn,
-                        signal_id=signal_id,
-                        outcome=outcome,
-                        pnl_usdt=round(net_pnl_usdt, 2),
-                        pnl_pct=round(net_pnl_pct, 2),
-                        close_reason=reason,
-                    )
-                log.info(f"Monitor: Signal outcome recorded ({signal_id[:8]}...): {outcome} {net_pnl_usdt:+.2f} USDT")
-            except Exception as e:
-                log.warning(f"Monitor: Failed to record signal outcome for {symbol}: {e}")
+                trade_mfe = self._extremes.get(order_id, {}).get('mfe')
+                trade_mae = self._extremes.get(order_id, {}).get('mae')
+                shared_db.update_order_closed(
+                    conn, order_id,
+                    pnl_usdt=round(fin['net_pnl_usdt'], 2),
+                    pnl_percent=round(fin['net_pnl_pct'], 2),
+                    close_reason=reason,
+                    exit_fee_usd=round(fin['exit_fee_usd'], 4),
+                    margin_interest_paid=round(fin['margin_interest_paid'], 4),
+                    net_pnl_pct=round(fin['net_pnl_pct'], 2),
+                    exit_price=float(price),
+                    hours_held=float(fin['hours_held']),
+                    mfe_pct=round(trade_mfe, 3) if trade_mfe is not None else None,
+                    mae_pct=round(trade_mae, 3) if trade_mae is not None else None,
+                )
+
+                bal = shared_db.get_balance(conn, "USDT")
+                new_balance = (bal + fin['margin_usdt'] + fin['gross_pnl_usdt']
+                               - fin['exit_fee_usd'] - fin['margin_interest_paid'])
+                shared_db.set_balance(conn, "USDT", new_balance)
+                shared_db.record_daily_pnl(conn, round(fin['net_pnl_usdt'], 2))
+
+                signal_id = row.get("signal_id")
+                if signal_id:
+                    outcome = "WIN" if fin['net_pnl_usdt'] > 0 else ("BREAKEVEN" if fin['net_pnl_usdt'] == 0 else "LOSS")
+                    try:
+                        shared_db.update_signal_outcome(
+                            conn, signal_id=signal_id,
+                            outcome=outcome,
+                            pnl_usdt=round(fin['net_pnl_usdt'], 2),
+                            pnl_pct=round(fin['net_pnl_pct'], 2),
+                            close_reason=reason,
+                        )
+                        log.info(f"Monitor: Signal outcome recorded ({signal_id[:8]}...): {outcome} {fin['net_pnl_usdt']:+.2f} USDT")
+                    except Exception as e:
+                        log.warning(f"Monitor: Failed to record signal outcome for {symbol}: {e}")
+
+        except Exception as e:
+            log.error(f"Monitor: DB error in close_position for {symbol}: {e}")
+            return
+
+        self.db.rpush('notifications', json.dumps({
+            "type": "trade_closed",
+            "data": {
+                "symbol": symbol,
+                "entry": float(row["entry_price"]),
+                "exit": price,
+                "pnl_usdt": round(fin['net_pnl_usdt'], 2),
+                "pnl_percent": round(fin['net_pnl_pct'], 2),
+                "reason": reason,
+                "gross_pnl_usdt": round(fin['gross_pnl_usdt'], 2),
+                "gross_pnl_percent": round(fin['gross_pnl_percent'], 2),
+                "exit_fee_usd": round(fin['exit_fee_usd'], 4),
+                "margin_interest_paid": round(fin['margin_interest_paid'], 4),
+                "net_pnl_pct": round(fin['net_pnl_pct'], 2),
+                "hours_held": fin['hours_held'],
+                "strategy_name": row.get("strategy_name"),
+            },
+        }))
+        self._extremes.pop(order_id, None)
 
 
 if __name__ == "__main__":
