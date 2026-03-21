@@ -338,17 +338,19 @@ class Filter:
         btc_raw = self.db.get("market_data:BTC/USDT")
 
         if not btc_raw:
-            log.debug("Filter: market_data:BTC/USDT not in Redis — btc_context not updated")
+            log.warning("Filter: market_data:BTC/USDT not in Redis — Scout hasn't written BTC data yet")
             return
 
         try:
             data = json.loads(btc_raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            log.warning(f"Filter: market_data:BTC/USDT JSON decode error: {e}")
             return
 
         candles_15m = data.get('candles_15m', [])
         candles_1h = data.get('candles_1h', [])
         if not candles_15m:
+            log.warning("Filter: market_data:BTC/USDT has no candles_15m — cannot compute BTC context")
             return
 
         rsi = self.calculate_rsi(candles_15m)

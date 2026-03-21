@@ -686,7 +686,7 @@ class Messenger:
                 else:
                     lines.append("💵 Balance: — (DB error)")
 
-                # BTC market bias
+                # BTC market bias — try full computed context first, then raw Scout data, then live fetch
                 try:
                     btc_raw = self.db.get(shared_config.REDIS_KEY_BTC_CONTEXT)
                     if btc_raw:
@@ -715,9 +715,28 @@ class Messenger:
                         change_str = f" ({btc_change:+.1f}%)" if btc_change is not None else ""
                         lines.append(f"📡 BTC: {btc_price_str}{change_str} · {bias_label}")
                     else:
-                        lines.append("📡 BTC: — (no data yet)")
-                except Exception:
-                    lines.append("📡 BTC: — (error)")
+                        # Fallback 1: raw Scout data (available earlier than computed context)
+                        scout_raw = self.db.get("market_data:BTC/USDT")
+                        if scout_raw:
+                            scout_btc = json.loads(scout_raw)
+                            btc_price = scout_btc.get("last_price")
+                            btc_change = scout_btc.get("change_24h")
+                            btc_price_str = f"${float(btc_price):,.0f}" if btc_price else "—"
+                            change_str = f" ({btc_change:+.1f}%)" if btc_change is not None else ""
+                            lines.append(f"📡 BTC: {btc_price_str}{change_str} · _(bias computing...)_")
+                        else:
+                            # Fallback 2: live fetch directly from exchange
+                            try:
+                                ticker = self.exchange.fetch_ticker("BTC/USDT")
+                                btc_price = ticker.get("last")
+                                btc_change = ticker.get("percentage")
+                                btc_price_str = f"${float(btc_price):,.0f}" if btc_price else "—"
+                                change_str = f" ({btc_change:+.1f}%)" if btc_change is not None else ""
+                                lines.append(f"📡 BTC: {btc_price_str}{change_str} · _(Scout starting...)_")
+                            except Exception:
+                                lines.append("📡 BTC: — (Scout not ready)")
+                except Exception as e:
+                    lines.append(f"📡 BTC: — (error: {e})")
 
                 # Scout freshness + candidates in queue
                 try:
