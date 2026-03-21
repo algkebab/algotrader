@@ -134,6 +134,8 @@ class Messenger:
 
         # Exchange for current price (orders command); public API only
         self.exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+        self.exchange.load_markets()
+        log.info("Messenger: Markets loaded")
 
         self.application = (
             Application.builder()
@@ -196,8 +198,9 @@ class Messenger:
                     pnl_line = f"\n   {pnl_emoji} Unrealized PnL: {pnl_sign}{unrealized:.2f} USDT"
                 else:
                     pnl_line = ""
-            except Exception:
-                now_str = "—"
+            except Exception as e:
+                log.error(f"Messenger: fetch_ticker failed for {symbol}: {e}")
+                now_str = f"⚠️ price error: {e}"
                 pnl_line = ""
             lines.append(
                 f"{i}. {symbol}\n"
@@ -467,8 +470,9 @@ class Messenger:
                     sign = "+" if unrealized >= 0 else ""
                     em = "📈" if unrealized >= 0 else "📉"
                     parts.append(f"  {em} {symbol}: {sign}{unrealized:.2f} USDT")
-                except Exception:
-                    parts.append(f"  ➡️ {symbol}: —")
+                except Exception as e:
+                    log.error(f"Messenger: fetch_ticker failed for {symbol}: {e}")
+                    parts.append(f"  ⚠️ {symbol}: price error — {e}")
             if open_orders and total_unrealized != 0:
                 sign = "+" if total_unrealized >= 0 else ""
                 parts.append(f"  Total unrealized: {sign}{total_unrealized:.2f} USDT")

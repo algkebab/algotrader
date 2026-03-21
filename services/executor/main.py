@@ -59,6 +59,9 @@ class Executor:
         else:
             log.info("Executor: Running in BINANCE REAL MARGIN mode")
 
+        self.exchange.load_markets()
+        log.info("Executor: Markets loaded")
+
     def get_precision_amount(self, symbol, amount):
         """Adjusts the coin amount to the exchange's required precision."""
         self.exchange.load_markets()
