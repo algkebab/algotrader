@@ -49,15 +49,15 @@ class Executor:
             'apiKey': os.getenv('BINANCE_API_KEY'),
             'secret': os.getenv('BINANCE_SECRET'),
             'enableRateLimit': True,
-            'options': {'defaultType': 'spot'}
+            'options': {'defaultType': 'margin'}
         })
 
-        # Activation of Sandbox (Binance Spot Testnet)
+        # Activation of Sandbox (Binance Margin Testnet)
         if os.getenv('IS_TESTNET', 'true').lower() == 'true':
             self.exchange.set_sandbox_mode(True)
-            log.warning("Executor: Running in BINANCE SPOT TESTNET mode")
+            log.warning("Executor: Running in BINANCE MARGIN TESTNET mode")
         else:
-            log.info("Executor: Running in BINANCE REAL SPOT mode")
+            log.info("Executor: Running in BINANCE REAL MARGIN mode")
 
     def get_precision_amount(self, symbol, amount):
         """Adjusts the coin amount to the exchange's required precision."""
@@ -223,7 +223,7 @@ class Executor:
                 # Margin required with leverage and entry fee (taker fee on notional)
                 margin_usdt = final_notional_usdt / shared_config.LEVERAGE
                 borrowed_amount = max(0.0, final_notional_usdt - margin_usdt)
-                entry_fee_usd = final_notional_usdt * shared_config.BINANCE_SPOT_FEE
+                entry_fee_usd = final_notional_usdt * shared_config.BINANCE_TAKER_FEE
                 total_entry_cost = margin_usdt + entry_fee_usd
                 if current_bal < total_entry_cost:
                     log.error(f"Executor: Paper order skipped: insufficient balance for margin+fee "
@@ -249,6 +249,7 @@ class Executor:
                     strategy_name=strategy_name,
                     session=session,
                     signal_id=signal_id,
+                    balance_at_entry=float(current_bal),
                 )
             log.info(f"Executor: Risking ${risk_amount:.2f} to buy ${final_notional_usdt:.2f} worth of {symbol} (Leverage: {shared_config.LEVERAGE}x)")
             result = {

@@ -1,5 +1,6 @@
 """Brain service: strategy execution and GPT analysis."""
 import json
+import math
 import os
 import sys
 import time
@@ -23,34 +24,78 @@ if _root not in sys.path:
 from shared import config as shared_config
 from shared import db as shared_db
 from shared import logger as shared_logger
+from shared.version import BOT_VERSION
 
 load_dotenv()
 
 log = shared_logger.get_logger("brain")
 
-# AI system prompts per AI strategy (set via Telegram "set strategy <name>")
+# AI system prompts per strategy — each defines a concrete decision framework,
+# not just a persona. The AI is told HOW to reason, not just who it is.
 STRATEGY_SYSTEM_MESSAGES = {
-    "conservative": (
-        "You are an expert crypto day-trader in CONSERVATIVE mode. "
-        "Focus on high-probability setups only. Require strong volume confirmation, "
-        "RSI below 70, and clean technical structure before considering BUY. "
-        "Prefer WAIT unless the setup is very clear, with asymmetric risk/reward and "
-        "a logical stop below recent support."
-    ),
-    "aggressive": (
-        "You are an expert crypto day-trader in AGGRESSIVE mode. "
-        "Focus on momentum and breakouts with higher risk tolerance. "
-        "You may accept RSI up to 85 when strong volume and trend continuation justify it. "
-        "Still avoid chasing obvious exhaustion wicks; look for continuation patterns, "
-        "strong breakouts, and clear invalidation levels for the stop loss."
-    ),
-    "reversal": (
-        "You are an expert crypto day-trader in REVERSAL mode. "
-        "Focus on identifying oversold exhaustion and potential bounces from local bottoms. "
-        "Look for RSI below 30, price-action rejection at or near the lows of the recent range, "
-        "and signs of seller exhaustion (long lower wicks, volume spikes on bounces). "
-        "Avoid late entries after the move has already bounced far from the lows."
-    ),
+    "conservative": """You are a professional crypto trader with 10+ years of experience, \
+trained at a quantitative prop desk. You are currently operating in CONSERVATIVE mode \
+where capital preservation is the primary objective.
+
+Your decision framework (apply in order):
+1. Higher-timeframe bias first: the 1h trend must be BULLISH or NEUTRAL. \
+   A bearish 1h trend is an immediate disqualifier — do not fight it.
+2. Structure before indicators: read the 1h and 15m candle sequence for higher highs / \
+   higher lows (uptrend) vs lower highs / lower lows (downtrend) vs consolidation. \
+   Indicators confirm what price structure shows, they do not replace it.
+3. Confluence minimum: require at least 3 of these 5 signals aligned bullishly before BUY — \
+   (a) price above VWAP, (b) 15m EMA stack bullish, (c) MACD histogram positive and growing, \
+   (d) RSI 45–65 (momentum without overbought), (e) RVOL ≥ 2.0 confirming participation.
+4. Volume context: a price move on below-average volume is a fakeout. \
+   Volume must expand on the breakout candle or the move preceding entry.
+5. Risk definition before profit: identify the exact stop level (below last key low or \
+   lowest wick in recent 15m range) BEFORE evaluating the TP. \
+   If you cannot find a logical stop, the trade does not exist.
+6. Minimum R:R 2.5:1. If the nearest visible resistance does not give 2.5× the SL distance, WAIT.
+7. When in doubt, WAIT. A missed trade costs nothing. A bad trade costs real money.""",
+
+    "aggressive": """You are a professional crypto trader with 10+ years of experience, \
+specializing in momentum breakouts and trend continuation. \
+You are currently operating in AGGRESSIVE mode.
+
+Your decision framework (apply in order):
+1. Momentum identification: you are looking for breakouts with strong volume expansion \
+   and EMA trend alignment, not overextended chases. Momentum must be fresh.
+2. Timeframe alignment: 15m EMA stack bullish is required. \
+   1h neutral is acceptable; 1h bullish is ideal. 1h bearish = only take if 15m momentum is \
+   exceptionally strong with RVOL ≥ 3.0.
+3. Volume confirmation: RVOL ≥ 1.5 minimum. On breakout setups, volume must expand \
+   above the average of the last 5 candles.
+4. Momentum freshness: MACD histogram must be positive. If histogram is positive but shrinking \
+   for 2+ bars, momentum is fading — consider WAIT.
+5. Entry quality: price breaking above a clear resistance level with body close above it \
+   is an A-grade entry. Price in the middle of a range with no clear trigger is B-grade or lower.
+6. Risk definition: always identify a specific stop level. RSI up to 85 is acceptable \
+   but the stop must still sit below a structural low, not be set arbitrarily.
+7. Minimum R:R 2.0:1. Accept 1.8:1 only if momentum is exceptionally strong (RVOL > 3, \
+   strong MACD, multiple timeframe alignment).""",
+
+    "reversal": """You are a professional crypto trader with 10+ years of experience, \
+specializing in identifying exhaustion and capitulation at market lows. \
+You are currently operating in REVERSAL mode — you are a counter-trend hunter.
+
+Your decision framework (apply in order):
+1. Oversold exhaustion is required: RSI must be below 30 on the 15m. \
+   RSI 30–40 means the bounce has already started — too late, WAIT for the next setup.
+2. Price location: price must be at or near the lower Bollinger Band (%B ≤ 25%). \
+   A reversal entry 10%+ above the recent swing low is chasing, not reversing.
+3. Seller exhaustion signals — look for ALL of these in the 15m candles: \
+   (a) long lower wicks (rejection), (b) decreasing sell volume on recent down bars, \
+   (c) MACD histogram bearish but magnitude shrinking (momentum exhausting). \
+   Two out of three is minimum. All three is ideal.
+4. Candle confirmation: a bullish engulfing, hammer, or doji with lower wick \
+   on increasing volume is the entry trigger. Do not enter on a still-falling candle.
+5. 1h trend context: 1h will be bearish — that is expected. \
+   But the 1h MACD histogram should be slowing (bars getting smaller), not accelerating.
+6. Wider stops accepted: stops must go below the most recent swing low. \
+   This is often 2–4% — this is correct for reversal trades.
+7. Minimum R:R 3.0:1 — counter-trend trades have lower win rate and must compensate with \
+   larger reward. If you cannot find a 3:1 target in the candle structure, WAIT.""",
 }
 
 STRATEGY_DEFAULT = "CONSERVATIVE"
@@ -185,81 +230,348 @@ class Brain:
             f"- Self-calibration directive: {directive}\n\n"
         )
 
-    def get_ai_verdict(self, symbol, price, rsi, rvol, candles, high_24h, low_24h):
-        """Sends technical data to GPT for a high-level trading verdict with TP/SL targets.
+    def _get_btc_context(self) -> dict | None:
+        """Read BTC market context from Redis (published by Filter each cycle).
+
+        Returns None when the key is missing or stale (TTL expired).
+        """
+        raw = self.db.get(shared_config.REDIS_KEY_BTC_CONTEXT)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def _format_btc_context_for_prompt(self, btc_ctx: dict) -> tuple[str, str]:
+        """Format BTC context as a natural-language block and derive the market bias label.
+
+        Returns (formatted_section: str, bias_label: str).
+        bias_label is one of: BULLISH_TAILWIND, NEUTRAL, BEARISH_HEADWIND, STRONG_BEARISH.
+        """
+        lines = []
+
+        price = btc_ctx.get("price")
+        change_24h = btc_ctx.get("change_24h")
+        rsi = btc_ctx.get("rsi")
+        vwap_pct = btc_ctx.get("vwap_pct")
+        ema_15m = btc_ctx.get("ema_stack_15m") or {}
+        ema_1h = btc_ctx.get("ema_stack_1h") or {}
+        macd = btc_ctx.get("macd_15m") or {}
+
+        if price is not None:
+            change_str = f" ({change_24h:+.2f}% 24h)" if change_24h is not None else ""
+            lines.append(f"- BTC Price: ${float(price):,.2f}{change_str}")
+
+        if rsi is not None:
+            lines.append(f"- BTC RSI (15m): {rsi}")
+
+        if vwap_pct is not None:
+            direction = "above" if vwap_pct > 0 else "below"
+            lines.append(f"- BTC vs VWAP: {abs(vwap_pct):.2f}% {direction} VWAP")
+
+        if ema_15m.get("description"):
+            lines.append(f"- BTC EMA Stack (15m): {ema_15m['description']}")
+
+        if ema_1h.get("description"):
+            lines.append(f"- BTC EMA Stack (1h): {ema_1h['description']}")
+
+        if macd.get("histogram") is not None:
+            h = macd["histogram"]
+            h_prev = macd.get("histogram_prev")
+            sign = "bullish" if h > 0 else "bearish"
+            momentum = ""
+            if h_prev is not None:
+                momentum = ", strengthening" if abs(h) > abs(h_prev) else ", weakening"
+            lines.append(f"- BTC MACD (15m): histogram={h:+.6g} ({sign}{momentum})")
+
+        # Derive market bias from 1h EMA alignment + MACD + RSI
+        ema_1h_align = ema_1h.get("alignment", "MIXED")
+        ema_15m_align = ema_15m.get("alignment", "MIXED")
+        macd_bullish = (macd.get("histogram") or 0) > 0
+        rsi_value = float(rsi) if rsi is not None else 50.0
+
+        bearish_alignments = {"BEARISH", "WEAKENING"}
+        bullish_alignments = {"BULLISH", "RECOVERING"}
+
+        if ema_1h_align in bearish_alignments and ema_15m_align in bearish_alignments and rsi_value < 40:
+            bias = "STRONG_BEARISH"
+            bias_label = "STRONG BEARISH — avoid all altcoin longs"
+        elif ema_1h_align in bearish_alignments and not macd_bullish:
+            bias = "BEARISH_HEADWIND"
+            bias_label = "BEARISH HEADWIND — significantly raise the entry bar"
+        elif ema_1h_align in bullish_alignments and macd_bullish:
+            bias = "BULLISH_TAILWIND"
+            bias_label = "BULLISH TAILWIND — standard entry criteria apply"
+        else:
+            bias = "NEUTRAL"
+            bias_label = "NEUTRAL — evaluate altcoin on own merits, raise selectivity slightly"
+
+        lines.append(f"→ Market Bias: {bias_label}")
+        return "\n".join(lines), bias
+
+    def _format_indicators_for_prompt(self, price: float, indicators: dict) -> str:
+        """Format computed technical indicators as natural-language lines for the AI prompt."""
+        lines = []
+
+        # VWAP — institutional price benchmark
+        vwap = indicators.get("vwap")
+        if vwap and price:
+            pct = (price - vwap) / vwap * 100
+            direction = "above" if pct > 0 else "below"
+            lines.append(f"- VWAP: {vwap:.6g} — price is {abs(pct):.2f}% {direction} VWAP")
+
+        # ATR — volatility-adjusted stop guide
+        atr = indicators.get("atr")
+        if atr and price:
+            atr_pct = atr / price * 100
+            suggested_sl_pct = round(atr_pct * 1.5, 2)
+            lines.append(
+                f"- ATR (14, 15m): {atr:.6g} ({atr_pct:.2f}% of price) "
+                f"→ 1.5× ATR suggested SL = {suggested_sl_pct:.2f}% below entry"
+            )
+
+        # EMA stack (15m) — short-term entry trend
+        ema_15m = indicators.get("ema_stack_15m")
+        if ema_15m:
+            lines.append(f"- EMA Stack (15m): {ema_15m['description']}")
+
+        # EMA stack (1h) — higher-timeframe trend bias
+        ema_1h = indicators.get("ema_stack_1h")
+        if ema_1h:
+            lines.append(f"- EMA Stack (1h, trend bias): {ema_1h['description']}")
+
+        # Bollinger Bands — volatility squeeze and price position
+        bb = indicators.get("bollinger_15m")
+        if bb:
+            pct_b = bb["pct_b"]
+            bw = bb["bandwidth"]
+            if pct_b > 80:
+                bb_zone = "near upper band — overbought or breakout continuation"
+            elif pct_b < 20:
+                bb_zone = "near lower band — oversold or breakdown continuation"
+            else:
+                bb_zone = "mid-range"
+            squeeze = (
+                "squeeze — breakout likely soon" if bw < 2.0
+                else ("expanding" if bw > 5.0 else "normal")
+            )
+            lines.append(
+                f"- Bollinger Bands (15m): %B={pct_b:.0f}% ({bb_zone}), "
+                f"bandwidth={bw:.1f}% ({squeeze})"
+            )
+
+        # MACD histogram — momentum direction
+        macd = indicators.get("macd_15m")
+        if macd:
+            h = macd["histogram"]
+            h_prev = macd.get("histogram_prev")
+            sign = "bullish" if h > 0 else "bearish"
+            momentum = ""
+            if h_prev is not None:
+                momentum = ", strengthening" if abs(h) > abs(h_prev) else ", weakening"
+            lines.append(f"- MACD (15m): histogram={h:+.6g} ({sign}{momentum})")
+
+        return "\n".join(lines) if lines else "  N/A (indicators unavailable)"
+
+    def get_ai_verdict(self, symbol, price, rsi, rvol, candles_15m, candles_1h,
+                       high_24h, low_24h, indicators=None, change_24h=None, volume_24h=None):
+        """Send enriched technical data to GPT for a trading verdict with TP/SL targets.
 
         Returns a tuple: (parsed_response_dict, signal_id).
         """
         signal_id = str(uuid.uuid4())
+        indicators = indicators or {}
 
-        recent_candles = candles[-5:] if candles else []
-        candle_summary = [f"Close: {c[4]}, Vol: {c[5]}" for c in recent_candles]
+        # Recent 15m candles for entry price action context (last 15 = ~3.75 hours)
+        recent_15m = candles_15m[-15:] if candles_15m else []
+        candle_15m_lines = [
+            f"  O:{c[1]:.6g} H:{c[2]:.6g} L:{c[3]:.6g} C:{c[4]:.6g} V:{c[5]:.0f}"
+            for c in recent_15m
+        ]
 
-        # 24h range context
+        # Recent 1h candles for trend context (last 10 = ~10 hours, full OHLCV for structure)
+        recent_1h = candles_1h[-10:] if candles_1h else []
+        candle_1h_lines = [
+            f"  O:{c[1]:.6g} H:{c[2]:.6g} L:{c[3]:.6g} C:{c[4]:.6g} V:{c[5]:.0f}"
+            for c in recent_1h
+        ]
+
+        # 24h range
         high_str = "N/A" if high_24h is None else f"{high_24h}"
         low_str = "N/A" if low_24h is None else f"{low_24h}"
 
         strategy = self._get_strategy_name()
-
         symbol_base = symbol.split("/")[0] if "/" in symbol else symbol
         is_major = symbol_base in {"BTC", "ETH"}
 
         performance_section = self._get_performance_section()
+        indicators_section = self._format_indicators_for_prompt(price, indicators)
+
+        # BTC macro context — only relevant for non-BTC symbols
+        btc_section = ""
+        btc_bias = "NEUTRAL"
+        if symbol_base != "BTC":
+            btc_ctx = self._get_btc_context()
+            if btc_ctx:
+                btc_section_text, btc_bias = self._format_btc_context_for_prompt(btc_ctx)
+                btc_section = f"\n### BTC Market Context (macro barometer)\n{btc_section_text}\n"
+
+        # ATR-based SL hint for the rules section
+        atr = indicators.get("atr")
+        atr_sl_hint = ""
+        if atr and price:
+            atr_pct = atr / price * 100
+            atr_sl_pct = round(atr_pct * 1.5, 2)
+            atr_sl_hint = (
+                f" The ATR-based guide for this symbol is {atr_sl_pct:.2f}% (1.5× ATR)."
+                f" Use this as your primary SL sizing reference when it exceeds 1.2%."
+            )
 
         prompt = f"""
-{performance_section}Analyze this crypto trade setup for {symbol} in the context of the current market:
+{performance_section}## Market Data: {symbol}
+Active Strategy: {strategy}
+{btc_section}
+### Price Context
 - Current Price: {price}
-- 24h High: {high_str}
-- 24h Low: {low_str}
-- RSI (14): {rsi}
-- Relative Volume (RVOL): {rvol}
-- Recent Price Action (Last 5 candles): {', '.join(candle_summary) if candle_summary else 'N/A'}
-- Active strategy from the pipeline: {strategy}
+- 24h High: {high_str} | 24h Low: {low_str}
+- RSI (14, 15m): {rsi}
+- Relative Volume (RVOL): {rvol}x average
 
-You must act as a strategic architect for entries and exits, not just a simple yes/no filter.
+### Computed Indicators
+{indicators_section}
 
-Return a STRICT JSON object with this exact schema:
+### 15m Candles — last {len(recent_15m)} bars [timestamp, O, H, L, C, Vol]
+(Entry structure — read for higher highs/lows, candle patterns, breakout levels)
+{chr(10).join(candle_15m_lines) if candle_15m_lines else "  N/A"}
+
+### 1h Candles — last {len(recent_1h)} bars [timestamp, O, H, L, C, Vol]
+(Trend structure — read for dominant trend direction and key swing levels)
+{chr(10).join(candle_1h_lines) if candle_1h_lines else "  N/A"}
+
+---
+## Your Analysis Task
+
+Work through the following steps in your response. Each field in the JSON is a reasoning step — \
+fill them sequentially, as each step informs the next.
+
+**Step 1 — 1h Trend Structure:**
+Read the 1h candle sequence. Is price making higher highs and higher lows (uptrend), \
+lower highs and lower lows (downtrend), or ranging between levels (consolidation)? \
+What are the key swing high and swing low visible in the 1h data?
+
+**Step 2 — 15m Setup:**
+Read the 15m candle sequence. What pattern is forming — breakout above resistance, \
+pullback to support, range compression, or exhaustion? \
+Identify any significant candlestick patterns (hammer, engulfing, doji, shooting star, \
+inside bar). What is the most recent key low that defines the stop?
+
+**Step 3 — Volume Context:**
+Is RVOL above or below normal? Does the volume action confirm the price move \
+(expansion on directional bars, contraction on pullbacks) or contradict it \
+(price rising on declining volume = weak)? Is there institutional participation?
+
+**Step 4 — Indicator Confluence:**
+List every signal that argues FOR a long trade. \
+Then list every signal that argues AGAINST it. \
+Count the confluence. Be honest about contradictions — do not ignore them.
+
+**Step 5 — Risk Definition (stop first, profit second):**
+Identify the exact structural stop level from the candle data \
+(below the last key low or lowest wick in the 15m range). \
+Convert to a percentage below current price. \
+Then identify the nearest meaningful resistance from the candle data as the TP target. \
+Calculate the actual R:R ratio.{atr_sl_hint}
+
+**Step 6 — Timeframe Conflict Rule:**
+If the 15m setup is bullish but the 1h trend is bearish: \
+CONSERVATIVE = WAIT; AGGRESSIVE = only if 15m momentum is extremely strong (RVOL > 3); \
+REVERSAL = expected, assess exhaustion quality instead.
+
+**Step 7 — BTC Macro Correlation:**
+BTC drives 60–85% of altcoin price movement. Current BTC bias: {btc_bias}.
+Apply these rules strictly:
+- BULLISH_TAILWIND: standard entry criteria from your strategy apply.
+- NEUTRAL: raise selectivity by one level — prefer A-grade setups, flag uncertainty in reason.
+- BEARISH_HEADWIND: require A-grade setup minimum; reduce TP to nearest visible resistance \
+  (do not reach for extended targets); lean towards WAIT on any marginal setup.
+- STRONG_BEARISH: verdict must be WAIT regardless of the altcoin's own setup. \
+  Document BTC as the reason. Do not override this rule.
+
+**Step 8 — Final Verdict:**
+Apply the {strategy} strategy criteria from your system instructions \
+(including the BTC macro rule above). \
+Is this an A-grade setup (3+ strong confluence signals, clear structure, logical SL) \
+or B-grade (mixed signals, weak volume, unclear structure)? \
+CONSERVATIVE and REVERSAL require A-grade. AGGRESSIVE may accept B-grade with strong momentum.
+
+---
+Return your full analysis as a single JSON object with this exact schema \
+(no extra keys, no comments):
 {{
-  "verdict": "BUY" or "WAIT",
-  "stop_loss_pct": "Float (e.g., 1.5 for 1.5% below entry)",
-  "take_profit_pct": "Float (e.g., 4.5 for 4.5% above entry)",
-  "reason": "Technical justification for these specific levels and the verdict",
-  "confidence": "0-100%"
+  "trend_1h": "BULLISH | BEARISH | NEUTRAL — describe the HH/HL or LH/LL structure seen",
+  "setup_15m": "BREAKOUT | PULLBACK | REVERSAL | CONSOLIDATION | NONE — describe the specific pattern",
+  "candle_patterns": "Any significant patterns identified (e.g. hammer at support, bearish engulfing) or NONE",
+  "volume_verdict": "CONFIRMING | NEUTRAL | CONTRADICTING — one sentence on volume-price relationship",
+  "confluence_signals": ["list each signal that supports a long entry"],
+  "conflicting_signals": ["list each signal that argues against a long entry"],
+  "setup_grade": "A | B | C",
+  "verdict": "BUY | WAIT",
+  "stop_loss_pct": 0.0,
+  "take_profit_pct": 0.0,
+  "rr_ratio": 0.0,
+  "confidence": 0,
+  "reason": "2-3 sentence synthesis: trend context + entry trigger + what confirms + what invalidates"
 }}
 
-Rules for stop_loss_pct (very important):
-- stop_loss_pct is the percentage distance BELOW the entry price where the stop should be placed.
-- For ALL symbols you MUST use stop_loss_pct >= 1.2 (never tighter than 1.2%).
-- Place the stop loss below the recent local support or the lowest wick of the last 5 candles when possible.
-- Avoid unrealistically tight stops that will be hit by normal intraday noise.
+Rules (non-negotiable):
+- stop_loss_pct: percentage BELOW entry. Minimum 1.2%. Must be anchored to a structural level.
+- take_profit_pct: percentage ABOVE entry. Anchored to visible resistance in the candle data.
+- rr_ratio: take_profit_pct / stop_loss_pct. Must meet your strategy's minimum R:R.
+- confidence: integer 0–100, defined as: (number of confluence_signals / 6) × 100, \
+  capped at 95. Do not invent a number — calculate it.
+- If R:R does not meet the strategy minimum, verdict must be WAIT regardless of other signals.
 
-Rules for take_profit_pct:
-- Choose a realistic take_profit_pct that gives a favorable risk/reward vs the stop loss, consistent with the active strategy {strategy}.
-
-Behavior by strategy:
-- When strategy is CONSERVATIVE, prefer WAIT unless the setup is very clean with strong confirmation and a clear invalidation level.
-- When strategy is AGGRESSIVE, you may accept more marginal setups if momentum and volume are strong, but still respect the stop loss rules above.
-- When strategy is REVERSAL, focus on oversold exhaustion, RSI below 30, rejection from lows, and bounces from support; avoid chasing late bounces that are far from the recent lows.
-
-Respond with ONLY the JSON object, no comments or additional text.
+Respond with ONLY the JSON object.
 """
 
         strategy_key = self._get_strategy_name().lower()
         system_content = STRATEGY_SYSTEM_MESSAGES.get(strategy_key, STRATEGY_SYSTEM_MESSAGES["conservative"])
+        # Flatten key indicator values as top-level fields for ML training queries.
+        # Nested dicts (ema_stack, bollinger, macd) are kept in indicators but critical
+        # scalar values are promoted here so they're queryable without JSON parsing.
+        ema_stack_15m = indicators.get("ema_stack_15m") or {}
+        ema_stack_1h = indicators.get("ema_stack_1h") or {}
+        macd_15m = indicators.get("macd_15m") or {}
+        bollinger_15m = indicators.get("bollinger_15m") or {}
         stats = {
             "symbol": symbol,
             "price": price,
             "rsi": rsi,
             "rvol": rvol,
+            "change_24h": change_24h,
+            "volume_24h": volume_24h,
             "high_24h": high_24h,
             "low_24h": low_24h,
             "strategy": strategy,
-            "recent_candles": recent_candles,
+            "btc_bias": btc_bias,
+            "candles_15m_count": len(candles_15m),
+            "candles_1h_count": len(candles_1h),
             "is_major": is_major,
+            "bot_version": BOT_VERSION,
+            # Flat indicator scalars for ML
+            "atr_at_entry": indicators.get("atr"),
+            "ema_alignment_15m": ema_stack_15m.get("alignment"),
+            "ema_alignment_1h": ema_stack_1h.get("alignment"),
+            "macd_hist_15m": macd_15m.get("histogram"),
+            "bb_pct_b_15m": bollinger_15m.get("pct_b"),
+            # Full indicator dicts for completeness
+            "indicators": indicators,
         }
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o",
+                temperature=0,  # deterministic — same input always produces same verdict
                 messages=[
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": prompt}
@@ -271,11 +583,19 @@ Respond with ONLY the JSON object, no comments or additional text.
         except Exception as e:
             log.error(f"Brain: AI Error: {e}")
             data = {
+                "trend_1h": "UNKNOWN",
+                "setup_15m": "NONE",
+                "candle_patterns": "NONE",
+                "volume_verdict": "NEUTRAL",
+                "confluence_signals": [],
+                "conflicting_signals": [],
+                "setup_grade": "C",
                 "verdict": "WAIT",
                 "stop_loss_pct": 0.0,
                 "take_profit_pct": 0.0,
-                "reason": "AI Analysis failed",
-                "confidence": "0%",
+                "rr_ratio": 0.0,
+                "confidence": 0,
+                "reason": "AI analysis failed",
             }
 
         # Persist signal (stats we sent to AI, prompt, parsed response) with generated signal_id
@@ -296,7 +616,13 @@ Respond with ONLY the JSON object, no comments or additional text.
         return data, signal_id
 
     def run(self):
-        log.info("Brain: AI Technical Analyst is online with Smart Cache...")
+        log.info(f"Brain: AI Technical Analyst is online with Smart Cache... [version: {BOT_VERSION}]")
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                shared_db.set_setting(conn, "bot_version", BOT_VERSION)
+        except Exception as e:
+            log.warning(f"Brain: Could not write bot_version to DB: {e}")
 
         while True:
             if shared_db.get_setting_value(shared_config.SYSTEM_KEY_TRADING_PAUSED) == "1":
@@ -310,9 +636,35 @@ Respond with ONLY the JSON object, no comments or additional text.
 
             candidates = json.loads(raw_data)
 
+            # --- PORTFOLIO CORRELATION RISK GATE ---
+            # Enforce BTC macro bias as a hard code-level rule, not just a prompt suggestion.
+            # The AI cannot override this — if conditions aren't met, no GPT calls are made.
+            btc_ctx = self._get_btc_context()
+            if btc_ctx:
+                _, btc_bias_now = self._format_btc_context_for_prompt(btc_ctx)
+                if btc_bias_now == "STRONG_BEARISH":
+                    log.info(
+                        "Brain: STRONG_BEARISH BTC — blocking all altcoin analysis "
+                        "(correlated drawdown risk too high)"
+                    )
+                    time.sleep(5)
+                    continue
+            else:
+                btc_bias_now = "NEUTRAL"
+
             # Do not call OpenAI when at max open orders (no new orders would be placed)
             open_count = self._get_open_order_count()
             max_open = self._get_max_open_orders()
+
+            # Under BEARISH_HEADWIND, halve the effective position limit to reduce
+            # simultaneous correlated exposure (all alts will fall together with BTC)
+            if btc_bias_now == "BEARISH_HEADWIND":
+                max_open = math.ceil(max_open / 2)
+                log.info(
+                    f"Brain: BEARISH_HEADWIND BTC — reducing effective max_open "
+                    f"to {max_open} (correlated risk management)"
+                )
+
             if open_count >= max_open:
                 log.info(f"Brain: Skipping AI (max open orders reached: {open_count}/{max_open})")
                 self.db.delete('filtered_candidates')
@@ -358,9 +710,20 @@ Respond with ONLY the JSON object, no comments or additional text.
                     current_price,
                     item['rsi'],
                     item['rvol'],
-                    item.get('candles', []),
+                    item.get('candles_15m', []),
+                    item.get('candles_1h', []),
                     item.get('high_24h'),
                     item.get('low_24h'),
+                    indicators={
+                        'vwap':          item.get('vwap'),
+                        'atr':           item.get('atr'),
+                        'ema_stack_15m': item.get('ema_stack_15m'),
+                        'ema_stack_1h':  item.get('ema_stack_1h'),
+                        'bollinger_15m': item.get('bollinger_15m'),
+                        'macd_15m':      item.get('macd_15m'),
+                    },
+                    change_24h=item.get('change_24h'),
+                    volume_24h=item.get('volume_24h'),
                 )
 
                 # Negative cache: when AI says WAIT, cache symbol to avoid re-analyzing flat charts

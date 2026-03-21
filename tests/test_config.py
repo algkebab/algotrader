@@ -20,7 +20,7 @@ def test_leverage_positive():
 
 
 def test_fees_non_negative():
-    assert config.BINANCE_SPOT_FEE >= 0
+    assert config.BINANCE_TAKER_FEE >= 0
     assert config.ENTRY_SLIPPAGE >= 0
     assert config.HOURLY_MARGIN_INTEREST_RATE >= 0
 

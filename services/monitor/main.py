@@ -28,6 +28,9 @@ class Monitor:
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
+        # MFE/MAE tracking: {order_id: {'mfe': float, 'mae': float}}
+        # Populated from DB on startup (restart recovery) and updated each price tick.
+        self._extremes: dict = {}
 
     def _get_positions_to_monitor(self):
         """Returns list of (symbol, trade_dict) from DB (paper mode only)."""
@@ -43,6 +46,8 @@ class Monitor:
                     "tp": float(r["tp_price"]),
                     "sl": float(r["sl_price"]),
                     "opened_at": r["opened_at"],
+                    "mfe_pct": r.get("mfe_pct"),
+                    "mae_pct": r.get("mae_pct"),
                 })
                 for r in rows
             ]
@@ -75,6 +80,31 @@ class Monitor:
                     sl_price = trade['sl']
                     tp_price = trade['tp']
                     order_id = trade['id']
+
+                    # Seed MFE/MAE from DB on first sight of this order (restart recovery)
+                    if order_id not in self._extremes:
+                        self._extremes[order_id] = {
+                            'mfe': trade.get('mfe_pct') or 0.0,
+                            'mae': trade.get('mae_pct') or 0.0,
+                        }
+
+                    # Update MFE/MAE with current unrealized PnL %
+                    current_pnl_pct = (current_price - entry_price) / entry_price * 100
+                    prev = self._extremes[order_id].copy()
+                    self._extremes[order_id]['mfe'] = max(prev['mfe'], current_pnl_pct)
+                    self._extremes[order_id]['mae'] = min(prev['mae'], current_pnl_pct)
+                    new_mfe = self._extremes[order_id]['mfe']
+                    new_mae = self._extremes[order_id]['mae']
+                    # Write to DB when extremes shift by >=0.1% to throttle writes
+                    if abs(new_mfe - prev['mfe']) >= 0.1 or abs(new_mae - prev['mae']) >= 0.1:
+                        try:
+                            with shared_db.get_connection() as conn:
+                                shared_db.init_schema(conn)
+                                shared_db.update_order_extremes(
+                                    conn, order_id, round(new_mfe, 3), round(new_mae, 3)
+                                )
+                        except Exception as e:
+                            log.warning(f"Monitor: Failed to persist extremes for {symbol}: {e}")
 
                     # Time-stop: close positions open longer than 48 hours (paper only)
                     try:
@@ -118,12 +148,14 @@ class Monitor:
     def close_position(self, symbol, price, reason):
         """Close position: update DB and notify (paper mode only, DB-backed)."""
         margin_usdt = 0.0  # add back locked margin on close
+        order_id_for_close = None
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
                 row = shared_db.get_open_order_for_symbol(conn, symbol)
             if not row:
                 return
+            order_id_for_close = row["id"]
             entry_price = float(row["entry_price"])
             qty = float(row["quantity"])
             # amount_usdt in DB is notional; margin = notional / leverage
@@ -140,7 +172,7 @@ class Monitor:
         margin_interest_paid = 0.0
         # Fees and margin interest simulation for paper trades
         exit_notional_usdt = qty * price
-        exit_fee_usd = exit_notional_usdt * shared_config.BINANCE_SPOT_FEE
+        exit_fee_usd = exit_notional_usdt * shared_config.BINANCE_TAKER_FEE
 
         # Use stored borrowed_amount and hourly_interest_rate from order when present (Executor saves at entry)
         borrowed_amount = row.get("borrowed_amount")
@@ -180,7 +212,7 @@ class Monitor:
             f"Monitor: Closing {symbol} at {price}. "
             f"Gross PnL: {gross_pnl_usdt:.2f} USDT ({gross_pnl_percent:.2f}%), "
             f"Fees/Interest: {total_costs:.2f} USDT "
-            f"-> Net PnL: {net_pnl_usdt:.2f} USDT ({net_pnl_pct:.2f}%) [{reason}] (paper)"
+            f"-> Net PnL: {net_pnl_usdt:.2f} USDT ({net_pnl_pct:.2f}%) [{reason}] (paper margin simulation)"
         )
 
         # Extra metadata for Messenger (fees, interest, strategy, holding time)
@@ -206,6 +238,10 @@ class Monitor:
         }
         self.db.rpush('notifications', json.dumps(notification))
 
+        # Retrieve final MFE/MAE from memory (populated during the monitoring loop)
+        trade_mfe = self._extremes.get(order_id_for_close, {}).get('mfe') if order_id_for_close else None
+        trade_mae = self._extremes.get(order_id_for_close, {}).get('mae') if order_id_for_close else None
+
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
@@ -220,13 +256,22 @@ class Monitor:
                         exit_fee_usd=float(exit_fee_usd),
                         margin_interest_paid=float(margin_interest_paid),
                         net_pnl_pct=round(net_pnl_pct, 2),
+                        exit_price=float(price),
+                        hours_held=float(hours_held),
+                        mfe_pct=round(trade_mfe, 3) if trade_mfe is not None else None,
+                        mae_pct=round(trade_mae, 3) if trade_mae is not None else None,
                     )
                     bal = shared_db.get_balance(conn, "USDT")
                     # Paper: new_balance = balance + margin + gross_pnl - exit_fee - interest
                     new_balance = bal + margin_usdt + gross_pnl_usdt - exit_fee_usd - margin_interest_paid
                     shared_db.set_balance(conn, "USDT", new_balance)
+                    shared_db.record_daily_pnl(conn, round(net_pnl_usdt, 2))
         except Exception as db_err:
             log.warning(f"Monitor: DB update failed: {db_err}")
+
+        # Clean up in-memory extremes for closed order
+        if order_id_for_close is not None:
+            self._extremes.pop(order_id_for_close, None)
 
         # Write trade outcome back to the originating AI signal for self-calibration
         signal_id = row.get("signal_id")

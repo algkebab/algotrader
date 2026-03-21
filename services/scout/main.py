@@ -77,15 +77,17 @@ class Scout:
             fallback = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT']
             return fallback, {}
 
-    async def fetch_ohlcv_data(self, symbol, timeframe='1h', limit=24):
-        """Fetches historical candlestick data from the exchange"""
+    async def fetch_ohlcv_data(self, symbol, timeframe='15m', limit=50):
+        """Fetches historical candlestick data (OHLCV) from the exchange.
+
+        Returns list of [timestamp, open, high, low, close, volume] or [] on error.
+        """
         try:
-            # Fetch OHLCV: timestamp, open, high, low, close, volume
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            log.info(f"Scout: OHLCV {symbol} {timeframe} -> {len(ohlcv)} candles")
+            log.debug(f"Scout: OHLCV {symbol} {timeframe} -> {len(ohlcv)} candles")
             return ohlcv
         except Exception as e:
-            log.error(f"Scout: Error fetching candles for {symbol}: {e}")
+            log.error(f"Scout: Error fetching candles for {symbol} {timeframe}: {e}")
             return []
 
     async def run(self):
@@ -111,8 +113,14 @@ class Scout:
                     high_24h = ticker.get('high')
                     low_24h = ticker.get('low')
 
-                    # 2. Get historical candles (last 24 hours)
-                    candles = await self.fetch_ohlcv_data(symbol)
+                    # 2. Fetch candles for two timeframes:
+                    #    - 15m (100 candles ≈ 25 h): entry signal computation
+                    #      (RSI, MACD, Bollinger Bands, EMA9/21/50, VWAP, ATR)
+                    #      100 candles ensures EMA50 has converged (needs ~2× period)
+                    #    - 1h  (150 candles ≈ 6 days): higher-timeframe trend direction
+                    #      150 candles ensures EMA50(1h) is meaningful
+                    candles_15m = await self.fetch_ohlcv_data(symbol, '15m', 100)
+                    candles_1h = await self.fetch_ohlcv_data(symbol, '1h', 150)
 
                     entry = {
                         'last_price': last_price,
@@ -120,7 +128,8 @@ class Scout:
                         'volume_24h': volume_24h,
                         'high_24h': high_24h,
                         'low_24h': low_24h,
-                        'candles': candles,  # Nested candle data for AI/Filter analysis
+                        'candles_15m': candles_15m,
+                        'candles_1h': candles_1h,
                     }
 
                     # Save per-symbol market data

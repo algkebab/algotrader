@@ -248,7 +248,7 @@ class Messenger:
 
             # Fees and interest for manual close
             exit_notional = qty * close_price
-            exit_fee_usd = exit_notional * shared_config.BINANCE_SPOT_FEE
+            exit_fee_usd = exit_notional * shared_config.BINANCE_TAKER_FEE
             borrowed = row.get("borrowed_amount")
             if borrowed is not None:
                 try:

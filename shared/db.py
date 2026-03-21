@@ -31,6 +31,11 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
         ("strategy_name", "TEXT"),
         ("session", "TEXT"),
         ("signal_id", "TEXT"),
+        ("exit_price", "REAL"),
+        ("hours_held", "REAL"),
+        ("mfe_pct", "REAL"),
+        ("mae_pct", "REAL"),
+        ("balance_at_entry", "REAL"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
@@ -97,6 +102,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
             hourly_interest_rate REAL,
             strategy_name TEXT,
             session TEXT,
+            signal_id TEXT,
+            exit_price REAL,
+            hours_held REAL,
+            mfe_pct REAL,
+            mae_pct REAL,
+            balance_at_entry REAL,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_orders_symbol_status ON orders(symbol, status);
@@ -125,6 +136,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
             prompt TEXT NOT NULL,
             response_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS daily_pnl (
+            date TEXT PRIMARY KEY,
+            pnl_usdt REAL NOT NULL DEFAULT 0,
+            trade_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
     """)
     _add_signals_columns_if_missing(conn)
@@ -169,12 +186,17 @@ def insert_order(
     strategy_name: Optional[str] = None,
     session: Optional[str] = None,
     signal_id: Optional[str] = None,
+    balance_at_entry: Optional[float] = None,
 ) -> int:
     now = datetime.utcnow().isoformat() + "Z"
     cur = conn.execute(
-        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session, signal_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session, signal_id),
+        """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price,
+                               status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount,
+                               hourly_interest_rate, strategy_name, session, signal_id, balance_at_entry)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id,
+         now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session,
+         signal_id, balance_at_entry),
     )
     return cur.lastrowid
 
@@ -202,9 +224,10 @@ def insert_signal(
 
 
 def get_open_orders(conn: sqlite3.Connection) -> List[Any]:
-    """Return all open orders (status='open'), newest first. Rows as dict-like with keys: symbol, entry_price, quantity, tp_price, sl_price, amount_usdt, opened_at, exchange_order_id."""
+    """Return all open orders (status='open'), newest first."""
     cur = conn.execute(
-        """SELECT id, symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id, opened_at
+        """SELECT id, symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price,
+                  exchange_order_id, opened_at, mfe_pct, mae_pct
            FROM orders WHERE status = 'open' ORDER BY opened_at DESC"""
     )
     return [dict(row) for row in cur.fetchall()]
@@ -237,6 +260,10 @@ def update_order_closed(
     exit_fee_usd: float,
     margin_interest_paid: float,
     net_pnl_pct: float,
+    exit_price: Optional[float] = None,
+    hours_held: Optional[float] = None,
+    mfe_pct: Optional[float] = None,
+    mae_pct: Optional[float] = None,
 ) -> None:
     now = datetime.utcnow().isoformat() + "Z"
     conn.execute(
@@ -248,10 +275,47 @@ def update_order_closed(
                close_reason = ?,
                exit_fee_usd = ?,
                margin_interest_paid = ?,
-               net_pnl_pct = ?
+               net_pnl_pct = ?,
+               exit_price = ?,
+               hours_held = ?,
+               mfe_pct = ?,
+               mae_pct = ?
            WHERE id = ?""",
-        (now, pnl_usdt, pnl_percent, close_reason, exit_fee_usd, margin_interest_paid, net_pnl_pct, order_id),
+        (now, pnl_usdt, pnl_percent, close_reason, exit_fee_usd, margin_interest_paid,
+         net_pnl_pct, exit_price, hours_held, mfe_pct, mae_pct, order_id),
     )
+
+
+def update_order_extremes(conn: sqlite3.Connection, order_id: int, mfe_pct: float, mae_pct: float) -> None:
+    """Update MFE/MAE for an open order. Called by Monitor on each price tick when extremes change."""
+    conn.execute(
+        "UPDATE orders SET mfe_pct = ?, mae_pct = ? WHERE id = ? AND status = 'open'",
+        (mfe_pct, mae_pct, order_id),
+    )
+
+
+def record_daily_pnl(conn: sqlite3.Connection, pnl_usdt_delta: float) -> None:
+    """Accumulate closed-trade PnL into today's daily_pnl row (UTC). Called by Monitor on close."""
+    today = datetime.utcnow().date().isoformat()
+    now = datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """INSERT INTO daily_pnl (date, pnl_usdt, trade_count, updated_at)
+           VALUES (?, ?, 1, ?)
+           ON CONFLICT(date) DO UPDATE SET
+               pnl_usdt = pnl_usdt + excluded.pnl_usdt,
+               trade_count = trade_count + 1,
+               updated_at = excluded.updated_at""",
+        (today, pnl_usdt_delta, now),
+    )
+
+
+def get_daily_pnl_history(conn: sqlite3.Connection, days: int = 30) -> List[dict]:
+    """Return daily PnL rows for the last N days, newest first."""
+    cur = conn.execute(
+        "SELECT date, pnl_usdt, trade_count FROM daily_pnl ORDER BY date DESC LIMIT ?",
+        (days,),
+    )
+    return [dict(row) for row in cur.fetchall()]
 
 
 def update_signal_outcome(
@@ -352,6 +416,7 @@ def get_closed_orders_with_signals(
         SELECT
             o.id, o.symbol, o.strategy_name, o.entry_price, o.quantity, o.tp_price, o.sl_price,
             o.opened_at, o.closed_at, o.pnl_usdt, o.pnl_percent, o.close_reason, o.signal_id,
+            o.exit_price, o.hours_held, o.mfe_pct, o.mae_pct,
             s.stats_json, s.response_json
         FROM orders o
         LEFT JOIN signals s ON o.signal_id = s.id
@@ -363,34 +428,72 @@ def get_closed_orders_with_signals(
     for row in cur.fetchall():
         row_dict = dict(row)
         entry = float(row_dict["entry_price"])
-        pnl_pct = row_dict["pnl_percent"]
-        if pnl_pct is not None:
-            pnl_pct = float(pnl_pct)
+        pnl_pct = float(row_dict["pnl_percent"]) if row_dict.get("pnl_percent") is not None else None
+        # Use stored exit_price when available; fall back to computing it for old rows
+        if row_dict.get("exit_price") is not None:
+            exit_price = float(row_dict["exit_price"])
+        elif pnl_pct is not None:
             exit_price = entry * (1 + pnl_pct / 100.0)
         else:
             exit_price = None
+
         rsi_at_entry = None
         rvol_at_entry = None
+        change_24h_at_entry = None
+        volume_24h_at_entry = None
+        atr_at_entry = None
+        ema_alignment_15m = None
+        ema_alignment_1h = None
+        macd_hist_15m = None
+        bb_pct_b_15m = None
+        btc_bias_at_entry = None
+        bot_version_at_signal = None
         ai_reason = None
+        ai_confidence = None
+        ai_setup_grade = None
+
         try:
             if row_dict.get("stats_json"):
                 stats = json.loads(row_dict["stats_json"])
                 rsi_at_entry = stats.get("rsi")
                 rvol_at_entry = stats.get("rvol")
+                change_24h_at_entry = stats.get("change_24h")
+                volume_24h_at_entry = stats.get("volume_24h")
+                atr_at_entry = stats.get("atr_at_entry")
+                ema_alignment_15m = stats.get("ema_alignment_15m")
+                ema_alignment_1h = stats.get("ema_alignment_1h")
+                macd_hist_15m = stats.get("macd_hist_15m")
+                bb_pct_b_15m = stats.get("bb_pct_b_15m")
+                btc_bias_at_entry = stats.get("btc_bias")
+                bot_version_at_signal = stats.get("bot_version")
         except (json.JSONDecodeError, TypeError):
             pass
         try:
             if row_dict.get("response_json"):
                 resp = json.loads(row_dict["response_json"])
                 ai_reason = resp.get("reason")
+                ai_confidence = resp.get("confidence")
+                ai_setup_grade = resp.get("setup_grade")
         except (json.JSONDecodeError, TypeError):
             pass
+
         rows.append({
             "symbol": row_dict["symbol"],
             "strategy_name": row_dict.get("strategy_name"),
             "ai_reason": ai_reason,
+            "ai_confidence": ai_confidence,
+            "ai_setup_grade": ai_setup_grade,
             "rsi_at_entry": rsi_at_entry,
             "rvol_at_entry": rvol_at_entry,
+            "change_24h_at_entry": change_24h_at_entry,
+            "volume_24h_at_entry": volume_24h_at_entry,
+            "atr_at_entry": atr_at_entry,
+            "ema_alignment_15m": ema_alignment_15m,
+            "ema_alignment_1h": ema_alignment_1h,
+            "macd_hist_15m": macd_hist_15m,
+            "bb_pct_b_15m": bb_pct_b_15m,
+            "btc_bias_at_entry": btc_bias_at_entry,
+            "bot_version": bot_version_at_signal,
             "entry_price": entry,
             "exit_price": exit_price,
             "pnl_usdt": float(row_dict["pnl_usdt"]) if row_dict.get("pnl_usdt") is not None else None,
@@ -398,7 +501,9 @@ def get_closed_orders_with_signals(
             "close_reason": row_dict.get("close_reason"),
             "opened_at": row_dict.get("opened_at"),
             "closed_at": row_dict.get("closed_at"),
-            "mfe_pct": None,
+            "hours_held": row_dict.get("hours_held"),
+            "mfe_pct": row_dict.get("mfe_pct"),
+            "mae_pct": row_dict.get("mae_pct"),
         })
     return rows
 

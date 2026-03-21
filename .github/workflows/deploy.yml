@@ -1,5 +1,4 @@
-# Deploy to VPS on push to main (Option A: SSH + git pull + docker compose)
-name: Deploy to VPS
+name: Deploy
 
 on:
   push:
@@ -10,6 +9,26 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate bot version
+        run: python3 scripts/gen_version.py
+
+      - name: Commit version to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add shared/version.py
+          git diff --cached --quiet || git commit -m "chore: bump bot version [skip ci]"
+          git push
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
