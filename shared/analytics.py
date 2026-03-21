@@ -67,28 +67,45 @@ def generate_performance_report(period: str = "today") -> str:
     count_sl = stats["count_sl"]
     count_tp = stats["count_tp"]
 
+    gross_profit = sum(t["pnl_usdt"] for t in trades if (t.get("pnl_usdt") or 0) > 0)
+    gross_loss = abs(sum(t["pnl_usdt"] for t in trades if (t.get("pnl_usdt") or 0) < 0))
+    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else None
+
     summary = {
         "period": period,
         "total_trades": count,
         "win_rate_pct": round(win_rate_pct, 1),
         "total_pnl_usdt": round(total_pnl, 2),
+        "profit_factor": profit_factor,
         "count_stop_loss": count_sl,
         "count_take_profit": count_tp,
         "trades": [
             {
                 "symbol": t["symbol"],
                 "strategy": t.get("strategy_name") or "—",
-                "ai_reason": (t.get("ai_reason") or "—")[:300],
+                # AI verdict context
+                "ai_reason": t.get("ai_reason") or "—",
+                "ai_confidence": t.get("ai_confidence"),
+                "ai_setup_grade": t.get("ai_setup_grade"),
+                # Entry indicators
                 "rsi_at_entry": t.get("rsi_at_entry"),
                 "rvol_at_entry": t.get("rvol_at_entry"),
+                "atr_at_entry": t.get("atr_at_entry"),
+                "ema_alignment_15m": t.get("ema_alignment_15m"),
+                "ema_alignment_1h": t.get("ema_alignment_1h"),
+                "bb_pct_b_15m": t.get("bb_pct_b_15m"),
+                "btc_bias_at_entry": t.get("btc_bias_at_entry"),
+                # Trade outcome
                 "entry_price": t["entry_price"],
                 "exit_price": t.get("exit_price"),
                 "pnl_usdt": t.get("pnl_usdt"),
                 "pnl_percent": t.get("pnl_percent"),
+                "hours_held": t.get("hours_held"),
                 "close_reason": t.get("close_reason") or "—",
+                "mfe_pct": t.get("mfe_pct"),
+                "mae_pct": t.get("mae_pct"),
                 "opened_at": t.get("opened_at"),
                 "closed_at": t.get("closed_at"),
-                "mfe_pct": t.get("mfe_pct"),
             }
             for t in trades
         ],
@@ -105,14 +122,26 @@ def generate_performance_report(period: str = "today") -> str:
                 {
                     "role": "user",
                     "content": (
-                        "Post-trade summary below. Perform the forensic analysis per your instructions. "
-                        "Output: (1) PERFORMANCE METRICS — Win Rate, Profit Factor, Average Drawdown; "
-                        "(2) SYSTEMIC FLAWS — market conditions that produced the worst trades; "
-                        "(3) 3 ACTIONABLE UPDATES — precise changes to filter.py or brain.py.\n\n"
+                        "Post-trade summary below. Perform the forensic analysis per your instructions.\n\n"
+                        "Key fields available per trade:\n"
+                        "- ai_setup_grade (A/B/C): the AI's own entry quality assessment\n"
+                        "- ai_confidence (0-100): AI certainty at time of BUY signal\n"
+                        "- btc_bias_at_entry: macro context (BULLISH_TAILWIND/NEUTRAL/BEARISH_HEADWIND/STRONG_BEARISH)\n"
+                        "- mae_pct: max adverse excursion — how far price moved against the trade before close\n"
+                        "- mfe_pct: max favorable excursion — the best unrealized gain during the trade\n"
+                        "- ema_alignment_15m / ema_alignment_1h: trend alignment at entry\n"
+                        "- atr_at_entry: volatility measure used for stop sizing\n"
+                        "- hours_held: trade duration\n\n"
+                        "Output: (1) PERFORMANCE METRICS — Win Rate, Profit Factor, Avg MAE vs SL width; "
+                        "(2) SYSTEMIC FLAWS — cluster losing trades by btc_bias, setup_grade, session, "
+                        "ema_alignment, and RSI to identify toxic entry conditions; "
+                        "(3) 3 ACTIONABLE UPDATES — precise threshold or logic changes to filter.py or brain.py "
+                        "backed by the data patterns you found.\n\n"
                         + payload_str
                     ),
                 },
             ],
+            timeout=60,
         )
         content = (response.choices[0].message.content or "").strip()
     except Exception as e:
@@ -122,9 +151,10 @@ def generate_performance_report(period: str = "today") -> str:
             f"❌ AI analysis failed: {e}"
         )
 
+    pf_str = f" · PF: {profit_factor:.2f}" if profit_factor is not None else ""
     header = (
         f"📊 Analytics ({_period_label(period)})\n\n"
-        f"📋 Trades: {count} · Win rate: {win_rate_pct:.0f}% · PnL: {total_pnl:+.2f} USDT\n"
+        f"📋 Trades: {count} · Win rate: {win_rate_pct:.0f}% · PnL: {total_pnl:+.2f} USDT{pf_str}\n"
         f"🟢 TP: {count_tp} · 🔴 SL: {count_sl}\n\n"
     )
     return header + content
