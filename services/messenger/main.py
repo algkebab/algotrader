@@ -39,27 +39,12 @@ TELEGRAM_CONNECTION_POOL_SIZE = 8
 SEND_MESSAGE_RETRIES = 2
 SEND_MESSAGE_RETRY_DELAY = 2.0
 
-# System settings are stored in DB (shared/db.py settings table), not Redis.
-# Keys we never delete on "clear redis" (empty: no system keys in Redis)
-REDIS_SYSTEM_KEYS = frozenset()
-
 # Allowed values for "strategy <name>"
 STRATEGY_VALUES = frozenset({"conservative", "aggressive", "reversal"})
 # Allowed values for "stats <value>"
 STATS_VALUES = frozenset({"today", "yesterday", "week", "month", "all"})
 # Allowed values for "analytics <period>"
 ANALYTICS_VALUES = frozenset({"last", "today", "week", "month"})
-
-# Data keys and patterns to clear on "clear redis"
-REDIS_DATA_KEYS = [
-    "market_data",
-    "filtered_candidates",
-    "signals",
-    "trade_commands",
-    "active_trades",
-    "notifications",
-]
-REDIS_DATA_PATTERNS = ["analyzed:*", "last_vol:*", "cache:brain_price:*"]
 
 def _normalize_symbol(s: str) -> str:
     """Normalize to BASE/USDT (e.g. BTCUSDT or btc/usdt -> BTC/USDT)."""
@@ -82,11 +67,8 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 🟢 • *autopilot on* — Auto-place orders on BUY (max set by orders set max). No Buy button. Resumes pipeline if paused.
 🔴 • *autopilot off* — Stop auto orders. Buy button shown again on BUY signals.
 
-🧹 *Data*
-🗑️ • *clear redis* — Clear queues and cache. Keeps system settings.
-
 📊 *Info & Trading*
-📈 • *status* — Pipeline, autopilot, WAIT signals.
+📈 • *status* — Pipeline, autopilot, balance, BTC bias, Scout freshness, bot version.
 📢 • *signal wait on* — Send Telegram notifications for WAIT verdicts.
 📢 • *signal wait off* — Do not notify for WAIT verdicts (default).
 📋 • *orders* — List open orders from DB.
@@ -648,17 +630,6 @@ class Messenger:
             return
         await self._safe_reply(update, report)
 
-    def _clear_redis_data(self) -> int:
-        """Delete all Redis data keys and pattern keys; never touch REDIS_SYSTEM_KEYS. Returns count deleted."""
-        deleted = 0
-        for key in REDIS_DATA_KEYS:
-            deleted += self.db.delete(key)
-        for pattern in REDIS_DATA_PATTERNS:
-            for key in self.db.scan_iter(match=pattern):
-                if key not in REDIS_SYSTEM_KEYS:
-                    deleted += self.db.delete(key)
-        return deleted
-
     async def handle_text(self, update, context):
         """Handle stop / start / status commands from Telegram."""
         if not self._is_allowed_chat(update.effective_chat.id):
@@ -678,40 +649,110 @@ class Messenger:
             self._set_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED, "0")
             log.info("Messenger: Pipeline RESUMED (Filter & Brain running)")
             await self._safe_reply(update, "▶️ Pipeline resumed\n\nFilter and Brain are running.")
-        elif text == "clear redis":
-            try:
-                n = self._clear_redis_data()
-                log.info(f"Messenger: Redis data cleared ({n} keys deleted)")
-                await self._safe_reply(
-                    update,
-                    f"🧹 Redis cleared\n\n{n} keys deleted.",
-                )
-            except Exception as e:
-                log.error(f"Messenger: clear redis failed: {e}")
-                await self._safe_reply(update, f"❌ Clear Redis failed\n\n{e}")
         elif text == "status":
             try:
                 paused = self._get_setting(shared_config.SYSTEM_KEY_TRADING_PAUSED)
                 autopilot = self._get_setting(shared_config.SYSTEM_KEY_AUTOPILOT)
                 symbols_val = self._get_setting(shared_config.SYSTEM_KEY_MAX_SYMBOLS)
                 symbols_n = int(symbols_val) if symbols_val and str(symbols_val).isdigit() else shared_config.MAX_SYMBOLS_DEFAULT
+                strategy_val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
+                if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+                    strategy_val = "CONSERVATIVE"
+                signal_wait = self._get_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT)
+                max_open = self._get_max_open_orders()
+
+                # DB: balance, today PnL, open orders, bot version
+                try:
+                    with shared_db.get_connection() as conn:
+                        shared_db.init_schema(conn)
+                        open_orders = shared_db.get_open_orders(conn)
+                        balance = shared_db.get_balance(conn, "USDT")
+                        today_pnl = shared_db.get_today_closed_pnl(conn)
+                        bot_version = shared_db.get_setting_value("bot_version")
+                except Exception:
+                    open_orders = []
+                    balance = None
+                    today_pnl = None
+                    bot_version = None
+
+                open_count = len(open_orders)
+                open_symbols = ", ".join(o["symbol"] for o in open_orders) if open_orders else "—"
+
                 lines = [
                     "📊 Status",
                     "",
                     "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused == "1" else "▶️ running"),
                     "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot == "1" else "OFF (Buy button on signals)"),
+                    f"🎯 Strategy: {strategy_val}",
                     f"📈 Symbols: top {symbols_n} by volume",
+                    f"📋 Open orders: {open_count} / {max_open} — {open_symbols}",
+                    "📢 WAIT signals: " + ("ON" if signal_wait == "1" else "OFF"),
                     "⚙️ Model: 3x leverage · 0.1% taker fee · 0.001%/h margin interest",
                 ]
-                strategy_val = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
-                if strategy_val not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
-                    strategy_val = "CONSERVATIVE"
-                lines.append(f"🎯 Strategy: {strategy_val}")
-                max_open = self._get_max_open_orders()
-                open_count = self._get_open_order_count()
-                lines.append(f"📋 Open orders: {open_count} / {max_open}")
-                signal_wait = self._get_setting(shared_config.SYSTEM_KEY_SIGNAL_WAIT)
-                lines.append("📢 WAIT signals: " + ("ON" if signal_wait == "1" else "OFF"))
+
+                # Balance + today's PnL
+                lines.append("")
+                if balance is not None:
+                    pnl_emoji = "📈" if today_pnl and today_pnl > 0 else ("📉" if today_pnl and today_pnl < 0 else "➡️")
+                    pnl_sign = "+" if today_pnl and today_pnl >= 0 else ""
+                    pnl_str = f"{pnl_emoji} {pnl_sign}{today_pnl:.2f} USDT today" if today_pnl is not None else "➡️ 0.00 USDT today"
+                    lines.append(f"💵 Balance: {balance:.2f} USDT · {pnl_str}")
+                else:
+                    lines.append("💵 Balance: — (DB error)")
+
+                # BTC market bias
+                try:
+                    btc_raw = self.db.get(shared_config.REDIS_KEY_BTC_CONTEXT)
+                    if btc_raw:
+                        btc_ctx = json.loads(btc_raw)
+                        btc_price = btc_ctx.get("price")
+                        btc_change = btc_ctx.get("change_24h")
+                        ema_1h = (btc_ctx.get("ema_stack_1h") or {})
+                        ema_15m = (btc_ctx.get("ema_stack_15m") or {})
+                        macd = (btc_ctx.get("macd_15m") or {})
+                        rsi = btc_ctx.get("rsi")
+                        ema_1h_align = ema_1h.get("alignment", "MIXED")
+                        ema_15m_align = ema_15m.get("alignment", "MIXED")
+                        macd_bullish = (macd.get("histogram") or 0) > 0
+                        rsi_val = float(rsi) if rsi is not None else 50.0
+                        bearish_set = {"BEARISH", "WEAKENING"}
+                        bullish_set = {"BULLISH", "RECOVERING"}
+                        if ema_1h_align in bearish_set and ema_15m_align in bearish_set and rsi_val < 40:
+                            bias_label = "🔴 STRONG BEARISH"
+                        elif ema_1h_align in bearish_set and not macd_bullish:
+                            bias_label = "🟠 BEARISH HEADWIND"
+                        elif ema_1h_align in bullish_set and macd_bullish:
+                            bias_label = "🟢 BULLISH TAILWIND"
+                        else:
+                            bias_label = "🟡 NEUTRAL"
+                        btc_price_str = f"${float(btc_price):,.0f}" if btc_price else "—"
+                        change_str = f" ({btc_change:+.1f}%)" if btc_change is not None else ""
+                        lines.append(f"📡 BTC: {btc_price_str}{change_str} · {bias_label}")
+                    else:
+                        lines.append("📡 BTC: — (no data yet)")
+                except Exception:
+                    lines.append("📡 BTC: — (error)")
+
+                # Scout freshness + candidates in queue
+                try:
+                    active_ttl = self.db.ttl(shared_config.REDIS_KEY_ACTIVE_SYMBOLS)
+                    if active_ttl > 0:
+                        scout_age = 360 - active_ttl
+                        scout_str = f"{scout_age}s ago" if scout_age < 60 else f"{scout_age // 60}m ago"
+                    elif active_ttl == -1:
+                        scout_str = "running (no TTL)"
+                    else:
+                        scout_str = "⚠️ stale (>6 min)"
+                    candidates_raw = self.db.get("filtered_candidates")
+                    candidates_count = len(json.loads(candidates_raw)) if candidates_raw else 0
+                    lines.append(f"🕐 Scout: {scout_str} · 🔍 Candidates: {candidates_count}")
+                except Exception:
+                    lines.append("🕐 Scout: — (error)")
+
+                # Bot version
+                if bot_version:
+                    lines.append(f"🏷️ Version: {bot_version}")
+
                 await self._safe_reply(update, "\n".join(lines))
             except Exception as e:
                 log.error(f"Messenger: status failed: {e}")
@@ -845,8 +886,7 @@ class Messenger:
         """Background task: Listens for trade execution results from Executor."""
         log.info("Messenger: Notification listener started (waiting for Executor updates)")
         while True:
-            # BLPOP blocks until a notification appears in the queue
-            notification = self.db.blpop('notifications', timeout=5)
+            notification = await asyncio.to_thread(self.db.blpop, 'notifications', 5)
             if notification:
                 _, payload = notification
                 note = json.loads(payload)
@@ -972,12 +1012,18 @@ class Messenger:
                         log.info(f"Messenger: WAIT signal for {symbol} (notifications off, skipped)")
                         continue
 
-                    # When at max open orders, don't show BUY signals (no slot to trade); consume and skip
+                    # When at max open orders, notify but don't show a Buy button
                     if verdict == "BUY":
                         open_count = self._get_open_order_count()
                         max_open = self._get_max_open_orders()
                         if open_count >= max_open:
-                            log.info(f"Messenger: Dropping BUY signal for {symbol} (max open orders: {open_count}/{max_open})")
+                            log.info(f"Messenger: BUY signal for {symbol} skipped (max open orders: {open_count}/{max_open})")
+                            await self.send_telegram_msg(
+                                f"🚀 *BUY signal: {symbol}* _(slots full)_\n\n"
+                                f"📝 _{data.get('reason', 'N/A')}_\n\n"
+                                f"⏸️ Not executed — {open_count}/{max_open} slots used.\n"
+                                f"_Close a position to free a slot._"
+                            )
                             continue
 
                     # Formatting external links
