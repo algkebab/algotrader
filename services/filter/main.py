@@ -393,14 +393,16 @@ class Filter:
         PAUSED_KEY = shared_config.SYSTEM_KEY_TRADING_PAUSED
 
         while True:
+            # Refresh BTC context unconditionally — runs regardless of paused/idle state
+            # so /status always has BTC data as soon as Scout writes market_data:BTC/USDT.
+            try:
+                self._compute_and_store_btc_context()
+            except Exception as e:
+                log.warning(f"Filter: BTC context update failed: {e}")
+
             if shared_db.get_setting_value(PAUSED_KEY) == "1":
                 time.sleep(5)
                 continue
-
-            # Refresh BTC context unconditionally — runs even while Scout is still
-            # doing its first scan so /status shows BTC data as soon as BTC/USDT
-            # market data is written (typically within the first few seconds of Scout startup).
-            self._compute_and_store_btc_context()
 
             # Stop filtering when at max open orders (no new orders would be placed)
             open_count = shared_db.get_open_order_count()
