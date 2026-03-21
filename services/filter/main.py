@@ -328,21 +328,17 @@ class Filter:
 
         return result
 
-    def _compute_and_store_btc_context(self, symbols: list, results: list) -> None:
+    def _compute_and_store_btc_context(self) -> None:
         """Compute BTC/USDT market indicators and publish to Redis as btc_context.
 
-        Called unconditionally every filter cycle — BTC does not need to pass the
-        strategy filter to produce context. Brain reads this key to assess the macro
-        bias before analyzing any altcoin signal.
+        Reads market_data:BTC/USDT directly so this can run as soon as Scout
+        writes BTC data — independently of whether the full active_symbols list
+        is available yet. Brain reads btc_context for macro bias on every signal.
         """
-        btc_raw = None
-        for sym, raw in zip(symbols, results):
-            if sym == "BTC/USDT" and raw:
-                btc_raw = raw
-                break
+        btc_raw = self.db.get("market_data:BTC/USDT")
 
         if not btc_raw:
-            log.debug("Filter: BTC/USDT not in active symbols — btc_context not updated")
+            log.debug("Filter: market_data:BTC/USDT not in Redis — btc_context not updated")
             return
 
         try:
@@ -401,6 +397,11 @@ class Filter:
                 time.sleep(5)
                 continue
 
+            # Refresh BTC context unconditionally — runs even while Scout is still
+            # doing its first scan so /status shows BTC data as soon as BTC/USDT
+            # market data is written (typically within the first few seconds of Scout startup).
+            self._compute_and_store_btc_context()
+
             # Stop filtering when at max open orders (no new orders would be placed)
             open_count = shared_db.get_open_order_count()
             max_open = shared_db.get_max_open_orders()
@@ -437,8 +438,7 @@ class Filter:
                 pipe.get(f"market_data:{symbol}")
             results = pipe.execute()
 
-            # Always refresh BTC macro context — Brain needs it for every altcoin signal
-            self._compute_and_store_btc_context(keys, results)
+            # BTC context was already refreshed at the top of the loop
 
             filtered_candidates = []
 
