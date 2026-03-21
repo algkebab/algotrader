@@ -73,9 +73,13 @@ class Scout:
         except Exception as e:
             log.error(f"Scout: Error fetching symbols: {e}")
             log.warning("Scout: Using emergency fallback symbol list")
-            # Emergency fallback (no pre-fetched tickers)
             fallback = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT']
-            return fallback, {}
+            try:
+                fallback_tickers = await self.exchange.fetch_tickers(fallback)
+            except Exception as fe:
+                log.error(f"Scout: Fallback ticker fetch also failed: {fe}")
+                fallback_tickers = {}
+            return fallback, fallback_tickers
 
     async def fetch_ohlcv_data(self, symbol, timeframe='15m', limit=50):
         """Fetches historical candlestick data (OHLCV) from the exchange.
@@ -108,6 +112,9 @@ class Scout:
 
                     # 1. Use existing ticker data
                     last_price = ticker.get('last')
+                    if last_price is None:
+                        log.warning(f"Scout: {symbol} skipped — last price is None")
+                        continue
                     change_24h = ticker.get('percentage')
                     volume_24h = ticker.get('quoteVolume')
                     high_24h = ticker.get('high')
@@ -132,9 +139,10 @@ class Scout:
                         'candles_1h': candles_1h,
                     }
 
-                    # Save per-symbol market data
+                    # Save per-symbol market data; TTL = 3 Scout cycles so Filter
+                    # naturally goes quiet if Scout crashes rather than scanning stale data
                     key = f"market_data:{symbol}"
-                    self.db.set(key, json.dumps(entry))
+                    self.db.set(key, json.dumps(entry), ex=360)
                     active_symbols.append(symbol)
                     log.info(f"Scout: Data updated & saved: {symbol}")
 
@@ -147,7 +155,7 @@ class Scout:
 
             # Save active symbols list so other services know which keys to read
             try:
-                self.db.set(shared_config.REDIS_KEY_ACTIVE_SYMBOLS, json.dumps(active_symbols))
+                self.db.set(shared_config.REDIS_KEY_ACTIVE_SYMBOLS, json.dumps(active_symbols), ex=360)
                 log.info(f"Scout: Updated {shared_config.REDIS_KEY_ACTIVE_SYMBOLS} ({len(active_symbols)} symbols)")
             except Exception as e:
                 log.error(f"Scout: Redis error saving active symbols: {e}")
