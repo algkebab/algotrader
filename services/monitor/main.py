@@ -228,6 +228,25 @@ class Monitor:
         except Exception as db_err:
             log.warning(f"Monitor: DB update failed: {db_err}")
 
+        # Write trade outcome back to the originating AI signal for self-calibration
+        signal_id = row.get("signal_id")
+        if signal_id:
+            outcome = "WIN" if net_pnl_usdt > 0 else ("BREAKEVEN" if net_pnl_usdt == 0 else "LOSS")
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    shared_db.update_signal_outcome(
+                        conn,
+                        signal_id=signal_id,
+                        outcome=outcome,
+                        pnl_usdt=round(net_pnl_usdt, 2),
+                        pnl_pct=round(net_pnl_pct, 2),
+                        close_reason=reason,
+                    )
+                log.info(f"Monitor: Signal outcome recorded ({signal_id[:8]}...): {outcome} {net_pnl_usdt:+.2f} USDT")
+            except Exception as e:
+                log.warning(f"Monitor: Failed to record signal outcome for {symbol}: {e}")
+
 
 if __name__ == "__main__":
     monitor = Monitor()

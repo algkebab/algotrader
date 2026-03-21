@@ -41,8 +41,16 @@ def _add_signals_columns_if_missing(conn: sqlite3.Connection) -> None:
     """Add new signal columns for existing DBs that were created before these columns existed."""
     cur = conn.execute("PRAGMA table_info(signals)")
     existing = {row[1] for row in cur.fetchall()}
-    if "verdict" not in existing:
-        conn.execute("ALTER TABLE signals ADD COLUMN verdict TEXT")
+    for col, spec in [
+        ("verdict", "TEXT"),
+        ("outcome", "TEXT"),
+        ("outcome_pnl_usdt", "REAL"),
+        ("outcome_pnl_pct", "REAL"),
+        ("outcome_close_reason", "TEXT"),
+        ("outcome_closed_at", "TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {spec}")
 
 
 @contextmanager
@@ -213,7 +221,7 @@ def get_open_order_id_for_symbol(conn: sqlite3.Connection, symbol: str) -> Optio
 def get_open_order_for_symbol(conn: sqlite3.Connection, symbol: str) -> Optional[Any]:
     """Return one open order row for symbol (id, symbol, entry_price, quantity, tp_price, sl_price, etc.) or None."""
     row = conn.execute(
-        """SELECT id, symbol, entry_price, quantity, tp_price, sl_price, amount_usdt, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name
+        """SELECT id, symbol, entry_price, quantity, tp_price, sl_price, amount_usdt, opened_at, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, signal_id
            FROM orders WHERE symbol = ? AND status = 'open' ORDER BY opened_at DESC LIMIT 1""",
         (symbol,),
     ).fetchone()
@@ -244,6 +252,53 @@ def update_order_closed(
            WHERE id = ?""",
         (now, pnl_usdt, pnl_percent, close_reason, exit_fee_usd, margin_interest_paid, net_pnl_pct, order_id),
     )
+
+
+def update_signal_outcome(
+    conn: sqlite3.Connection,
+    signal_id: str,
+    outcome: str,
+    pnl_usdt: float,
+    pnl_pct: float,
+    close_reason: str,
+) -> None:
+    """Record the trade result (WIN/LOSS/BREAKEVEN) back to the originating AI signal row."""
+    now = datetime.utcnow().isoformat() + "Z"
+    conn.execute(
+        """UPDATE signals
+           SET outcome = ?, outcome_pnl_usdt = ?, outcome_pnl_pct = ?,
+               outcome_close_reason = ?, outcome_closed_at = ?
+           WHERE id = ?""",
+        (outcome, pnl_usdt, pnl_pct, close_reason, now, signal_id),
+    )
+
+
+def get_recent_signal_win_rate(conn: sqlite3.Connection, limit: int = 20) -> dict:
+    """Win rate stats for the last N resolved BUY signals.
+
+    Returns dict: total, wins, win_rate_pct (None when no data), avg_pnl_usdt.
+    Only counts signals that have an outcome recorded (i.e. the trade closed).
+    """
+    cur = conn.execute(
+        """SELECT outcome, outcome_pnl_usdt
+           FROM signals
+           WHERE outcome IS NOT NULL AND verdict = 'BUY'
+           ORDER BY outcome_closed_at DESC
+           LIMIT ?""",
+        (limit,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return {"total": 0, "wins": 0, "win_rate_pct": None, "avg_pnl_usdt": None}
+    total = len(rows)
+    wins = sum(1 for r in rows if r["outcome"] == "WIN")
+    total_pnl = sum(r["outcome_pnl_usdt"] or 0.0 for r in rows)
+    return {
+        "total": total,
+        "wins": wins,
+        "win_rate_pct": round(wins / total * 100, 1),
+        "avg_pnl_usdt": round(total_pnl / total, 2),
+    }
 
 
 def update_order_sl_price(conn: sqlite3.Connection, order_id: int, new_sl_price: float) -> None:

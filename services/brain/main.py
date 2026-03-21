@@ -142,6 +142,49 @@ class Brain:
         except Exception:
             return 0
 
+    def _get_performance_section(self) -> str:
+        """Build a self-calibration block from the last 20 resolved BUY signals.
+
+        Returns an empty string when there is not enough data (< 5 closed trades).
+        """
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                stats = shared_db.get_recent_signal_win_rate(conn, limit=20)
+        except Exception:
+            return ""
+
+        if stats["total"] < 5:
+            return ""
+
+        wr = stats["win_rate_pct"]
+        avg_pnl = stats["avg_pnl_usdt"]
+        total = stats["total"]
+        wins = stats["wins"]
+
+        if wr >= 60:
+            directive = (
+                "Win rate is healthy. Maintain your current selectivity — the strategy is working."
+            )
+        elif wr >= 45:
+            directive = (
+                "Win rate is slightly below target. Raise your bar modestly — be more demanding "
+                "on volume confirmation and RSI positioning before issuing BUY."
+            )
+        else:
+            directive = (
+                "Win rate is critically low. You are entering too many losing trades. "
+                "Be significantly more selective — prefer WAIT unless every criterion is clearly met. "
+                "Avoid all borderline setups."
+            )
+
+        return (
+            f"[Your Recent Performance — Last {total} closed BUY signals]\n"
+            f"- Win Rate: {wr}% ({wins}/{total} profitable)\n"
+            f"- Avg Net PnL: {avg_pnl:+.2f} USDT per trade\n"
+            f"- Self-calibration directive: {directive}\n\n"
+        )
+
     def get_ai_verdict(self, symbol, price, rsi, rvol, candles, high_24h, low_24h):
         """Sends technical data to GPT for a high-level trading verdict with TP/SL targets.
 
@@ -161,8 +204,10 @@ class Brain:
         symbol_base = symbol.split("/")[0] if "/" in symbol else symbol
         is_major = symbol_base in {"BTC", "ETH"}
 
+        performance_section = self._get_performance_section()
+
         prompt = f"""
-Analyze this crypto trade setup for {symbol} in the context of the current market:
+{performance_section}Analyze this crypto trade setup for {symbol} in the context of the current market:
 - Current Price: {price}
 - 24h High: {high_str}
 - 24h Low: {low_str}

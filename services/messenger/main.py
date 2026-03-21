@@ -299,6 +299,25 @@ class Messenger:
                     "reason": reason,
                 },
             }))
+
+            # Write trade outcome back to the originating AI signal for self-calibration
+            signal_id = row.get("signal_id")
+            if signal_id:
+                outcome = "WIN" if net_pnl_usdt > 0 else ("BREAKEVEN" if net_pnl_usdt == 0 else "LOSS")
+                try:
+                    with shared_db.get_connection() as conn:
+                        shared_db.init_schema(conn)
+                        shared_db.update_signal_outcome(
+                            conn,
+                            signal_id=signal_id,
+                            outcome=outcome,
+                            pnl_usdt=round(net_pnl_usdt, 2),
+                            pnl_pct=round(net_pnl_pct, 2),
+                            close_reason=reason,
+                        )
+                except Exception as e:
+                    log.warning(f"Messenger: Failed to record signal outcome for {symbol}: {e}")
+
             log.info(f"Messenger: Manual close {symbol} at {close_price}. PnL: {net_pnl_usdt:.2f} USDT")
             await self._safe_reply(
                 update,
