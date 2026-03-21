@@ -839,6 +839,20 @@ class Messenger:
             strategy_name = (self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE").strip().upper()
             if strategy_name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
                 strategy_name = "CONSERVATIVE"
+
+            open_count = self._get_open_order_count()
+            max_open = self._get_max_open_orders()
+            if open_count >= max_open:
+                log.info(f"Messenger: Manual Buy for {symbol} blocked (max open orders: {open_count}/{max_open})")
+                try:
+                    await query.edit_message_text(
+                        text=f"{query.message.text}\n\n⏸️ _Slots full ({open_count}/{max_open}) — close a position first_",
+                        parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    log.warning(f"Messenger: edit_message_text error: {e}")
+                return
+
             command = {
                 "symbol": symbol,
                 "stop_loss_pct": stop_loss_pct,
@@ -886,100 +900,109 @@ class Messenger:
         """Background task: Listens for trade execution results from Executor."""
         log.info("Messenger: Notification listener started (waiting for Executor updates)")
         while True:
-            notification = await asyncio.to_thread(self.db.blpop, 'notifications', 5)
-            if notification:
-                _, payload = notification
-                note = json.loads(payload)
+            try:
+                notification = await asyncio.to_thread(self.db.blpop, 'notifications', 5)
+            except Exception as e:
+                log.error(f"Messenger: notification listener blpop error: {e}")
+                await asyncio.sleep(5)
+                continue
+            try:
+                if notification:
+                    _, payload = notification
+                    note = json.loads(payload)
 
-                if note['type'] == 'trade_confirmed':
-                    d = note['data']
-                    msg = (
-                        f"✅ *Trade opened*\n\n"
-                        f"📌 #{d['symbol'].replace('/', '')}\n\n"
-                        f"💰 Entry: `{d['entry']}`\n"
-                        f"🎯 Take profit: `{d['tp']}`\n"
-                        f"🛑 Stop loss: `{d['sl']}`\n\n"
-                        f"_Active — orders placed_"
-                    )
-                    await self.send_telegram_msg(msg)
+                    if note['type'] == 'trade_confirmed':
+                        d = note['data']
+                        msg = (
+                            f"✅ *Trade opened*\n\n"
+                            f"📌 #{d['symbol'].replace('/', '')}\n\n"
+                            f"💰 Entry: `{d['entry']}`\n"
+                            f"🎯 Take profit: `{d['tp']}`\n"
+                            f"🛑 Stop loss: `{d['sl']}`\n\n"
+                            f"_Active — orders placed_"
+                        )
+                        await self.send_telegram_msg(msg)
 
-                elif note['type'] == 'trade_skipped':
-                    d = note.get('data', {})
-                    symbol = d.get('symbol', '—')
-                    reason = d.get('reason', 'Already have open order for this symbol')
-                    msg = (
-                        f"⏸️ *Order skipped*\n\n"
-                        f"📌 {symbol}\n\n"
-                        f"{reason}"
-                    )
-                    await self.send_telegram_msg(msg)
+                    elif note['type'] == 'trade_skipped':
+                        d = note.get('data', {})
+                        symbol = d.get('symbol', '—')
+                        reason = d.get('reason', 'Already have open order for this symbol')
+                        msg = (
+                            f"⏸️ *Order skipped*\n\n"
+                            f"📌 {symbol}\n\n"
+                            f"{reason}"
+                        )
+                        await self.send_telegram_msg(msg)
 
-                elif note['type'] == 'trade_closed':
-                    d = note['data']
-                    result_emoji = "💰" if d['pnl_usdt'] >= 0 else "📉"
-                    pnl_sign = "+" if d['pnl_usdt'] >= 0 else ""
-                    lines = [
-                        f"{result_emoji} *Trade closed*",
-                        "",
-                        f"📌 #{d['symbol'].replace('/', '')}",
-                        f"📋 {d['reason']}",
-                        "",
-                        f"💵 Net PnL: `{pnl_sign}{d['pnl_usdt']}` USDT",
-                        f"📈 PnL: `{pnl_sign}{d['pnl_percent']}`%",
-                    ]
-                    # Optional extended audit fields
-                    gross_pnl_usdt = d.get("gross_pnl_usdt")
-                    if gross_pnl_usdt is not None:
-                        gross_sign = "+" if gross_pnl_usdt >= 0 else ""
-                        lines.append(f"💰 Gross PnL: `{gross_sign}{gross_pnl_usdt}` USDT")
-                    gross_pnl_percent = d.get("gross_pnl_percent")
-                    if gross_pnl_percent is not None:
-                        gsign = "+" if gross_pnl_percent >= 0 else ""
-                        lines.append(f"📊 Gross PnL: `{gsign}{gross_pnl_percent}`%")
-                    exit_fee = d.get("exit_fee_usd")
-                    interest = d.get("margin_interest_paid")
-                    if exit_fee is not None or interest is not None:
-                        fee_str = f"{exit_fee:.4f}" if isinstance(exit_fee, (int, float)) else exit_fee
-                        int_str = f"{interest:.4f}" if isinstance(interest, (int, float)) else interest
-                        lines.append(f"💸 Fees: entry (inc.), exit `{fee_str}` USDT")
-                        lines.append(f"🏦 Margin interest: `{int_str}` USDT")
-                    net_roe = d.get("net_pnl_pct")
-                    if net_roe is not None:
-                        roe_sign = "+" if net_roe >= 0 else ""
-                        lines.append(f"📈 ROE (on margin): `{roe_sign}{net_roe}`%")
-                    hours_held = d.get("hours_held")
-                    if hours_held is not None:
-                        lines.append(f"⏱️ Time in trade: `{hours_held}` h")
-                    strategy_name = d.get("strategy_name")
-                    if strategy_name:
-                        lines.append(f"🎯 Strategy: `{strategy_name}`")
-                    lines.extend(
-                        [
+                    elif note['type'] == 'trade_closed':
+                        d = note['data']
+                        result_emoji = "💰" if d['pnl_usdt'] >= 0 else "📉"
+                        pnl_sign = "+" if d['pnl_usdt'] >= 0 else ""
+                        lines = [
+                            f"{result_emoji} *Trade closed*",
                             "",
-                            f"📥 Entry: `{d.get('entry', '—')}`",
-                            f"📤 Exit: `{d.get('exit', '—')}`",
+                            f"📌 #{d['symbol'].replace('/', '')}",
+                            f"📋 {d['reason']}",
+                            "",
+                            f"💵 Net PnL: `{pnl_sign}{d['pnl_usdt']}` USDT",
+                            f"📈 PnL: `{pnl_sign}{d['pnl_percent']}`%",
                         ]
-                    )
-                    msg = "\n".join(lines)
-                    await self.send_telegram_msg(msg)
+                        # Optional extended audit fields
+                        gross_pnl_usdt = d.get("gross_pnl_usdt")
+                        if gross_pnl_usdt is not None:
+                            gross_sign = "+" if gross_pnl_usdt >= 0 else ""
+                            lines.append(f"💰 Gross PnL: `{gross_sign}{gross_pnl_usdt}` USDT")
+                        gross_pnl_percent = d.get("gross_pnl_percent")
+                        if gross_pnl_percent is not None:
+                            gsign = "+" if gross_pnl_percent >= 0 else ""
+                            lines.append(f"📊 Gross PnL: `{gsign}{gross_pnl_percent}`%")
+                        exit_fee = d.get("exit_fee_usd")
+                        interest = d.get("margin_interest_paid")
+                        if exit_fee is not None or interest is not None:
+                            fee_str = f"{exit_fee:.4f}" if isinstance(exit_fee, (int, float)) else exit_fee
+                            int_str = f"{interest:.4f}" if isinstance(interest, (int, float)) else interest
+                            lines.append(f"💸 Fees: entry (inc.), exit `{fee_str}` USDT")
+                            lines.append(f"🏦 Margin interest: `{int_str}` USDT")
+                        net_roe = d.get("net_pnl_pct")
+                        if net_roe is not None:
+                            roe_sign = "+" if net_roe >= 0 else ""
+                            lines.append(f"📈 ROE (on margin): `{roe_sign}{net_roe}`%")
+                        hours_held = d.get("hours_held")
+                        if hours_held is not None:
+                            lines.append(f"⏱️ Time in trade: `{hours_held}` h")
+                        strategy_name = d.get("strategy_name")
+                        if strategy_name:
+                            lines.append(f"🎯 Strategy: `{strategy_name}`")
+                        lines.extend(
+                            [
+                                "",
+                                f"📥 Entry: `{d.get('entry', '—')}`",
+                                f"📤 Exit: `{d.get('exit', '—')}`",
+                            ]
+                        )
+                        msg = "\n".join(lines)
+                        await self.send_telegram_msg(msg)
 
-                elif note['type'] == 'risk_guard_adjustment':
-                    d = note.get('data', {})
-                    symbol = d.get('symbol', '—')
-                    orig_sl = d.get('original_stop_loss_pct')
-                    new_sl = d.get('adjusted_stop_loss_pct')
-                    orig_tp = d.get('original_take_profit_pct')
-                    new_tp = d.get('adjusted_take_profit_pct')
-                    rr = d.get('min_rr_ratio')
-                    max_sl = d.get('max_allowed_sl')
-                    lines = [
-                        "🛡️ *RiskGuard adjustment*",
-                        "",
-                        f"📌 {symbol}",
-                        f"🛑 SL: `{orig_sl}` → `{new_sl}` (max {max_sl}%)",
-                        f"🎯 TP: `{orig_tp}` → `{new_tp}` (RR≥{rr}x)",
-                    ]
-                    await self.send_telegram_msg("\n".join(lines))
+                    elif note['type'] == 'risk_guard_adjustment':
+                        d = note.get('data', {})
+                        symbol = d.get('symbol', '—')
+                        orig_sl = d.get('original_stop_loss_pct')
+                        new_sl = d.get('adjusted_stop_loss_pct')
+                        orig_tp = d.get('original_take_profit_pct')
+                        new_tp = d.get('adjusted_take_profit_pct')
+                        rr = d.get('min_rr_ratio')
+                        max_sl = d.get('max_allowed_sl')
+                        lines = [
+                            "🛡️ *RiskGuard adjustment*",
+                            "",
+                            f"📌 {symbol}",
+                            f"🛑 SL: `{orig_sl}` → `{new_sl}` (max {max_sl}%)",
+                            f"🎯 TP: `{orig_tp}` → `{new_tp}` (RR≥{rr}x)",
+                        ]
+                        await self.send_telegram_msg("\n".join(lines))
+
+            except Exception as e:
+                log.error(f"Messenger: notification processing error: {e}")
 
             await asyncio.sleep(1)
 
