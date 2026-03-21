@@ -167,7 +167,18 @@ class Executor:
 
         except Exception as e:
             log.error(f"Executor: Order Error: {e}")
+            self._push_failure(symbol, str(e))
             return {"status": "error", "message": str(e)}
+
+    def _push_failure(self, symbol, reason):
+        """Push a trade_failed notification so Messenger can surface the error."""
+        try:
+            self.db.rpush("notifications", json.dumps({
+                "type": "trade_failed",
+                "data": {"symbol": symbol, "reason": reason},
+            }))
+        except Exception as e:
+            log.warning(f"Executor: Failed to push trade_failed notification for {symbol}: {e}")
 
     def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None):
         """Write order to DB only; no exchange, no Redis active_trades.
@@ -177,8 +188,10 @@ class Executor:
                 shared_db.init_schema(conn)
                 current_bal = shared_db.get_balance(conn, "USDT")
                 if current_bal <= 0:
-                    log.error(f"Executor: Paper order skipped: non-positive balance ({current_bal:.2f} USDT)")
-                    return {"status": "error", "message": "Insufficient balance for paper order"}
+                    msg = f"Non-positive balance ({current_bal:.2f} USDT)"
+                    log.error(f"Executor: Paper order skipped: {msg}")
+                    self._push_failure(symbol, msg)
+                    return {"status": "error", "message": msg}
 
                 # Position sizing: risk POSITION_RISK_PCT of balance per trade
                 risk_amount = current_bal * shared_config.POSITION_RISK_PCT
@@ -187,21 +200,28 @@ class Executor:
                 if effective_stop_loss_pct is None or effective_stop_loss_pct <= 0:
                     effective_stop_loss_pct = (1 - shared_config.SL_PERCENT) * 100  # e.g. 2% when SL_PERCENT = 0.98
                 if effective_stop_loss_pct <= 0:
-                    log.error(f"Executor: Invalid stop loss percent ({effective_stop_loss_pct}%), aborting paper order")
-                    return {"status": "error", "message": "Invalid stop loss percent"}
+                    msg = f"Invalid stop loss percent ({effective_stop_loss_pct}%)"
+                    log.error(f"Executor: {msg}, aborting paper order")
+                    self._push_failure(symbol, msg)
+                    return {"status": "error", "message": msg}
 
                 # Liquidation safety: for 3x leverage, liquidation ~33% drop; skip if SL would trigger liquidation first
                 if effective_stop_loss_pct >= shared_config.LIQUIDATION_THRESHOLD_PCT:
-                    log.warning(f"Executor: Order skipped: stop loss {effective_stop_loss_pct:.1f}% >= liquidation threshold {shared_config.LIQUIDATION_THRESHOLD_PCT}% ({shared_config.LEVERAGE}x leverage)")
-                    return {"status": "error", "message": "Stop loss too wide; would liquidate before SL"}
+                    msg = (f"SL {effective_stop_loss_pct:.1f}% >= liquidation threshold "
+                           f"{shared_config.LIQUIDATION_THRESHOLD_PCT}% at {shared_config.LEVERAGE}x leverage")
+                    log.warning(f"Executor: Order skipped: {msg}")
+                    self._push_failure(symbol, msg)
+                    return {"status": "error", "message": msg}
 
                 # Position notional in USDT from risk amount and stop loss distance
                 position_size_usdt = risk_amount / (effective_stop_loss_pct / 100.0)
                 max_notional = current_bal * shared_config.LEVERAGE
                 position_size_usdt = min(position_size_usdt, max_notional)
                 if position_size_usdt <= 0:
-                    log.error("Executor: Paper order skipped: zero position size after risk sizing")
-                    return {"status": "error", "message": "Zero position size"}
+                    msg = "Zero position size after risk sizing"
+                    log.error(f"Executor: Paper order skipped: {msg}")
+                    self._push_failure(symbol, msg)
+                    return {"status": "error", "message": msg}
 
                 # Public ticker for entry/tp/sl (no account interaction)
                 ticker = self.exchange.fetch_ticker(symbol)
@@ -229,9 +249,11 @@ class Executor:
                 entry_fee_usd = final_notional_usdt * shared_config.BINANCE_TAKER_FEE
                 total_entry_cost = margin_usdt + entry_fee_usd
                 if current_bal < total_entry_cost:
-                    log.error(f"Executor: Paper order skipped: insufficient balance for margin+fee "
-                              f"({current_bal:.2f} < {total_entry_cost:.2f} USDT)")
-                    return {"status": "error", "message": "Insufficient balance for paper order"}
+                    msg = (f"Insufficient balance for margin+fee "
+                           f"({current_bal:.2f} < {total_entry_cost:.2f} USDT)")
+                    log.error(f"Executor: Paper order skipped: {msg}")
+                    self._push_failure(symbol, msg)
+                    return {"status": "error", "message": msg}
 
                 # Lock margin and pay entry fee from virtual balance
                 shared_db.set_balance(conn, "USDT", current_bal - total_entry_cost)
@@ -270,6 +292,7 @@ class Executor:
             return result
         except Exception as e:
             log.error(f"Executor: Paper order error: {e}")
+            self._push_failure(symbol, str(e))
             return {"status": "error", "message": str(e)}
 
     def run(self):

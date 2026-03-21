@@ -918,6 +918,17 @@ class Messenger:
                         )
                         await self.send_telegram_msg(msg)
 
+                    elif note['type'] == 'trade_failed':
+                        d = note.get('data', {})
+                        symbol = d.get('symbol', '—')
+                        reason = d.get('reason', 'Unknown error')
+                        msg = (
+                            f"❌ *Order failed*\n\n"
+                            f"📌 {symbol}\n\n"
+                            f"⚠️ _{reason}_"
+                        )
+                        await self.send_telegram_msg(msg)
+
                     elif note['type'] == 'trade_closed':
                         d = note['data']
                         result_emoji = "💰" if d['pnl_usdt'] >= 0 else "📉"
