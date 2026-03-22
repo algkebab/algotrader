@@ -345,6 +345,11 @@ class Brain:
         if ema_1h:
             lines.append(f"- EMA Stack (1h, trend bias): {ema_1h['description']}")
 
+        # EMA stack (4h) — dominant trend gate (days-level direction)
+        ema_4h = indicators.get("ema_stack_4h")
+        if ema_4h:
+            lines.append(f"- EMA Stack (4h, trend gate): {ema_4h['description']}")
+
         # Bollinger Bands — volatility squeeze and price position
         bb = indicators.get("bollinger_15m")
         if bb:
@@ -387,15 +392,15 @@ class Brain:
         signal_id = str(uuid.uuid4())
         indicators = indicators or {}
 
-        # Recent 15m candles for entry price action context (last 15 = ~3.75 hours)
-        recent_15m = candles_15m[-15:] if candles_15m else []
+        # Recent 15m candles for entry price action context (last 30 = ~7.5 hours)
+        recent_15m = candles_15m[-30:] if candles_15m else []
         candle_15m_lines = [
             f"  O:{c[1]:.6g} H:{c[2]:.6g} L:{c[3]:.6g} C:{c[4]:.6g} V:{c[5]:.0f}"
             for c in recent_15m
         ]
 
-        # Recent 1h candles for trend context (last 10 = ~10 hours, full OHLCV for structure)
-        recent_1h = candles_1h[-10:] if candles_1h else []
+        # Recent 1h candles for trend context (last 24 = 24 hours, full OHLCV for structure)
+        recent_1h = candles_1h[-24:] if candles_1h else []
         candle_1h_lines = [
             f"  O:{c[1]:.6g} H:{c[2]:.6g} L:{c[3]:.6g} C:{c[4]:.6g} V:{c[5]:.0f}"
             for c in recent_1h
@@ -544,6 +549,7 @@ Respond with ONLY the JSON object.
         # scalar values are promoted here so they're queryable without JSON parsing.
         ema_stack_15m = indicators.get("ema_stack_15m") or {}
         ema_stack_1h = indicators.get("ema_stack_1h") or {}
+        ema_stack_4h = indicators.get("ema_stack_4h") or {}
         macd_15m = indicators.get("macd_15m") or {}
         bollinger_15m = indicators.get("bollinger_15m") or {}
         stats = {
@@ -565,6 +571,7 @@ Respond with ONLY the JSON object.
             "atr_at_entry": indicators.get("atr"),
             "ema_alignment_15m": ema_stack_15m.get("alignment"),
             "ema_alignment_1h": ema_stack_1h.get("alignment"),
+            "ema_alignment_4h": ema_stack_4h.get("alignment"),
             "macd_hist_15m": macd_15m.get("histogram"),
             "bb_pct_b_15m": bollinger_15m.get("pct_b"),
             # Full indicator dicts for completeness
@@ -732,6 +739,7 @@ Respond with ONLY the JSON object.
                         'atr':           item.get('atr'),
                         'ema_stack_15m': item.get('ema_stack_15m'),
                         'ema_stack_1h':  item.get('ema_stack_1h'),
+                        'ema_stack_4h':  item.get('ema_stack_4h'),
                         'bollinger_15m': item.get('bollinger_15m'),
                         'macd_15m':      item.get('macd_15m'),
                     },

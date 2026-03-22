@@ -41,7 +41,12 @@ class Monitor:
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
-                rows = shared_db.get_open_orders(conn)
+                cur = conn.execute(
+                    """SELECT id, symbol, entry_price, quantity, tp_price, sl_price, opened_at,
+                              mfe_pct, mae_pct, partial_tp_hit, initial_sl_price
+                       FROM orders WHERE status = 'open' ORDER BY opened_at DESC"""
+                )
+                rows = [dict(r) for r in cur.fetchall()]
             return [
                 (r["symbol"], {
                     "id": r["id"],
@@ -52,12 +57,78 @@ class Monitor:
                     "opened_at": r["opened_at"],
                     "mfe_pct": r.get("mfe_pct"),
                     "mae_pct": r.get("mae_pct"),
+                    "partial_tp_hit": bool(r.get("partial_tp_hit")),
+                    "initial_sl": float(r["initial_sl_price"]) if r.get("initial_sl_price") is not None else None,
                 })
                 for r in rows
             ]
         except Exception as e:
             log.error(f"Monitor: DB error: {e}")
             return []
+
+    def _get_atr_for_symbol(self, symbol: str, period: int = 14) -> float | None:
+        """Compute ATR (Wilder's, 15m) from Redis cached market data. Returns None on error."""
+        try:
+            raw = self.db.get(f"market_data:{symbol}")
+            if not raw:
+                return None
+            candles = json.loads(raw).get('candles_15m', [])
+            if len(candles) < period + 1:
+                return None
+            true_ranges = []
+            for i in range(1, len(candles)):
+                high, low, prev_close = candles[i][2], candles[i][3], candles[i - 1][4]
+                true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+            atr = sum(true_ranges[:period]) / period
+            for tr in true_ranges[period:]:
+                atr = (atr * (period - 1) + tr) / period
+            return atr
+        except Exception:
+            return None
+
+    def _handle_partial_profit(self, symbol: str, trade: dict, current_price: float) -> bool:
+        """Close 50% of position at 1R target, move SL to breakeven. Returns True if executed."""
+        if trade.get('partial_tp_hit'):
+            return False
+        initial_sl = trade.get('initial_sl')
+        entry = trade['entry']
+        if initial_sl is None:
+            return False
+        one_r_target = entry + (entry - initial_sl)
+        if current_price < one_r_target:
+            return False
+        try:
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                row = shared_db.get_open_order_for_symbol(conn, symbol)
+                if not row:
+                    return False
+                qty = float(row['quantity'])
+                half_qty = qty / 2
+                half_amount = float(row['amount_usdt']) / 2
+                entry_price = float(row['entry_price'])
+                gross_pnl = (current_price - entry_price) * half_qty
+                exit_fee = half_qty * current_price * shared_config.BINANCE_TAKER_FEE
+                margin_per_half = half_amount / shared_config.LEVERAGE
+                bal = shared_db.get_balance(conn, "USDT")
+                shared_db.set_balance(conn, "USDT", bal + margin_per_half + gross_pnl - exit_fee)
+                borrowed = float(row.get('borrowed_amount') or 0)
+                shared_db.update_order_partial_close(
+                    conn,
+                    order_id=row['id'],
+                    new_quantity=half_qty,
+                    new_amount_usdt=half_amount,
+                    new_sl_price=entry_price,
+                    new_borrowed_amount=borrowed / 2,
+                )
+            log.info(
+                f"Monitor: Partial profit {symbol}: 50% closed at {current_price:.6g} "
+                f"(1R={one_r_target:.6g}, entry={entry_price:.6g}), SL moved to breakeven"
+            )
+            return True
+        except Exception as e:
+            log.error(f"Monitor: Partial profit failed for {symbol}: {e}")
+            return False
 
     def run(self):
         log.info("Monitor: Tracking active positions...")
@@ -114,31 +185,38 @@ class Monitor:
                     try:
                         opened_at = datetime.fromisoformat(trade["opened_at"].replace("Z", "+00:00"))
                         hours_open = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0
-                        if hours_open >= 48:
+                        if hours_open >= 24:
                             self.close_position(symbol, current_price, "TIME-STOP")
                             continue
                     except Exception:
                         pass
 
-                    # Trailing stop-loss: trail distance = original SL% from entry.
-                    # SL only ever moves up — if price hasn't risen, nothing changes.
-                    # Only write to DB when new SL is at least 0.1% higher (reduces writes).
-                    trail_pct = (entry_price - sl_price) / entry_price * 100
-                    if trail_pct > 0:
-                        new_sl = current_price * (1 - trail_pct / 100)
-                        if new_sl > sl_price * 1.001:
-                            try:
-                                with shared_db.get_connection() as conn:
-                                    shared_db.init_schema(conn)
-                                    shared_db.update_order_sl_price(conn, order_id, new_sl)
-                                log.info(
-                                    f"Monitor: Trailing SL {symbol}: "
-                                    f"{sl_price:.6g} -> {new_sl:.6g} "
-                                    f"(price={current_price:.6g}, trail={trail_pct:.2f}%)"
-                                )
-                                sl_price = new_sl  # use updated value for the check below
-                            except Exception as e:
-                                log.warning(f"Monitor: Failed to update trailing SL for {symbol}: {e}")
+                    # Partial profit at 1R: close 50%, move SL to breakeven
+                    if self._handle_partial_profit(symbol, trade, current_price):
+                        sl_price = entry_price  # reflect breakeven SL locally
+
+                    # Trailing stop-loss: ATR-based (2× ATR from current price).
+                    # Adapts to current volatility; falls back to original fixed-% when ATR unavailable.
+                    # SL only ever moves up — never trails down.
+                    atr = self._get_atr_for_symbol(symbol)
+                    if atr and atr > 0:
+                        new_sl = current_price - atr * 2.0
+                    else:
+                        trail_pct = (entry_price - sl_price) / entry_price * 100
+                        new_sl = current_price * (1 - trail_pct / 100) if trail_pct > 0 else sl_price
+                    if new_sl > sl_price * 1.001:
+                        try:
+                            with shared_db.get_connection() as conn:
+                                shared_db.init_schema(conn)
+                                shared_db.update_order_sl_price(conn, order_id, new_sl)
+                            log.info(
+                                f"Monitor: Trailing SL {symbol}: "
+                                f"{sl_price:.6g} -> {new_sl:.6g} "
+                                f"(price={current_price:.6g}, {'ATR×2' if atr else 'fixed-pct'})"
+                            )
+                            sl_price = new_sl
+                        except Exception as e:
+                            log.warning(f"Monitor: Failed to update trailing SL for {symbol}: {e}")
 
                     if current_price <= sl_price:
                         self.close_position(symbol, current_price, "STOP-LOSS")

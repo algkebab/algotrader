@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import redis
 from dotenv import load_dotenv
@@ -89,7 +90,7 @@ class Filter:
         rs = avg_gain / avg_loss
         return round(100 - (100 / (1 + rs)), 2)
 
-    def _compute_rvol_from_candles(self, candles: list, period: int = 20) -> float:
+    def _compute_rvol_from_candles(self, candles: list, period: int = 50) -> float:
         """Standard RVOL: current bar volume / average volume of prior `period` bars.
 
         This matches how RVOL is displayed on TradingView and professional platforms.
@@ -300,7 +301,9 @@ class Filter:
 
         return round(score, 1)
 
-    def _compute_technical_indicators(self, candles_15m: list, candles_1h: list) -> dict:
+    def _compute_technical_indicators(
+        self, candles_15m: list, candles_1h: list, candles_4h: list | None = None
+    ) -> dict:
         """Orchestrate all technical indicator computations.
 
         Returns a flat dict of indicator values ready to merge into the candidate payload.
@@ -310,7 +313,17 @@ class Filter:
 
         if candles_15m:
             closes_15m = [c[4] for c in candles_15m]
-            result["vwap"] = self._compute_vwap(candles_15m)
+            # Session VWAP: filter candles to today 00:00 UTC (institutional daily reset).
+            # Falls back to last 32 candles early in the session (< 10 today candles).
+            today_midnight_ms = int(
+                datetime.now(timezone.utc)
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+                .timestamp() * 1000
+            )
+            session_candles = [c for c in candles_15m if c[0] >= today_midnight_ms]
+            if len(session_candles) < 10:
+                session_candles = candles_15m[-32:]
+            result["vwap"] = self._compute_vwap(session_candles)
             result["atr"] = self._compute_atr(candles_15m, period=14)
             result["ema_stack_15m"] = self._compute_ema_stack(closes_15m)
             result["bollinger_15m"] = self._compute_bollinger_bands(closes_15m)
@@ -325,6 +338,13 @@ class Filter:
             result["ema_stack_1h"] = self._compute_ema_stack(closes_1h)
         else:
             result["ema_stack_1h"] = None
+
+        # 4h EMA stack: mandatory trend gate (dominant direction over days, not hours)
+        if candles_4h:
+            closes_4h = [c[4] for c in candles_4h]
+            result["ema_stack_4h"] = self._compute_ema_stack(closes_4h)
+        else:
+            result["ema_stack_4h"] = None
 
         return result
 
@@ -494,6 +514,7 @@ class Filter:
                     indicators = self._compute_technical_indicators(
                         data.get('candles_15m', []),
                         data.get('candles_1h', []),
+                        data.get('candles_4h', []),
                     )
 
                     # Pre-filter: skip full bearish EMA stack for momentum strategies.
@@ -502,6 +523,20 @@ class Filter:
                     if strategy_name != "REVERSAL" and ema_15m.get('alignment') == "BEARISH":
                         log.debug(f"Filter: {symbol} skipped — bearish 15m EMA stack in {strategy_name} mode")
                         continue
+
+                    # 4h EMA mandatory trend gate: reject entries against the dominant 4h trend.
+                    # CONSERVATIVE: rejects BEARISH + WEAKENING (only allow neutral/bullish structures)
+                    # AGGRESSIVE: rejects BEARISH only (allow weakening if 15m momentum is strong)
+                    # REVERSAL: exempt (counter-trend by design — expects bearish 4h structure)
+                    ema_4h = indicators.get('ema_stack_4h') or {}
+                    ema_4h_align = ema_4h.get('alignment')
+                    if ema_4h_align:
+                        if strategy_name == "CONSERVATIVE" and ema_4h_align in ("BEARISH", "WEAKENING"):
+                            log.debug(f"Filter: {symbol} skipped — 4h EMA {ema_4h_align} in CONSERVATIVE mode")
+                            continue
+                        elif strategy_name == "AGGRESSIVE" and ema_4h_align == "BEARISH":
+                            log.debug(f"Filter: {symbol} skipped — 4h EMA BEARISH in AGGRESSIVE mode")
+                            continue
 
                     data['symbol'] = symbol
                     data['rvol'] = round(rvol, 2)
@@ -516,7 +551,8 @@ class Filter:
                         f"| RVOL: {rvol:.2f} | RSI(15m): {rsi} | RSI(1h): {rsi_1h} "
                         f"| 4h Chg: {recent_change:+.2f}% "
                         f"| EMA(15m): {ema_15m.get('alignment', 'N/A')} "
-                        f"| EMA(1h): {(indicators.get('ema_stack_1h') or {}).get('alignment', 'N/A')}"
+                        f"| EMA(1h): {(indicators.get('ema_stack_1h') or {}).get('alignment', 'N/A')} "
+                        f"| EMA(4h): {ema_4h_align or 'N/A'}"
                     )
                     filtered_candidates.append(data)
 

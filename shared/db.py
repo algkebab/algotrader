@@ -36,6 +36,8 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
         ("mfe_pct", "REAL"),
         ("mae_pct", "REAL"),
         ("balance_at_entry", "REAL"),
+        ("initial_sl_price", "REAL"),
+        ("partial_tp_hit", "INTEGER NOT NULL DEFAULT 0"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
@@ -108,6 +110,8 @@ def init_schema(conn: sqlite3.Connection) -> None:
             mfe_pct REAL,
             mae_pct REAL,
             balance_at_entry REAL,
+            initial_sl_price REAL,
+            partial_tp_hit INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_orders_symbol_status ON orders(symbol, status);
@@ -192,11 +196,12 @@ def insert_order(
     cur = conn.execute(
         """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price,
                                status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount,
-                               hourly_interest_rate, strategy_name, session, signal_id, balance_at_entry)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               hourly_interest_rate, strategy_name, session, signal_id, balance_at_entry,
+                               initial_sl_price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id,
          now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session,
-         signal_id, balance_at_entry),
+         signal_id, balance_at_entry, sl_price),
     )
     return cur.lastrowid
 
@@ -370,6 +375,23 @@ def update_order_sl_price(conn: sqlite3.Connection, order_id: int, new_sl_price:
     conn.execute(
         "UPDATE orders SET sl_price = ? WHERE id = ? AND status = 'open'",
         (new_sl_price, order_id),
+    )
+
+
+def update_order_partial_close(
+    conn: sqlite3.Connection,
+    order_id: int,
+    new_quantity: float,
+    new_amount_usdt: float,
+    new_sl_price: float,
+    new_borrowed_amount: float,
+) -> None:
+    """Update order after partial 1R close: halve size fields, set SL to breakeven, mark partial done."""
+    conn.execute(
+        """UPDATE orders
+           SET quantity = ?, amount_usdt = ?, sl_price = ?, borrowed_amount = ?, partial_tp_hit = 1
+           WHERE id = ? AND status = 'open'""",
+        (new_quantity, new_amount_usdt, new_sl_price, new_borrowed_amount, order_id),
     )
 
 

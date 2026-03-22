@@ -126,8 +126,11 @@ class Scout:
                     #      100 candles ensures EMA50 has converged (needs ~2× period)
                     #    - 1h  (150 candles ≈ 6 days): higher-timeframe trend direction
                     #      150 candles ensures EMA50(1h) is meaningful
+                    #    - 4h  (100 candles ≈ 17 days): mandatory trend gate
+                    #      filters entries against the dominant 4h trend direction
                     candles_15m = await self.fetch_ohlcv_data(symbol, '15m', 100)
                     candles_1h = await self.fetch_ohlcv_data(symbol, '1h', 150)
+                    candles_4h = await self.fetch_ohlcv_data(symbol, '4h', 100)
 
                     entry = {
                         'last_price': last_price,
@@ -137,6 +140,7 @@ class Scout:
                         'low_24h': low_24h,
                         'candles_15m': candles_15m,
                         'candles_1h': candles_1h,
+                        'candles_4h': candles_4h,
                     }
 
                     # Save per-symbol market data; TTL = 3 Scout cycles so Filter
