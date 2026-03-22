@@ -403,10 +403,18 @@ async def api_market():
                     ]
                 except Exception:
                     pass
+            regime = None
+            raw4 = r.get(config.REDIS_KEY_MARKET_REGIME)
+            if raw4:
+                try:
+                    regime = json.loads(raw4)
+                except Exception:
+                    pass
         return {
             "btc_context": btc,
             "active_symbols": active or [],
             "filtered_candidates": candidates or [],
+            "market_regime": regime,
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})

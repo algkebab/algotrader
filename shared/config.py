@@ -41,4 +41,5 @@ SYSTEM_KEY_SIGNAL_WAIT = "signal_wait"
 
 # --- Redis key (pipeline data; Scout writes, Filter reads) ---
 REDIS_KEY_ACTIVE_SYMBOLS = "active_symbols"
-REDIS_KEY_BTC_CONTEXT = "btc_context"  # Filter writes, Brain reads for macro bias
+REDIS_KEY_BTC_CONTEXT = "btc_context"        # Filter writes, Brain reads for macro bias
+REDIS_KEY_MARKET_REGIME = "market_regime"    # Filter writes, Brain/Dashboard reads

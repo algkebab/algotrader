@@ -247,6 +247,16 @@ class Brain:
         except (json.JSONDecodeError, TypeError):
             return None
 
+    def _get_market_regime(self) -> dict | None:
+        """Read market regime from Redis (published by Filter after each scan cycle)."""
+        raw = self.db.get(shared_config.REDIS_KEY_MARKET_REGIME)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
     def _format_btc_context_for_prompt(self, btc_ctx: dict) -> tuple[str, str]:
         """Format BTC context as a natural-language block and derive the market bias label.
 
@@ -426,6 +436,44 @@ class Brain:
                 btc_section_text, btc_bias = self._format_btc_context_for_prompt(btc_ctx)
                 btc_section = f"\n### BTC Market Context (macro barometer)\n{btc_section_text}\n"
 
+        # Market regime context
+        regime_ctx = self._get_market_regime()
+        regime_section = ""
+        if regime_ctx:
+            regime_name = regime_ctx.get('regime', 'MIXED')
+            regime_guidance = {
+                'BULL_TRENDING': (
+                    'Momentum and breakout strategies are favored. '
+                    'Full position sizing applies. Standard entry criteria.'
+                ),
+                'BEAR_TRENDING': (
+                    'Only the highest-quality reversal setups pass. '
+                    'Raise selectivity dramatically. Reduce TP to nearest visible resistance. '
+                    'Any momentum or breakout setup should be WAIT.'
+                ),
+                'RANGING': (
+                    'Market is non-trending. Breakout entries are fakeout-prone — avoid them. '
+                    'Mean-reversion setups to range boundaries are preferred. '
+                    'Tighter TP targets at the range ceiling.'
+                ),
+                'MIXED': (
+                    'Uncertain regime. Raise selectivity by one level — '
+                    'prefer A-grade setups only, flag any uncertainty in reason.'
+                ),
+            }.get(regime_name, 'Apply standard criteria.')
+            regime_section = (
+                f"\n### Market Regime (system-level classification)\n"
+                f"- Regime: **{regime_name}** (confidence: {regime_ctx.get('confidence', '?')}%)\n"
+                f"- Market Breadth: {regime_ctx.get('breadth_bullish_pct', '?')}% of tracked assets "
+                f"in bullish 4h EMA structure\n"
+                f"- Trend Strength ADX(4h): {regime_ctx.get('adx_4h') or 'N/A'} "
+                f"(>25 = trending, <20 = ranging)\n"
+                f"- Volatility: {regime_ctx.get('vol_regime', 'N/A')} "
+                f"(realized vol ratio vs 50-bar baseline: {regime_ctx.get('atr_ratio', 'N/A')}×)\n"
+                f"- Position Sizing: {regime_ctx.get('position_size_multiplier', 1.0)}× normal\n"
+                f"→ Regime directive: {regime_guidance}\n"
+            )
+
         # ATR-based SL hint for the rules section
         atr = indicators.get("atr")
         atr_sl_hint = ""
@@ -440,7 +488,7 @@ class Brain:
         prompt = f"""
 {performance_section}## Market Data: {symbol}
 Active Strategy: {strategy}
-{btc_section}
+{btc_section}{regime_section}
 ### Price Context
 - Current Price: {price}
 - 24h High: {high_str} | 24h Low: {low_str}
@@ -574,6 +622,10 @@ Respond with ONLY the JSON object.
             "ema_alignment_4h": ema_stack_4h.get("alignment"),
             "macd_hist_15m": macd_15m.get("histogram"),
             "bb_pct_b_15m": bollinger_15m.get("pct_b"),
+            # Market regime at time of signal
+            "market_regime": regime_ctx.get("regime") if regime_ctx else None,
+            "breadth_bullish_pct": regime_ctx.get("breadth_bullish_pct") if regime_ctx else None,
+            "vol_regime": regime_ctx.get("vol_regime") if regime_ctx else None,
             # Full indicator dicts for completeness
             "indicators": indicators,
         }
@@ -691,6 +743,28 @@ Respond with ONLY the JSON object.
                 time.sleep(5)
                 continue
 
+            # Market regime gating: block strategies not allowed by current regime,
+            # and reduce effective capacity during elevated volatility.
+            strategy_now = self._get_strategy_name()
+            regime_now = self._get_market_regime()
+            if regime_now:
+                allowed = regime_now.get('active_strategies', [])
+                if allowed and strategy_now not in allowed:
+                    log.info(
+                        f"Brain: Blocking batch — strategy {strategy_now} not active "
+                        f"in {regime_now['regime']} regime (active: {allowed})"
+                    )
+                    self.db.delete('filtered_candidates')
+                    time.sleep(5)
+                    continue
+                vol = regime_now.get('vol_regime', 'NORMAL')
+                if vol == 'EXTREME':
+                    max_open = max(1, math.ceil(max_open * 0.5))
+                    log.info(f"Brain: EXTREME volatility — reducing effective max_open to {max_open}")
+                elif vol == 'ELEVATED':
+                    max_open = max(1, math.ceil(max_open * 0.75))
+                    log.info(f"Brain: ELEVATED volatility — reducing effective max_open to {max_open}")
+
             for item in candidates:
                 # Re-check at max capacity before each item (avoids race: 10th order opened after batch start)
                 open_count = shared_db.get_open_order_count()
@@ -760,6 +834,9 @@ Respond with ONLY the JSON object.
 
                 # Merge AI verdict with market data and attach unique signal_id
                 final_signal = {**item, **analysis, "signal_id": signal_id}
+                if regime_now:
+                    final_signal['position_size_multiplier'] = regime_now.get('position_size_multiplier', 1.0)
+                    final_signal['market_regime'] = regime_now.get('regime', 'MIXED')
 
                 # Never send a signal if at max open orders or already have open order for this symbol
                 if shared_db.get_open_order_count() >= shared_db.get_max_open_orders():

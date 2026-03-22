@@ -273,6 +273,57 @@ tr.loss td { background: rgba(255,71,87,0.04); }
 .summary-item .s-label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
 .summary-item .s-value { font-weight: bold; margin-top: 1px; }
 
+/* ── Regime card ───────────────────────────────── */
+.regime-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px 20px;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  flex-wrap: wrap;
+}
+.regime-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: bold;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+.regime-stat { text-align: center; min-width: 80px; }
+.regime-stat .rs-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+.regime-stat .rs-value { font-size: 15px; font-weight: bold; }
+.confidence-track {
+  background: #1e2d4a;
+  border-radius: 3px;
+  height: 4px;
+  width: 100%;
+  margin-top: 6px;
+  overflow: hidden;
+}
+.confidence-fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+.strategy-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+.strategy-pill {
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: bold;
+  background: #1e2d4a;
+  color: var(--accent);
+  border: 1px solid #2a3f60;
+}
+
 /* ── Market cards ──────────────────────────────── */
 .btc-card {
   background: var(--card);
@@ -730,6 +781,39 @@ tr.loss td { background: rgba(255,71,87,0.04); }
 
     <!-- ══ MARKET ═══════════════════════════════════════════════════ -->
     <section id="section-market" class="section">
+
+      <!-- Regime card -->
+      <div class="regime-card" id="regime-card">
+        <div>
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Market Regime</div>
+          <div class="regime-badge" id="regime-badge">--</div>
+          <div class="confidence-track" style="width:140px;margin-top:8px">
+            <div class="confidence-fill" id="regime-conf-bar" style="width:0%"></div>
+          </div>
+          <div style="font-size:10px;color:var(--muted);margin-top:3px" id="regime-conf-label">Confidence --</div>
+        </div>
+        <div class="regime-stat">
+          <div class="rs-label">Breadth Bullish</div>
+          <div class="rs-value" id="regime-breadth">--</div>
+        </div>
+        <div class="regime-stat">
+          <div class="rs-label">ADX (4h)</div>
+          <div class="rs-value" id="regime-adx">--</div>
+        </div>
+        <div class="regime-stat">
+          <div class="rs-label">Volatility</div>
+          <div class="rs-value" id="regime-vol">--</div>
+        </div>
+        <div class="regime-stat">
+          <div class="rs-label">Size Mult</div>
+          <div class="rs-value" id="regime-size">--</div>
+        </div>
+        <div>
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Active Strategies</div>
+          <div class="strategy-pills" id="regime-strategies"></div>
+        </div>
+      </div>
+
       <div class="btc-card" id="btc-card">
         <div class="btc-main">
           <div class="btc-label">Bitcoin</div>
@@ -1357,6 +1441,51 @@ async function loadMarket() {
         vwapEl.textContent = fmtPct(btc.vwap_pct);
         vwapEl.style.color = btc.vwap_pct >= 0 ? 'var(--green)' : 'var(--red)';
       }
+    }
+
+    // Market regime
+    const regime = d.market_regime;
+    if (regime) {
+      const regimeColors = {
+        BULL_TRENDING:  { color: 'var(--green)',  bg: 'rgba(0,255,157,0.12)',  label: 'BULL TRENDING' },
+        BEAR_TRENDING:  { color: 'var(--red)',    bg: 'rgba(255,71,87,0.12)',  label: 'BEAR TRENDING' },
+        RANGING:        { color: 'var(--yellow)', bg: 'rgba(255,211,42,0.12)', label: 'RANGING' },
+        MIXED:          { color: 'var(--muted)',  bg: 'rgba(100,116,139,0.15)', label: 'MIXED' },
+      };
+      const rc = regimeColors[regime.regime] || regimeColors.MIXED;
+      const badge = document.getElementById('regime-badge');
+      badge.textContent = rc.label;
+      badge.style.color = rc.color;
+      badge.style.background = rc.bg;
+      badge.style.border = `1px solid ${rc.color}`;
+
+      const conf = regime.confidence || 0;
+      document.getElementById('regime-conf-bar').style.width = conf + '%';
+      document.getElementById('regime-conf-label').textContent = `Confidence ${conf}%`;
+
+      const breadthEl = document.getElementById('regime-breadth');
+      const bpct = regime.breadth_bullish_pct;
+      breadthEl.textContent = bpct !== undefined ? bpct.toFixed(1) + '%' : '--';
+      breadthEl.style.color = bpct >= 55 ? 'var(--green)' : bpct <= 40 ? 'var(--red)' : 'var(--yellow)';
+
+      const adxEl = document.getElementById('regime-adx');
+      adxEl.textContent = regime.adx_4h !== null && regime.adx_4h !== undefined ? regime.adx_4h.toFixed(1) : '--';
+      adxEl.style.color = regime.adx_4h >= 25 ? 'var(--accent)' : 'var(--muted)';
+
+      const volEl = document.getElementById('regime-vol');
+      volEl.textContent = regime.vol_regime || '--';
+      volEl.style.color = regime.vol_regime === 'EXTREME' ? 'var(--red)' : regime.vol_regime === 'ELEVATED' ? 'var(--yellow)' : 'var(--green)';
+
+      const sizeEl = document.getElementById('regime-size');
+      const sm = regime.position_size_multiplier;
+      sizeEl.textContent = sm !== undefined ? sm.toFixed(2) + '×' : '--';
+      sizeEl.style.color = sm >= 1.0 ? 'var(--green)' : sm >= 0.75 ? 'var(--yellow)' : 'var(--red)';
+
+      const pillsEl = document.getElementById('regime-strategies');
+      const strategies = regime.active_strategies || [];
+      pillsEl.innerHTML = strategies.length
+        ? strategies.map(s => `<span class="strategy-pill">${s}</span>`).join('')
+        : '<span style="color:var(--muted);font-size:11px">none</span>';
     }
 
     // Active symbols

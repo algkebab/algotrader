@@ -247,6 +247,48 @@ class Filter:
             "description": description,
         }
 
+    def _compute_adx(self, candles: list, period: int = 14) -> float | None:
+        """Compute ADX (Average Directional Index) using Wilder's smoothing.
+
+        ADX measures trend *strength*, not direction: >25 = trending, <20 = ranging.
+        Uses Wilder's method: smooth +DM, -DM, ATR separately; compute DX at each bar;
+        then smooth DX values into ADX.
+        Returns None when there is insufficient data (need >= period * 2 + 1 candles).
+        """
+        if len(candles) < period * 2 + 1:
+            return None
+        plus_dms, minus_dms, trs = [], [], []
+        for i in range(1, len(candles)):
+            h, l, pc = candles[i][2], candles[i][3], candles[i - 1][4]
+            ph, pl = candles[i - 1][2], candles[i - 1][3]
+            up, dn = h - ph, pl - l
+            plus_dms.append(up if up > dn and up > 0 else 0.0)
+            minus_dms.append(dn if dn > up and dn > 0 else 0.0)
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        # Seed smoothed values with sum of first `period` bars
+        tr14  = sum(trs[:period])
+        pdm14 = sum(plus_dms[:period])
+        mdm14 = sum(minus_dms[:period])
+        dx_values = []
+        for i in range(period, len(trs)):
+            tr14  = tr14  - tr14  / period + trs[i]
+            pdm14 = pdm14 - pdm14 / period + plus_dms[i]
+            mdm14 = mdm14 - mdm14 / period + minus_dms[i]
+            if tr14 == 0:
+                continue
+            pdi = 100 * pdm14 / tr14
+            mdi = 100 * mdm14 / tr14
+            denom = pdi + mdi
+            if denom == 0:
+                continue
+            dx_values.append(100 * abs(pdi - mdi) / denom)
+        if len(dx_values) < period:
+            return None
+        adx = sum(dx_values[:period]) / period
+        for dx in dx_values[period:]:
+            adx = (adx * (period - 1) + dx) / period
+        return round(adx, 2)
+
     def _compute_recent_change(self, candles_15m: list, lookback: int = 16) -> float:
         """Price change over the last `lookback` 15m bars (default 16 = 4 hours).
 
@@ -369,12 +411,31 @@ class Filter:
 
         candles_15m = data.get('candles_15m', [])
         candles_1h = data.get('candles_1h', [])
+        candles_4h = data.get('candles_4h', [])
         if not candles_15m:
             log.warning("Filter: market_data:BTC/USDT has no candles_15m — cannot compute BTC context")
             return
 
         rsi = self.calculate_rsi(candles_15m)
         indicators = self._compute_technical_indicators(candles_15m, candles_1h)
+
+        # 4h EMA, ADX, and volatility ratio — regime detection inputs
+        ema_stack_4h = None
+        adx_4h = None
+        atr_ratio = None
+        if candles_4h:
+            closes_4h = [c[4] for c in candles_4h]
+            ema_stack_4h = self._compute_ema_stack(closes_4h)
+            adx_4h = self._compute_adx(candles_4h, period=14)
+            # Volatility ratio: RMS of recent 14-bar returns vs 50-bar historical
+            if len(candles_4h) >= 65:
+                recent_ret = [(candles_4h[i][4] - candles_4h[i - 1][4]) / candles_4h[i - 1][4]
+                              for i in range(len(candles_4h) - 14, len(candles_4h))]
+                hist_ret = [(candles_4h[i][4] - candles_4h[i - 1][4]) / candles_4h[i - 1][4]
+                            for i in range(len(candles_4h) - 50, len(candles_4h))]
+                vol_r = (sum(r * r for r in recent_ret) / len(recent_ret)) ** 0.5
+                vol_h = (sum(r * r for r in hist_ret) / len(hist_ret)) ** 0.5
+                atr_ratio = round(vol_r / vol_h, 2) if vol_h > 0 else 1.0
 
         price = data.get('last_price')
         vwap = indicators.get('vwap')
@@ -390,6 +451,9 @@ class Filter:
             "ema_stack_15m": indicators.get('ema_stack_15m'),
             "ema_stack_1h":  indicators.get('ema_stack_1h'),
             "macd_15m":      indicators.get('macd_15m'),
+            "ema_stack_4h":  ema_stack_4h,
+            "adx_4h":        adx_4h,
+            "atr_ratio":     atr_ratio,
         }
 
         # TTL 180s — valid across multiple filter cycles (filter runs every 10s)
@@ -399,7 +463,113 @@ class Filter:
             f"Filter: BTC context updated — RSI: {rsi} "
             f"| EMA(15m): {(indicators.get('ema_stack_15m') or {}).get('alignment', 'N/A')} "
             f"| EMA(1h): {(indicators.get('ema_stack_1h') or {}).get('alignment', 'N/A')} "
+            f"| EMA(4h): {(ema_stack_4h or {}).get('alignment', 'N/A')} "
+            f"| ADX(4h): {adx_4h or 'N/A'} "
             f"| VWAP: {vwap_str}"
+        )
+
+    def _compute_and_store_market_regime(self, breadth_stats: dict) -> None:
+        """Classify market regime from BTC 4h trend + ADX + market breadth + volatility.
+
+        Four regimes — each drives different strategy gating and position sizing:
+          BULL_TRENDING  — momentum strategies favored, full sizing
+          BEAR_TRENDING  — only reversal setups pass, half sizing
+          RANGING        — mean-reversion favored, breakouts disabled, 75% sizing
+          MIXED          — uncertain, conservative strategies only, 75% sizing
+
+        Volatility overlay (ELEVATED/EXTREME) further reduces sizing on top of regime.
+        Publishes to Redis with 5-minute TTL so downstream services stay fresh.
+        """
+        btc_raw = self.db.get(shared_config.REDIS_KEY_BTC_CONTEXT)
+        if not btc_raw:
+            return
+        try:
+            btc = json.loads(btc_raw)
+        except Exception:
+            return
+
+        btc_4h_align = (btc.get('ema_stack_4h') or {}).get('alignment', 'MIXED')
+        adx_4h = btc.get('adx_4h') or 0.0
+        btc_rsi = float(btc.get('rsi') or 50)
+        atr_ratio = float(btc.get('atr_ratio') or 1.0)
+
+        total = breadth_stats.get('total', 0)
+        breadth_bull_pct = round(breadth_stats['bullish_4h'] / total * 100, 1) if total > 0 else 50.0
+        breadth_rsi_pct  = round(breadth_stats['rsi_above_50'] / total * 100, 1) if total > 0 else 50.0
+
+        # Volatility regime from 4h realized-vol ratio
+        if atr_ratio > 2.0:
+            vol_regime = "EXTREME"
+        elif atr_ratio > 1.5:
+            vol_regime = "ELEVATED"
+        else:
+            vol_regime = "NORMAL"
+
+        # Confluence scoring — each signal votes bull or bear (max 5 each side)
+        bull_votes = bear_votes = 0
+        if btc_4h_align in ('BULLISH', 'RECOVERING'):   bull_votes += 1
+        if btc_4h_align in ('BEARISH', 'WEAKENING'):    bear_votes += 1
+        if breadth_bull_pct >= 55:                       bull_votes += 1
+        if breadth_bull_pct <= 40:                       bear_votes += 1
+        if adx_4h >= 25 and btc_4h_align in ('BULLISH', 'RECOVERING'):  bull_votes += 1
+        if adx_4h >= 25 and btc_4h_align in ('BEARISH', 'WEAKENING'):   bear_votes += 1
+        if btc_rsi >= 50:                                bull_votes += 1
+        if btc_rsi < 50:                                 bear_votes += 1
+        if breadth_rsi_pct >= 55:                        bull_votes += 1
+        if breadth_rsi_pct < 45:                         bear_votes += 1
+
+        # Regime classification
+        if adx_4h < 20 and adx_4h > 0:
+            regime = "RANGING"
+            confidence = max(30, int((1 - adx_4h / 20) * 80))
+        elif bull_votes >= 3:
+            regime = "BULL_TRENDING"
+            confidence = int(bull_votes / 5 * 100)
+        elif bear_votes >= 3:
+            regime = "BEAR_TRENDING"
+            confidence = int(bear_votes / 5 * 100)
+        else:
+            regime = "MIXED"
+            confidence = 40
+
+        # Strategy gating per regime
+        if regime == "BULL_TRENDING":
+            active_strategies = ["CONSERVATIVE", "AGGRESSIVE", "REVERSAL"]
+            size_mult = 1.0
+        elif regime == "BEAR_TRENDING":
+            active_strategies = ["REVERSAL"]   # only counter-trend longs in a downtrend
+            size_mult = 0.5
+        elif regime == "RANGING":
+            active_strategies = ["CONSERVATIVE", "REVERSAL"]  # breakouts fail in ranges
+            size_mult = 0.75
+        else:  # MIXED
+            active_strategies = ["CONSERVATIVE", "REVERSAL"]
+            size_mult = 0.75
+
+        # Volatility overlay reduces sizing further on top of regime
+        if vol_regime == "EXTREME":
+            size_mult = round(size_mult * 0.5, 2)
+        elif vol_regime == "ELEVATED":
+            size_mult = round(size_mult * 0.75, 2)
+
+        payload = {
+            "regime": regime,
+            "confidence": confidence,
+            "btc_4h_alignment": btc_4h_align,
+            "adx_4h": round(adx_4h, 2) if adx_4h else None,
+            "breadth_bullish_pct": breadth_bull_pct,
+            "breadth_rsi_above_50_pct": breadth_rsi_pct,
+            "vol_regime": vol_regime,
+            "atr_ratio": round(atr_ratio, 2),
+            "active_strategies": active_strategies,
+            "position_size_multiplier": size_mult,
+            "updated_at": datetime.now(timezone.utc).isoformat() + "Z",
+        }
+        self.db.set(shared_config.REDIS_KEY_MARKET_REGIME, json.dumps(payload), ex=300)
+        log.info(
+            f"Filter: Market regime → {regime} ({confidence}% confidence) "
+            f"| Breadth: {breadth_bull_pct:.0f}% bullish | ADX: {adx_4h:.1f} "
+            f"| Vol: {vol_regime} ({atr_ratio:.2f}×) | Active: {active_strategies}"
         )
 
     def _get_strategy(self):
@@ -463,6 +633,36 @@ class Filter:
             results = pipe.execute()
 
             # BTC context was already refreshed at the top of the loop
+
+            # Market breadth: scan ALL symbols for 4h EMA alignment (pre-filter universe)
+            breadth_stats = {'total': 0, 'bullish_4h': 0, 'bearish_4h': 0, 'rsi_above_50': 0}
+            for raw_b in results:
+                if not raw_b:
+                    continue
+                try:
+                    d_b = json.loads(raw_b)
+                except Exception:
+                    continue
+                breadth_stats['total'] += 1
+                c4h_b = d_b.get('candles_4h', [])
+                if len(c4h_b) >= 50:
+                    ema_b = self._compute_ema_stack([c[4] for c in c4h_b])
+                    if ema_b:
+                        if ema_b['alignment'] in ('BULLISH', 'RECOVERING'):
+                            breadth_stats['bullish_4h'] += 1
+                        elif ema_b['alignment'] in ('BEARISH', 'WEAKENING'):
+                            breadth_stats['bearish_4h'] += 1
+                if self.calculate_rsi(d_b.get('candles_15m', [])) > 50:
+                    breadth_stats['rsi_above_50'] += 1
+
+            # Read regime computed last cycle — used to gate candidates this cycle
+            current_regime = None
+            try:
+                regime_raw = self.db.get(shared_config.REDIS_KEY_MARKET_REGIME)
+                if regime_raw:
+                    current_regime = json.loads(regime_raw)
+            except Exception:
+                pass
 
             filtered_candidates = []
 
@@ -538,6 +738,16 @@ class Filter:
                             log.debug(f"Filter: {symbol} skipped — 4h EMA BEARISH in AGGRESSIVE mode")
                             continue
 
+                    # Market regime strategy gate: block strategies not active in current regime
+                    if current_regime:
+                        allowed = current_regime.get('active_strategies', [])
+                        if allowed and strategy_name not in allowed:
+                            log.debug(
+                                f"Filter: {symbol} skipped — {strategy_name} not active "
+                                f"in {current_regime['regime']} regime"
+                            )
+                            continue
+
                     data['symbol'] = symbol
                     data['rvol'] = round(rvol, 2)
                     data['rsi'] = rsi
@@ -565,6 +775,12 @@ class Filter:
                     pass  # Don't write; next cycle Filter will stay idle
                 else:
                     self.db.set('filtered_candidates', json.dumps(filtered_candidates))
+
+            # Compute and publish market regime for next cycle
+            try:
+                self._compute_and_store_market_regime(breadth_stats)
+            except Exception as e:
+                log.warning(f"Filter: Market regime update failed: {e}")
 
             time.sleep(10)
 
