@@ -423,6 +423,32 @@ tr.loss td { background: rgba(255,71,87,0.04); }
   .two-col-eq { grid-template-columns: 1fr !important; }
   .three-col  { grid-template-columns: 1fr 1fr !important; }
 
+  /*
+   * Critical: without min-width:0, grid children can grow beyond their
+   * 1fr cell to fit table content, making them wider than every other card.
+   */
+  .kpi-row > *, .two-col > *, .two-col-eq > *, .three-col > * { min-width: 0; }
+
+  /* Cards must not burst outside the viewport */
+  .card, .chart-card, .kpi-card { max-width: 100%; overflow: hidden; }
+
+  /* Table wrappers: horizontal scroll + iOS momentum + right-fade scroll hint */
+  .tbl-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    -webkit-mask-image: linear-gradient(to right, black 88%, transparent 100%);
+    mask-image: linear-gradient(to right, black 88%, transparent 100%);
+  }
+  .tbl-wrap.scrolled-end { -webkit-mask-image: none; mask-image: none; }
+
+  /*
+   * table width: max-content lets the table be as wide as it needs to be
+   * while the .tbl-wrap clips and scrolls it — this is the correct pattern.
+   * min-width: 100% prevents it from being narrower than its card.
+   */
+  table { font-size: 11px; width: max-content; min-width: 100%; }
+  th, td { padding: 6px 8px; }
+
   /* Summary bar wraps on small screens */
   .summary-bar { flex-wrap: wrap; gap: 12px 20px; }
 
@@ -433,12 +459,8 @@ tr.loss td { background: rgba(255,71,87,0.04); }
   .nav-link { padding: 14px 20px; font-size: 13px; }
 
   /* Tabs: scrollable row if they overflow */
-  .tab-row { overflow-x: auto; padding-bottom: 2px; }
+  .tab-row { overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
   .tab { white-space: nowrap; padding: 8px 16px; font-size: 12px; }
-
-  /* Tables scroll horizontally (already have tbl-wrap) */
-  table { font-size: 11px; }
-  th, td { padding: 6px 8px; }
 }
 
 /* ── Tablet: sidebar visible but slightly narrower ─ */
@@ -848,6 +870,21 @@ function flashDot() {
   setTimeout(() => dot.classList.remove('flash'), 1200);
 }
 
+// ── Scroll-end fade hint for table wrappers ────────────────────────────────────
+function bindScrollFade() {
+  document.querySelectorAll('.tbl-wrap').forEach(el => {
+    if (el._scrollBound) return;
+    el._scrollBound = true;
+    const update = () => {
+      const atEnd = el.scrollLeft + el.clientWidth >= el.scrollWidth - 4;
+      el.classList.toggle('scrolled-end', atEnd);
+    };
+    el.addEventListener('scroll', update, { passive: true });
+    update(); // run once so tables narrower than the card have no fade
+  });
+}
+bindScrollFade();
+
 // ── Sidebar toggle (mobile) ────────────────────────────────────────────────────
 function toggleSidebar() {
   const open = document.getElementById('sidebar').classList.toggle('open');
@@ -1159,8 +1196,7 @@ async function loadPositions() {
         </tr>`).join('');
     }
 
-    // Recent trades (piggyback on positions call by fetching trades endpoint quick subset)
-    // We use the period=week and just show first 10 rows
+    bindScrollFade();
   } catch (e) { console.error('positions', e); }
 }
 
@@ -1180,6 +1216,7 @@ async function loadRecentTrades() {
         <td style="color:${pnlColor(t.pnl_usdt)};font-weight:bold">${fmtPnl(t.pnl_usdt)}</td>
         <td>${closeBadge(t.close_reason)}</td>
       </tr>`).join('');
+    bindScrollFade();
   } catch (e) { console.error('recent trades', e); }
 }
 
@@ -1226,6 +1263,7 @@ async function loadTrades(period) {
         <td class="green">${t.mfe_pct !== null ? '+' + fmt(t.mfe_pct) + '%' : '--'}</td>
         <td class="red">${t.mae_pct !== null ? fmt(t.mae_pct) + '%' : '--'}</td>
       </tr>`).join('');
+    bindScrollFade();
   } catch (e) { console.error('trades', e); }
 }
 
