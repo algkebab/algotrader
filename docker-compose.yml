@@ -110,6 +110,24 @@ services:
       - redis
     restart: always
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: services/dashboard/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - DATABASE_PATH=/data/algotrader.db
+      - DASHBOARD_USER=admin
+      - DASHBOARD_PASSWORD=changeme
+    volumes:
+      - trading_data:/data
+    depends_on:
+      - redis
+    restart: always
+
 volumes:
   trading_data:
   redis_data:
