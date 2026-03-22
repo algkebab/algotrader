@@ -411,6 +411,40 @@ tr.loss td { background: rgba(255,71,87,0.04); }
 .mb8   { margin-bottom: 8px; }
 .mb14  { margin-bottom: 14px; }
 
+/* ── Backtest section ───────────────────────────── */
+.bt-form { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 16px; }
+.bt-form label { font-size: 11px; color: var(--muted); display: block; margin-bottom: 4px; letter-spacing: .05em; }
+.bt-form select, .bt-form input[type="number"] {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 7px 10px; border-radius: 4px; font-size: 12px; font-family: inherit;
+  min-width: 140px;
+}
+.bt-form select:focus, .bt-form input[type="number"]:focus { outline: none; border-color: var(--accent); }
+.bt-run-btn {
+  background: var(--accent); color: #000; border: none; padding: 7px 18px;
+  border-radius: 4px; font-size: 12px; font-family: inherit; font-weight: bold;
+  cursor: pointer; letter-spacing: .06em; transition: opacity .15s;
+}
+.bt-run-btn:hover { opacity: 0.85; }
+.bt-run-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.bt-progress-card { padding: 16px 20px; }
+.bt-progress-label { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.bt-progress-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.bt-progress-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width .5s; }
+.bt-status-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: bold; letter-spacing: .06em; }
+.bt-status-running  { background: rgba(0,212,255,.15); color: var(--accent); }
+.bt-status-done     { background: rgba(0,255,157,.15); color: var(--green); }
+.bt-status-error    { background: rgba(255,71,87,.15);  color: var(--red); }
+.bt-status-idle     { background: rgba(100,116,139,.15); color: var(--muted); }
+.bt-results-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.bt-results-table th { color: var(--muted); font-weight: normal; text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); letter-spacing: .05em; }
+.bt-results-table td { padding: 7px 8px; border-bottom: 1px solid rgba(30,45,74,.6); vertical-align: middle; }
+.bt-results-table tr:hover td { background: rgba(0,212,255,.03); cursor: pointer; }
+.bt-trade-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.bt-trade-table th { color: var(--muted); font-weight: normal; text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); }
+.bt-trade-table td { padding: 5px 6px; border-bottom: 1px solid rgba(30,45,74,.5); }
+#bt-trades-panel { display: none; margin-top: 16px; }
+
 /* ── Hamburger button (hidden on desktop) ──────── */
 #menu-btn {
   display: none;
@@ -549,6 +583,9 @@ tr.loss td { background: rgba(255,71,87,0.04); }
     </div>
     <div class="nav-link" data-section="settings" onclick="showSection('settings')">
       <span class="nav-icon">&#9881;</span> Settings
+    </div>
+    <div class="nav-link" data-section="backtest" onclick="showSection('backtest')">
+      <span class="nav-icon">&#9654;</span> Backtest
     </div>
   </div>
   <div class="sidebar-footer">Read-only &bull; Auto-refresh ON</div>
@@ -880,6 +917,87 @@ tr.loss td { background: rgba(255,71,87,0.04); }
       </div>
     </section>
 
+    <!-- ══ BACKTEST ═════════════════════════════════════════════════ -->
+    <section id="section-backtest" class="section">
+      <div class="card" style="max-width:760px">
+        <div class="card-title">Run Backtest</div>
+        <div class="bt-form">
+          <div>
+            <label>Strategy</label>
+            <select id="bt-strategy">
+              <option value="CONSERVATIVE">CONSERVATIVE</option>
+              <option value="AGGRESSIVE">AGGRESSIVE</option>
+              <option value="REVERSAL">REVERSAL</option>
+            </select>
+          </div>
+          <div>
+            <label>Initial Balance (USDT)</label>
+            <input type="number" id="bt-balance" value="1000" min="100" max="100000" step="100">
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button class="bt-run-btn" id="bt-run-btn" onclick="startBacktest()">&#9654; Run</button>
+          </div>
+        </div>
+        <div class="muted" style="font-size:10px;margin-bottom:16px">
+          Date range: yesterday &minus; 365 days &bull; Top 30 symbols by volume &bull;
+          Uses code decision engine &bull; Bot version: <span id="bt-bot-version">--</span>
+        </div>
+
+        <!-- Active run progress -->
+        <div id="bt-active-card" class="bt-progress-card card" style="display:none;margin-bottom:16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <span class="card-title" style="margin:0">In Progress</span>
+            <span id="bt-active-badge" class="bt-status-badge bt-status-running">RUNNING</span>
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px" id="bt-active-detail">--</div>
+          <div class="bt-progress-bar">
+            <div class="bt-progress-fill" id="bt-progress-fill" style="width:0%"></div>
+          </div>
+          <div style="font-size:10px;color:var(--muted);margin-top:5px" id="bt-progress-pct">0%</div>
+        </div>
+      </div>
+
+      <!-- Past results -->
+      <div class="card" style="max-width:1100px;margin-top:16px">
+        <div class="card-title">Results History</div>
+        <div id="bt-results-empty" class="muted" style="padding:16px 0;display:none">No completed runs yet.</div>
+        <div style="overflow-x:auto">
+          <table class="bt-results-table" id="bt-results-table">
+            <thead>
+              <tr>
+                <th>Version</th><th>Strategy</th><th>Date Range</th>
+                <th>Balance</th><th>Final</th><th>Net PnL</th>
+                <th>Trades</th><th>Win%</th><th>P/F</th>
+                <th>Sharpe</th><th>Max DD</th><th>Avg Hold</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="bt-results-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Trade drill-down -->
+      <div id="bt-trades-panel" class="card" style="max-width:1100px;margin-top:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div class="card-title" style="margin:0" id="bt-trades-title">Trades</div>
+          <button onclick="closeTrades()" style="background:none;border:1px solid var(--border);color:var(--muted);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:11px">Close</button>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="bt-trade-table">
+            <thead>
+              <tr>
+                <th>Symbol</th><th>Entry</th><th>Exit</th>
+                <th>SL</th><th>TP</th><th>Entry Time</th><th>Exit Time</th>
+                <th>Hold</th><th>P&amp;L (USDT)</th><th>P&amp;L%</th><th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="bt-trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
   </div><!-- #content -->
 </div><!-- #main -->
 
@@ -990,6 +1108,7 @@ function showSection(name) {
   if (name === 'trades') loadTrades(currentPeriod);
   if (name === 'market') loadMarket();
   if (name === 'settings') loadSettings();
+  if (name === 'backtest') loadBacktest();
   closeSidebar(); // auto-close drawer on mobile after navigation
 }
 
@@ -1555,6 +1674,172 @@ async function loadSettings() {
     document.getElementById('cfg-fee').textContent         = d.taker_fee_pct + '%';
   } catch (e) { console.error('settings', e); }
 }
+
+// ── LOAD: Backtest ──────────────────────────────────────────────────────────────
+let _btPollInterval = null;
+
+async function loadBacktest() {
+  // Show bot version
+  try {
+    const s = await api('/api/settings');
+    document.getElementById('bt-bot-version').textContent = s.bot_version || BOT_VERSION || '--';
+  } catch (e) {}
+
+  await loadBacktestStatus();
+  await loadBacktestResults();
+}
+
+async function loadBacktestStatus() {
+  try {
+    const d = await api('/api/backtest/status');
+    const card = document.getElementById('bt-active-card');
+    const btn = document.getElementById('bt-run-btn');
+    if (!d || d.status === 'idle' || d.status === 'completed' || d.status === 'error') {
+      card.style.display = 'none';
+      btn.disabled = false;
+      if (_btPollInterval) { clearInterval(_btPollInterval); _btPollInterval = null; }
+      return;
+    }
+    card.style.display = 'block';
+    btn.disabled = true;
+    const badge = document.getElementById('bt-active-badge');
+    const detail = document.getElementById('bt-active-detail');
+    const fill = document.getElementById('bt-progress-fill');
+    const pctEl = document.getElementById('bt-progress-pct');
+    const pct = parseFloat(d.progress_pct || 0);
+    fill.style.width = pct + '%';
+    pctEl.textContent = pct.toFixed(1) + '%';
+    const statusLabel = d.status === 'running_fetch' ? 'FETCHING DATA' :
+                        d.status === 'running_sim'  ? 'SIMULATING'   : 'RUNNING';
+    badge.textContent = statusLabel;
+    badge.className = 'bt-status-badge bt-status-running';
+    detail.textContent = `${d.strategy} · ${d.symbols_done || 0}/${d.symbols_total || '?'} symbols · Run ${d.id ? d.id.slice(0,8) : '--'}...`;
+    // Keep polling while active
+    if (!_btPollInterval) {
+      _btPollInterval = setInterval(async () => {
+        await loadBacktestStatus();
+        if (currentSection === 'backtest') await loadBacktestResults();
+      }, 5000);
+    }
+  } catch (e) { console.error('bt status', e); }
+}
+
+async function loadBacktestResults() {
+  try {
+    const runs = await api('/api/backtest/results');
+    const tbody = document.getElementById('bt-results-body');
+    const empty = document.getElementById('bt-results-empty');
+    if (!runs || !runs.length) {
+      empty.style.display = 'block';
+      tbody.innerHTML = '';
+      return;
+    }
+    empty.style.display = 'none';
+    tbody.innerHTML = runs.map(r => {
+      const netPnl = r.net_pnl_usdt !== null ? parseFloat(r.net_pnl_usdt) : null;
+      const pnlColor = netPnl === null ? 'var(--muted)' : netPnl >= 0 ? 'var(--green)' : 'var(--red)';
+      const statusCls = r.status === 'completed' ? 'bt-status-done' :
+                        r.status === 'error'     ? 'bt-status-error' :
+                        (r.status || '').includes('running') ? 'bt-status-running' : 'bt-status-idle';
+      const dateRange = r.start_date && r.end_date ? `${r.start_date} → ${r.end_date}` : '--';
+      return `<tr onclick="loadTradesForRun('${r.id}', '${r.strategy}')">
+        <td style="font-size:10px;color:var(--muted)">${r.bot_version || '--'}</td>
+        <td>${stratBadge(r.strategy)}</td>
+        <td style="font-size:10px;color:var(--muted)">${dateRange}</td>
+        <td>$${fmt(r.initial_balance)}</td>
+        <td>$${r.final_balance !== null ? fmt(r.final_balance) : '--'}</td>
+        <td style="color:${pnlColor}">${netPnl !== null ? (netPnl >= 0 ? '+' : '') + '$' + fmt(Math.abs(netPnl)) : '--'}</td>
+        <td>${r.trades_count !== null ? r.trades_count : '--'}</td>
+        <td>${r.win_rate !== null ? r.win_rate + '%' : '--'}</td>
+        <td>${r.profit_factor !== null ? r.profit_factor : '--'}</td>
+        <td>${r.sharpe !== null ? r.sharpe : '--'}</td>
+        <td>${r.max_drawdown !== null ? '$' + fmt(r.max_drawdown) : '--'}</td>
+        <td>${r.avg_hold_hours !== null ? r.avg_hold_hours + 'h' : '--'}</td>
+        <td><span class="bt-status-badge ${statusCls}">${(r.status || '--').toUpperCase()}</span></td>
+      </tr>`;
+    }).join('');
+  } catch (e) { console.error('bt results', e); }
+}
+
+async function loadTradesForRun(runId, strategy) {
+  try {
+    const trades = await api(`/api/backtest/trades/${runId}`);
+    const panel = document.getElementById('bt-trades-panel');
+    const title = document.getElementById('bt-trades-title');
+    const tbody = document.getElementById('bt-trades-body');
+    title.textContent = `Trades — ${strategy} (${trades.length})`;
+    if (!trades.length) {
+      tbody.innerHTML = '<tr><td colspan="11" class="muted" style="padding:12px">No trades for this run.</td></tr>';
+    } else {
+      tbody.innerHTML = trades.map(t => {
+        const pnl = parseFloat(t.pnl_usdt || 0);
+        const pc = parseFloat(t.pnl_pct || 0);
+        const c = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        return `<tr>
+          <td>${t.symbol}</td>
+          <td>${t.entry_price ? parseFloat(t.entry_price).toPrecision(6) : '--'}</td>
+          <td>${t.exit_price ? parseFloat(t.exit_price).toPrecision(6) : '--'}</td>
+          <td>${t.sl_price ? parseFloat(t.sl_price).toPrecision(5) : '--'}</td>
+          <td>${t.tp_price ? parseFloat(t.tp_price).toPrecision(5) : '--'}</td>
+          <td style="font-size:10px;color:var(--muted)">${(t.entry_time || '').slice(0,16).replace('T',' ')}</td>
+          <td style="font-size:10px;color:var(--muted)">${(t.exit_time || '').slice(0,16).replace('T',' ')}</td>
+          <td>${t.hours_held !== null ? parseFloat(t.hours_held).toFixed(1) + 'h' : '--'}</td>
+          <td style="color:${c}">${(pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toFixed(2)}</td>
+          <td style="color:${c}">${(pc >= 0 ? '+' : '') + pc.toFixed(2) + '%'}</td>
+          <td>${closeBadge(t.close_reason)}</td>
+        </tr>`;
+      }).join('');
+    }
+    panel.style.display = 'block';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (e) { console.error('bt trades', e); }
+}
+
+function closeTrades() {
+  document.getElementById('bt-trades-panel').style.display = 'none';
+}
+
+async function startBacktest() {
+  const strategy = document.getElementById('bt-strategy').value;
+  const balance = parseFloat(document.getElementById('bt-balance').value);
+  if (isNaN(balance) || balance < 100) {
+    alert('Enter a valid balance (min 100 USDT).');
+    return;
+  }
+  const btn = document.getElementById('bt-run-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  try {
+    const resp = await fetch('/api/backtest/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ strategy, balance }),
+    });
+    if (resp.status === 409) {
+      alert('A backtest is already running. Wait for it to finish.');
+      btn.disabled = false;
+      btn.textContent = '▶ Run';
+      return;
+    }
+    if (!resp.ok) {
+      const err = await resp.json();
+      alert('Error: ' + (err.error || resp.statusText));
+      btn.disabled = false;
+      btn.textContent = '▶ Run';
+      return;
+    }
+    btn.textContent = '▶ Run';
+    // Poll for status immediately
+    await loadBacktestStatus();
+  } catch (e) {
+    alert('Request failed: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = '▶ Run';
+  }
+}
+
+// ── BOT_VERSION for display ─────────────────────────────────────────────────
+const BOT_VERSION = 'crystal-heron-53';  // updated by gen_version.py at build time
 
 // ── Initial load ───────────────────────────────────────────────────────────────
 loadOverview();

@@ -23,6 +23,7 @@ if _root not in sys.path:
 
 from shared import config as shared_config
 from shared import db as shared_db
+from shared import decision as shared_decision
 from shared import logger as shared_logger
 from shared.version import BOT_VERSION
 
@@ -117,6 +118,13 @@ class Brain:
         if name not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
             name = STRATEGY_DEFAULT
         return name
+
+    def _get_decision_mode(self) -> str:
+        """Return 'gpt' or 'code' (default: gpt)."""
+        val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_DECISION_MODE)
+        if val and val.lower() == "code":
+            return "code"
+        return "gpt"
 
     def should_analyze(self, symbol, current_price):
         """
@@ -797,29 +805,70 @@ Respond with ONLY the JSON object.
                     log.info(f"Brain: Skipping AI for {symbol} (max open orders reached)")
                     break
 
-                log.info(f"Brain: Analyzing {symbol} with AI...")
+                decision_mode = self._get_decision_mode()
+                indicators_dict = {
+                    'vwap':          item.get('vwap'),
+                    'atr':           item.get('atr'),
+                    'ema_stack_15m': item.get('ema_stack_15m'),
+                    'ema_stack_1h':  item.get('ema_stack_1h'),
+                    'ema_stack_4h':  item.get('ema_stack_4h'),
+                    'bollinger_15m': item.get('bollinger_15m'),
+                    'macd_15m':      item.get('macd_15m'),
+                }
+                log.info(f"Brain: Analyzing {symbol} [{decision_mode.upper()}]...")
 
-                analysis, signal_id = self.get_ai_verdict(
-                    symbol,
-                    current_price,
-                    item['rsi'],
-                    item['rvol'],
-                    item.get('candles_15m', []),
-                    item.get('candles_1h', []),
-                    item.get('high_24h'),
-                    item.get('low_24h'),
-                    indicators={
-                        'vwap':          item.get('vwap'),
-                        'atr':           item.get('atr'),
-                        'ema_stack_15m': item.get('ema_stack_15m'),
-                        'ema_stack_1h':  item.get('ema_stack_1h'),
-                        'ema_stack_4h':  item.get('ema_stack_4h'),
-                        'bollinger_15m': item.get('bollinger_15m'),
-                        'macd_15m':      item.get('macd_15m'),
-                    },
-                    change_24h=item.get('change_24h'),
-                    volume_24h=item.get('volume_24h'),
-                )
+                if decision_mode == "code":
+                    btc_bias_str = btc_bias_now if btc_bias_now else "NEUTRAL"
+                    analysis, signal_id = shared_decision.make_decision(
+                        symbol=symbol,
+                        price=current_price,
+                        rsi=item['rsi'],
+                        rvol=item['rvol'],
+                        candles_15m=item.get('candles_15m', []),
+                        candles_1h=item.get('candles_1h', []),
+                        high_24h=item.get('high_24h'),
+                        low_24h=item.get('low_24h'),
+                        indicators=indicators_dict,
+                        change_24h=item.get('change_24h'),
+                        volume_24h=item.get('volume_24h'),
+                        strategy=strategy_now,
+                        btc_bias=btc_bias_str,
+                        regime_ctx=regime_now,
+                    )
+                    # Persist code-mode signal to DB for tracking
+                    try:
+                        with shared_db.get_connection() as conn:
+                            shared_db.init_schema(conn)
+                            shared_db.insert_signal(
+                                conn,
+                                signal_id=signal_id,
+                                symbol=symbol,
+                                stats={
+                                    "symbol": symbol, "price": current_price,
+                                    "rsi": item['rsi'], "rvol": item['rvol'],
+                                    "strategy": strategy_now, "decision_mode": "code",
+                                    "bot_version": BOT_VERSION,
+                                    "indicators": indicators_dict,
+                                },
+                                prompt="[code_engine]",
+                                response=analysis,
+                            )
+                    except Exception as e:
+                        log.error(f"Brain: Failed to persist code signal {signal_id}: {e}")
+                else:
+                    analysis, signal_id = self.get_ai_verdict(
+                        symbol,
+                        current_price,
+                        item['rsi'],
+                        item['rvol'],
+                        item.get('candles_15m', []),
+                        item.get('candles_1h', []),
+                        item.get('high_24h'),
+                        item.get('low_24h'),
+                        indicators=indicators_dict,
+                        change_24h=item.get('change_24h'),
+                        volume_24h=item.get('volume_24h'),
+                    )
 
                 # Negative cache: when AI says WAIT, cache symbol to avoid re-analyzing flat charts
                 if str(analysis.get("verdict", "")).upper() == "WAIT":

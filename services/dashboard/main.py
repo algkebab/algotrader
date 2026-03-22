@@ -8,8 +8,10 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import redis as redis_lib
@@ -18,7 +20,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 sys.path.insert(0, "/app")
-from shared import db, config  # noqa: E402
+from shared import backtest_db, db, config  # noqa: E402
+from shared.version import BOT_VERSION  # noqa: E402
 
 STATIC_DIR = Path(__file__).parent / "static"
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
@@ -440,6 +443,91 @@ async def api_settings():
             "risk_guard_min_rr": config.RISK_GUARD_MIN_RR,
             "taker_fee_pct": round(config.BINANCE_TAKER_FEE * 100, 2),
         }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ── Backtest routes ────────────────────────────────────────────────────────────
+
+@app.post("/api/backtest/start")
+async def api_backtest_start(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    strategy = str(body.get("strategy", "CONSERVATIVE")).upper()
+    if strategy not in {"CONSERVATIVE", "AGGRESSIVE", "REVERSAL"}:
+        strategy = "CONSERVATIVE"
+    initial_balance = float(body.get("balance", 1000.0))
+
+    # Block if a run is already in progress
+    with backtest_db.get_connection() as conn:
+        backtest_db.init_schema(conn)
+        active = backtest_db.get_active_run(conn)
+        if active:
+            return JSONResponse(
+                status_code=409,
+                content={"error": "A backtest run is already in progress", "run_id": active["id"]},
+            )
+
+    run_id = str(uuid.uuid4())
+    yesterday = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    start_date = (yesterday - timedelta(days=365)).strftime("%Y-%m-%d")
+    end_date = yesterday.strftime("%Y-%m-%d")
+
+    with backtest_db.get_connection() as conn:
+        backtest_db.init_schema(conn)
+        backtest_db.create_run(
+            conn, run_id=run_id, bot_version=BOT_VERSION, strategy=strategy,
+            start_date=start_date, end_date=end_date, initial_balance=initial_balance,
+        )
+
+    # Spawn backtest subprocess — non-blocking
+    script_path = "/app/scripts/backtest.py"
+    if not os.path.exists(script_path):
+        script_path = str(Path(__file__).parent.parent.parent / "scripts" / "backtest.py")
+    subprocess.Popen(
+        [sys.executable, script_path,
+         "--run-id", run_id,
+         "--strategy", strategy,
+         "--balance", str(initial_balance)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    return {"run_id": run_id, "strategy": strategy, "balance": initial_balance,
+            "start_date": start_date, "end_date": end_date}
+
+
+@app.get("/api/backtest/status")
+async def api_backtest_status():
+    try:
+        with backtest_db.get_connection() as conn:
+            backtest_db.init_schema(conn)
+            active = backtest_db.get_active_run(conn)
+            return active or {"status": "idle"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/backtest/results")
+async def api_backtest_results():
+    try:
+        with backtest_db.get_connection() as conn:
+            backtest_db.init_schema(conn)
+            runs = backtest_db.get_all_runs(conn)
+            return runs
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/backtest/trades/{run_id}")
+async def api_backtest_trades(run_id: str):
+    try:
+        with backtest_db.get_connection() as conn:
+            backtest_db.init_schema(conn)
+            trades = backtest_db.get_trades_for_run(conn, run_id)
+            return trades
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 

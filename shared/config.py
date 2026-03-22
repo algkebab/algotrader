@@ -38,6 +38,7 @@ SYSTEM_KEY_BALANCE_LAST_CHECK = "balance_last_check"
 SYSTEM_KEY_STRATEGY = "strategy"
 SYSTEM_KEY_TIMEZONE_OFFSET_MIN = "timezone_offset_min"
 SYSTEM_KEY_SIGNAL_WAIT = "signal_wait"
+SYSTEM_KEY_DECISION_MODE = "decision_mode"  # "gpt" (default) | "code"
 
 # --- Redis key (pipeline data; Scout writes, Filter reads) ---
 REDIS_KEY_ACTIVE_SYMBOLS = "active_symbols"

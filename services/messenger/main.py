@@ -79,6 +79,7 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols {shared_config.MAX_SYMBOLS_DEFAULT}). Min {shared_config.MAX_SYMBOLS_MIN}, max {shared_config.MAX_SYMBOLS_MAX}. Default {shared_config.MAX_SYMBOLS_DEFAULT}.
 🛡️ • *strategy* <name> — Strategy: conservative, aggressive, reversal. Default: CONSERVATIVE.
 🕒 • *set timezone* <offset> — Local timezone offset vs UTC in hours (e.g. set timezone +2, set timezone -5, set timezone 5.5). Affects timestamps in bot messages only.
+🧠 • *set decision* <gpt|code> — Switch Brain between GPT (default) and code-based decision engine.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 📊 • *analytics* <period> — AI performance report: last, today, week, month. Win rate, PnL, insights, recommended tweaks.
 ❓ • *help* — This message."""
@@ -503,6 +504,27 @@ class Messenger:
         log.info(f"Messenger: max_symbols set to {n}")
         await self._safe_reply(update, f"✅ Symbols updated\n\n📈 Scout will fetch top {n} symbols by volume.")
 
+    async def _handle_set_decision(self, update, text: str) -> None:
+        """Set decision mode. Usage: set decision <gpt|code>."""
+        rest = text[len("set decision "):].strip().lower()
+        if rest not in ("gpt", "code"):
+            await self._safe_reply(
+                update,
+                "🧠 Decision mode\n\nUsage: set decision <gpt|code>\n\n"
+                "gpt  — GPT-4o AI analysis (default, requires OpenAI API)\n"
+                "code — Deterministic rule engine (fast, no API cost)",
+            )
+            return
+        self._set_setting(shared_config.SYSTEM_KEY_DECISION_MODE, rest)
+        log.info(f"Messenger: decision_mode set to {rest}")
+        mode_emoji = "🤖" if rest == "gpt" else "⚙️"
+        await self._safe_reply(
+            update,
+            f"{mode_emoji} Decision mode set to {rest.upper()}\n\n"
+            + ("GPT-4o will analyze candidates." if rest == "gpt"
+               else "Code rule engine will analyze candidates (fast, deterministic)."),
+        )
+
     async def _handle_strategy(self, update, text: str) -> None:
         """Set strategy. Usage: strategy <name>. Values: conservative, aggressive, reversal."""
         rest = text[len("strategy "):].strip().lower() if text.startswith("strategy ") else ""
@@ -818,6 +840,8 @@ class Messenger:
                 update,
                 "📢 WAIT signals: " + ("ON" if signal_wait == "1" else "OFF") + "\n\nUse *signal wait on* or *signal wait off* to change.",
             )
+        elif text.startswith("set decision "):
+            await self._handle_set_decision(update, text)
         elif text == "stats" or text.startswith("stats "):
             await self._handle_stats(update, text)
         elif text == "analytics" or text.startswith("analytics "):
