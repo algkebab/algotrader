@@ -43,7 +43,7 @@ STRATEGY_PROFILES = {
         "rsi_min": 40,
         "rsi_max": 70,
         "rsi_1h_max": 70,
-        "min_change": 1.0,
+        "min_change": 0.3,
     },
     "AGGRESSIVE": {
         "min_24h_volume": 5_000_000,
