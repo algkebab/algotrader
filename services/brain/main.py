@@ -704,6 +704,22 @@ Respond with ONLY the JSON object.
         except Exception as e:
             log.warning(f"Brain: Could not write bot_version to DB: {e}")
 
+        # Record BTC benchmark price on first start (for alpha calculation)
+        try:
+            btc_raw = self.db.get("market_data:BTC/USDT")
+            if btc_raw:
+                btc_data = json.loads(btc_raw)
+                btc_price = btc_data.get('last_price')
+                if btc_price:
+                    with shared_db.get_connection() as conn:
+                        shared_db.init_schema(conn)
+                        existing = shared_db.get_benchmark_price(conn, "BTC/USDT")
+                        if existing is None:
+                            shared_db.record_benchmark_price(conn, "BTC/USDT", float(btc_price))
+                            log.info(f"Brain: BTC benchmark price recorded: ${btc_price}")
+        except Exception as e:
+            log.warning(f"Brain: Could not record BTC benchmark: {e}")
+
         while True:
             if shared_db.get_setting_value(shared_config.SYSTEM_KEY_TRADING_PAUSED) == "1":
                 time.sleep(5)

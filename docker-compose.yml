@@ -69,6 +69,20 @@ services:
     depends_on:
       - redis
 
+  backtester:
+    build:
+      context: .
+      dockerfile: services/backtester/Dockerfile
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - DATABASE_PATH=/data/algotrader.db
+    volumes:
+      - trading_data:/data
+    depends_on:
+      - redis
+
   messenger:
     build:
       context: .

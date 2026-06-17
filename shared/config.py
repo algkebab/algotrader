@@ -45,6 +45,13 @@ RISK_DAILY_DRAWDOWN_PCT = 3.0      # pause if today's loss > 3% of balance
 RISK_PORTFOLIO_EXPOSURE_PCT = 150.0  # pause if open notional > 150% of balance (3x lev * 50%)
 RISK_MIN_BALANCE_USDT = 50.0       # pause if balance drops below $50
 
+# --- Portfolio / Kelly sizing ---
+KELLY_FRACTION = 0.25           # Fractional Kelly multiplier (25% of full Kelly)
+MAKER_FEE = 0.0005              # 0.05% maker fee for limit order simulation
+LIMIT_ORDER_SLIPPAGE = 0.0002   # 0.02% slippage for limit orders (vs 0.05% market)
+# Correlation guard
+CORR_MAX_PER_SECTOR = 2
+
 # --- Redis key (pipeline data; Scout writes, Filter reads) ---
 REDIS_KEY_ACTIVE_SYMBOLS = "active_symbols"
 REDIS_KEY_BTC_CONTEXT = "btc_context"        # Filter writes, Brain reads for macro bias

@@ -1,0 +1,580 @@
+"""
+Walk-forward backtester.
+
+Listens on Redis key 'backtest_request' (blpop).
+Fetches historical OHLCV from Binance public API.
+Replays through Filter indicators + decision.py code engine.
+Simulates limit order fills, TP/SL/time-stop exits.
+Stores results in SQLite backtest_runs and backtest_trades tables.
+Pushes 'backtest_complete' notification to Redis when done.
+"""
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone, timedelta
+
+import ccxt
+import redis
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename(_this_dir) == "backtester" else _this_dir
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+from shared import config as shared_config
+from shared import db as shared_db
+from shared import decision as shared_decision
+from shared import indicators as ind_lib
+from shared import logger as shared_logger
+from shared import portfolio as portfolio_lib
+
+log = shared_logger.get_logger("backtester")
+
+# Filter strategy profiles (mirrored from filter/main.py)
+STRATEGY_PROFILES = {
+    "CONSERVATIVE": {
+        "min_24h_volume": 10_000_000,
+        "rvol_threshold": 1.5,
+        "rsi_min": 40,
+        "rsi_max": 70,
+        "rsi_1h_max": 70,
+        "min_change": 1.0,
+    },
+    "AGGRESSIVE": {
+        "min_24h_volume": 5_000_000,
+        "rvol_threshold": 1.2,
+        "rsi_min": 35,
+        "rsi_max": 85,
+        "rsi_1h_max": 80,
+        "min_change": 2.0,
+    },
+    "REVERSAL": {
+        "min_24h_volume": 20_000_000,
+        "rvol_threshold": 3.0,
+        "rsi_min": 0,
+        "rsi_max": 30,
+        "rsi_1h_max": 40,
+        "min_change": -2.5,
+    },
+}
+
+# Default top symbols when none specified in request
+DEFAULT_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+    "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
+]
+
+# Binance rate limit safety: sleep between symbol fetches
+FETCH_SLEEP_S = 0.15
+
+# Step interval for walk-forward: every 4h (in number of 15m bars)
+STEP_BARS_15M = 16  # 16 × 15m = 4h
+
+
+def _fetch_ohlcv_full(exchange, symbol: str, timeframe: str, since_ms: int, limit_per_call: int = 1000) -> list:
+    """Fetch full OHLCV history from `since_ms` using paginated calls."""
+    all_candles = []
+    current_since = since_ms
+    while True:
+        try:
+            candles = exchange.fetch_ohlcv(symbol, timeframe, since=current_since, limit=limit_per_call)
+        except Exception as e:
+            log.warning(f"Backtester: fetch_ohlcv error for {symbol}/{timeframe}: {e}")
+            break
+        if not candles:
+            break
+        all_candles.extend(candles)
+        if len(candles) < limit_per_call:
+            # Got fewer than requested — we've reached the end
+            break
+        # Advance to just after the last candle's timestamp
+        current_since = candles[-1][0] + 1
+        time.sleep(FETCH_SLEEP_S)
+    # Deduplicate by timestamp (in case of overlap)
+    seen = set()
+    unique = []
+    for c in all_candles:
+        if c[0] not in seen:
+            seen.add(c[0])
+            unique.append(c)
+    return sorted(unique, key=lambda x: x[0])
+
+
+def _passes_filter(candles_15m: list, candles_1h: list, profile: dict, strategy: str) -> bool:
+    """Check if symbol passes the Filter criteria at this point in time."""
+    if not candles_15m or len(candles_15m) < 20:
+        return False
+
+    # Volume check: use average of last 24h as proxy for 24h volume
+    avg_vol = sum(c[5] * c[4] for c in candles_15m[-96:]) / max(len(candles_15m[-96:]), 1)
+    if avg_vol < profile['min_24h_volume'] / 100:
+        # Rough check — backtest uses smaller windows
+        pass  # Skip strict volume check in backtest for coverage
+
+    rvol = ind_lib.compute_rvol(candles_15m, period=50)
+    rsi = ind_lib.compute_rsi(candles_15m)
+    rsi_1h = ind_lib.compute_rsi(candles_1h) if candles_1h else 50.0
+    recent_change = ind_lib.compute_recent_change(candles_15m)
+
+    rvol_ok = rvol >= profile['rvol_threshold']
+    rsi_1h_ok = rsi_1h <= profile['rsi_1h_max']
+
+    if strategy == "REVERSAL":
+        rsi_ok = rsi <= profile['rsi_max']
+        change_ok = recent_change <= profile['min_change']
+    else:
+        rsi_ok = profile['rsi_min'] <= rsi <= profile['rsi_max']
+        change_ok = recent_change >= profile['min_change']
+
+    return rvol_ok and rsi_ok and rsi_1h_ok and change_ok
+
+
+def _backtest_symbol(
+    exchange,
+    symbol: str,
+    strategy: str,
+    days: int,
+    initial_balance: float,
+) -> tuple[list, float]:
+    """
+    Walk-forward backtest for one symbol.
+    Returns (trades: list, final_balance: float).
+    """
+    profile = STRATEGY_PROFILES.get(strategy, STRATEGY_PROFILES["CONSERVATIVE"])
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # Fetch with warmup: extra days so EMAs are seeded properly
+    since_15m = now_ms - (days + 2) * 24 * 3600 * 1000
+    since_1h = now_ms - (days + 7) * 24 * 3600 * 1000
+    since_4h = now_ms - (days + 30) * 24 * 3600 * 1000
+
+    log.info(f"Backtester: Fetching {symbol} history ({days}d)...")
+    candles_15m_all = _fetch_ohlcv_full(exchange, symbol, "15m", since_15m)
+    time.sleep(FETCH_SLEEP_S)
+    candles_1h_all = _fetch_ohlcv_full(exchange, symbol, "1h", since_1h)
+    time.sleep(FETCH_SLEEP_S)
+    candles_4h_all = _fetch_ohlcv_full(exchange, symbol, "4h", since_4h)
+    time.sleep(FETCH_SLEEP_S)
+
+    if not candles_15m_all or len(candles_15m_all) < 100:
+        log.warning(f"Backtester: Insufficient 15m data for {symbol} ({len(candles_15m_all)} bars)")
+        return [], initial_balance
+
+    # Trim 15m to only the backtest period (drop warmup)
+    start_cutoff_ms = now_ms - days * 24 * 3600 * 1000
+    backtest_start_idx = next(
+        (i for i, c in enumerate(candles_15m_all) if c[0] >= start_cutoff_ms),
+        len(candles_15m_all) - STEP_BARS_15M * 2,
+    )
+
+    trades = []
+    balance = initial_balance
+    open_position = None  # dict with entry details
+
+    # Walk forward in 4h steps from start_cutoff
+    for step_idx in range(backtest_start_idx, len(candles_15m_all) - STEP_BARS_15M, STEP_BARS_15M):
+        current_ts_ms = candles_15m_all[step_idx][0]
+
+        # Rolling windows for indicator computation
+        c15 = candles_15m_all[max(0, step_idx - 150):step_idx]
+        c1h = [c for c in candles_1h_all if c[0] <= current_ts_ms][-150:]
+        c4h = [c for c in candles_4h_all if c[0] <= current_ts_ms][-100:]
+
+        if not c15 or len(c15) < 60:
+            continue
+
+        # Check open position exits against bars in this 4h window
+        if open_position is not None:
+            # Examine each 15m bar in this step for TP/SL/time-stop
+            window_bars = candles_15m_all[step_idx:step_idx + STEP_BARS_15M]
+            for bar in window_bars:
+                bar_low = bar[3]
+                bar_high = bar[2]
+                bar_close = bar[4]
+                bar_ts = bar[0]
+
+                sl_hit = bar_low <= open_position['sl_price']
+                tp_hit = bar_high >= open_position['tp_price']
+                time_stop = (bar_ts - open_position['entry_ts_ms']) >= 24 * 3600 * 1000
+
+                if sl_hit or tp_hit or time_stop:
+                    if sl_hit and tp_hit:
+                        # Both in same bar — assume worst case (SL hit)
+                        exit_price = open_position['sl_price']
+                        close_reason = "STOP-LOSS"
+                    elif sl_hit:
+                        exit_price = open_position['sl_price']
+                        close_reason = "STOP-LOSS"
+                    elif tp_hit:
+                        exit_price = open_position['tp_price']
+                        close_reason = "TAKE-PROFIT"
+                    else:
+                        exit_price = bar_close
+                        close_reason = "TIME-STOP"
+
+                    qty = open_position['quantity']
+                    notional_usdt = open_position['notional_usdt']
+                    entry_price = open_position['entry_price']
+
+                    gross_pnl = (exit_price - entry_price) * qty
+                    exit_notional = qty * exit_price
+                    exit_fee = exit_notional * shared_config.MAKER_FEE
+                    pnl_usdt = gross_pnl - exit_fee
+                    pnl_pct = (exit_price - entry_price) / entry_price * 100
+
+                    margin_usdt = notional_usdt / shared_config.LEVERAGE
+                    balance += margin_usdt + pnl_usdt
+
+                    exit_dt = datetime.fromtimestamp(bar_ts / 1000, tz=timezone.utc)
+                    trades.append({
+                        "symbol": symbol,
+                        "strategy": strategy,
+                        "entry_time": open_position['entry_time'],
+                        "exit_time": exit_dt.isoformat(),
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "sl_price": open_position['sl_price'],
+                        "tp_price": open_position['tp_price'],
+                        "quantity": qty,
+                        "notional_usdt": notional_usdt,
+                        "pnl_usdt": round(pnl_usdt, 4),
+                        "pnl_pct": round(pnl_pct, 4),
+                        "close_reason": close_reason,
+                        "confidence": open_position.get('confidence'),
+                        "setup_grade": open_position.get('setup_grade'),
+                        "sl_pct": open_position.get('sl_pct'),
+                        "tp_pct": open_position.get('tp_pct'),
+                    })
+                    open_position = None
+                    break
+
+        # Only open new position if none is open
+        if open_position is not None:
+            continue
+
+        # Check filter criteria
+        if not _passes_filter(c15, c1h, profile, strategy):
+            continue
+
+        # Compute indicators and run decision engine
+        indicators = ind_lib.compute_all_indicators(c15, c1h, c4h, as_of_ts_ms=current_ts_ms)
+        rsi_val = ind_lib.compute_rsi(c15)
+        rvol_val = ind_lib.compute_rvol(c15)
+
+        current_price = c15[-1][4]
+
+        try:
+            analysis, _ = shared_decision.make_decision(
+                symbol=symbol,
+                price=current_price,
+                rsi=rsi_val,
+                rvol=rvol_val,
+                candles_15m=c15,
+                candles_1h=c1h,
+                high_24h=max(c[2] for c in c15[-96:]) if c15 else None,
+                low_24h=min(c[3] for c in c15[-96:]) if c15 else None,
+                indicators=indicators,
+                strategy=strategy,
+                btc_bias="NEUTRAL",  # simplified for backtest
+            )
+        except Exception as e:
+            log.warning(f"Backtester: Decision engine error for {symbol}: {e}")
+            continue
+
+        if analysis.get('verdict') != 'BUY':
+            continue
+
+        sl_pct = float(analysis.get('stop_loss_pct') or 1.5)
+        tp_pct = float(analysis.get('take_profit_pct') or 3.0)
+
+        # Entry at next bar's open (cleaner than intrabar)
+        if step_idx + STEP_BARS_15M >= len(candles_15m_all):
+            continue
+        entry_bar = candles_15m_all[step_idx + 1]
+        entry_price = entry_bar[1]  # open of next bar
+        entry_ts_ms = entry_bar[0]
+
+        sl_price = entry_price * (1 - sl_pct / 100)
+        tp_price = entry_price * (1 + tp_pct / 100)
+
+        # Position sizing: fixed POSITION_RISK_PCT for backtest
+        risk_amount = balance * shared_config.POSITION_RISK_PCT
+        if sl_pct <= 0:
+            continue
+        notional_usdt = min(risk_amount / (sl_pct / 100), balance * shared_config.LEVERAGE)
+        if notional_usdt <= 0:
+            continue
+
+        margin_usdt = notional_usdt / shared_config.LEVERAGE
+        qty = notional_usdt / entry_price
+        entry_fee = notional_usdt * shared_config.MAKER_FEE
+        total_cost = margin_usdt + entry_fee
+
+        if balance < total_cost:
+            continue
+
+        balance -= total_cost
+        entry_dt = datetime.fromtimestamp(entry_ts_ms / 1000, tz=timezone.utc)
+
+        open_position = {
+            'entry_price': entry_price,
+            'entry_ts_ms': entry_ts_ms,
+            'entry_time': entry_dt.isoformat(),
+            'sl_price': sl_price,
+            'tp_price': tp_price,
+            'quantity': qty,
+            'notional_usdt': notional_usdt,
+            'confidence': analysis.get('confidence'),
+            'setup_grade': analysis.get('setup_grade'),
+            'sl_pct': sl_pct,
+            'tp_pct': tp_pct,
+        }
+
+    # Close any still-open position at last bar's close (end of backtest)
+    if open_position is not None and candles_15m_all:
+        last_bar = candles_15m_all[-1]
+        exit_price = last_bar[4]
+        qty = open_position['quantity']
+        notional_usdt = open_position['notional_usdt']
+        entry_price = open_position['entry_price']
+        gross_pnl = (exit_price - entry_price) * qty
+        exit_fee = qty * exit_price * shared_config.MAKER_FEE
+        pnl_usdt = gross_pnl - exit_fee
+        pnl_pct = (exit_price - entry_price) / entry_price * 100
+        margin_usdt = notional_usdt / shared_config.LEVERAGE
+        balance += margin_usdt + pnl_usdt
+        exit_dt = datetime.fromtimestamp(last_bar[0] / 1000, tz=timezone.utc)
+        trades.append({
+            "symbol": symbol,
+            "strategy": strategy,
+            "entry_time": open_position['entry_time'],
+            "exit_time": exit_dt.isoformat(),
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "sl_price": open_position['sl_price'],
+            "tp_price": open_position['tp_price'],
+            "quantity": qty,
+            "notional_usdt": notional_usdt,
+            "pnl_usdt": round(pnl_usdt, 4),
+            "pnl_pct": round(pnl_pct, 4),
+            "close_reason": "END-OF-BACKTEST",
+            "confidence": open_position.get('confidence'),
+            "setup_grade": open_position.get('setup_grade'),
+            "sl_pct": open_position.get('sl_pct'),
+            "tp_pct": open_position.get('tp_pct'),
+        })
+
+    return trades, balance
+
+
+def _store_results(
+    strategy: str,
+    symbols: list,
+    days: int,
+    initial_balance: float,
+    final_balance: float,
+    all_trades: list,
+    benchmark_return_pct: float,
+) -> int:
+    """Store backtest run + trades in DB. Returns run_id."""
+    total_trades = len(all_trades)
+    wins = [t for t in all_trades if t.get('pnl_usdt', 0) > 0]
+    win_rate = len(wins) / total_trades if total_trades > 0 else None
+    total_return_pct = (final_balance - initial_balance) / initial_balance * 100 if initial_balance > 0 else 0.0
+    alpha = portfolio_lib.compute_alpha(total_return_pct, benchmark_return_pct)
+
+    # Build daily returns for Sharpe
+    if all_trades:
+        trade_returns = [t.get('pnl_pct', 0) for t in all_trades]
+        sharpe = portfolio_lib.compute_sharpe(trade_returns)
+    else:
+        sharpe = None
+
+    # Equity curve for max drawdown
+    equity = [initial_balance]
+    running = initial_balance
+    for t in sorted(all_trades, key=lambda x: x.get('entry_time', '')):
+        running += t.get('pnl_usdt', 0)
+        equity.append(running)
+    max_dd = portfolio_lib.compute_peak_drawdown(equity)
+
+    with shared_db.get_connection() as conn:
+        shared_db.init_schema(conn)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute(
+            """INSERT INTO backtest_runs
+               (strategy, symbol, days, initial_balance, final_balance, total_trades,
+                win_rate, sharpe, max_drawdown_pct, total_return_pct,
+                benchmark_return_pct, alpha, params_json, completed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                strategy,
+                ",".join(symbols) if symbols else None,
+                days,
+                initial_balance,
+                round(final_balance, 2),
+                total_trades,
+                round(win_rate, 3) if win_rate is not None else None,
+                sharpe,
+                max_dd,
+                round(total_return_pct, 2),
+                round(benchmark_return_pct, 2),
+                round(alpha, 2),
+                json.dumps({"symbols": symbols}),
+                now_iso,
+            ),
+        )
+        run_id = cur.lastrowid
+
+        for t in all_trades:
+            conn.execute(
+                """INSERT INTO backtest_trades
+                   (run_id, symbol, strategy, entry_time, exit_time, entry_price, exit_price,
+                    sl_price, tp_price, quantity, notional_usdt, pnl_usdt, pnl_pct,
+                    close_reason, confidence, setup_grade, sl_pct, tp_pct)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id, t['symbol'], t['strategy'], t['entry_time'], t.get('exit_time'),
+                    t['entry_price'], t.get('exit_price'), t['sl_price'], t['tp_price'],
+                    t['quantity'], t['notional_usdt'], t.get('pnl_usdt'), t.get('pnl_pct'),
+                    t.get('close_reason'), t.get('confidence'), t.get('setup_grade'),
+                    t.get('sl_pct'), t.get('tp_pct'),
+                ),
+            )
+
+    return run_id
+
+
+def _get_benchmark_return(exchange, days: int) -> float:
+    """Fetch BTC price at start and end of period. Returns return %."""
+    try:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        since_ms = now_ms - (days + 1) * 24 * 3600 * 1000
+        btc_candles = _fetch_ohlcv_full(exchange, "BTC/USDT", "1d", since_ms)
+        if btc_candles and len(btc_candles) >= 2:
+            start_price = btc_candles[0][4]  # close of first day
+            end_price = btc_candles[-1][4]   # close of last day
+            if start_price > 0:
+                return round((end_price - start_price) / start_price * 100, 2)
+    except Exception as e:
+        log.warning(f"Backtester: Could not fetch BTC benchmark: {e}")
+    return 0.0
+
+
+class Backtester:
+    def __init__(self):
+        redis_host = os.getenv('REDIS_HOST', 'localhost')
+        self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
+        # Public Binance API — no keys needed
+        self.exchange = ccxt.binance({'enableRateLimit': True})
+
+    def process_request(self, request: dict) -> None:
+        strategy = request.get('strategy', 'CONSERVATIVE').upper()
+        symbols = request.get('symbols') or DEFAULT_SYMBOLS
+        days = int(request.get('days', 90))
+        initial_balance = float(request.get('initial_balance', 1000.0))
+
+        if strategy not in STRATEGY_PROFILES:
+            log.warning(f"Backtester: Unknown strategy {strategy}, using CONSERVATIVE")
+            strategy = 'CONSERVATIVE'
+
+        days = max(7, min(days, 365))
+        log.info(f"Backtester: Starting {strategy} backtest | {len(symbols)} symbols | {days}d | ${initial_balance:.0f}")
+
+        # Fetch benchmark once
+        benchmark_return = _get_benchmark_return(self.exchange, days)
+        log.info(f"Backtester: BTC benchmark return over {days}d: {benchmark_return:+.1f}%")
+
+        all_trades = []
+        combined_balance = initial_balance
+        balance_per_symbol = initial_balance / max(len(symbols), 1)
+
+        for i, symbol in enumerate(symbols, 1):
+            try:
+                trades, final_bal = _backtest_symbol(
+                    self.exchange, symbol, strategy, days, balance_per_symbol
+                )
+                all_trades.extend(trades)
+                # Aggregate: ratio of final to initial per symbol
+                if balance_per_symbol > 0:
+                    combined_balance += (final_bal - balance_per_symbol)
+                if i % 10 == 0:
+                    log.info(f"Backtester: Progress {i}/{len(symbols)} symbols processed")
+            except Exception as e:
+                log.warning(f"Backtester: Error processing {symbol}: {e}")
+            time.sleep(FETCH_SLEEP_S)
+
+        run_id = _store_results(
+            strategy=strategy,
+            symbols=symbols,
+            days=days,
+            initial_balance=initial_balance,
+            final_balance=combined_balance,
+            all_trades=all_trades,
+            benchmark_return_pct=benchmark_return,
+        )
+
+        total_trades = len(all_trades)
+        wins = [t for t in all_trades if t.get('pnl_usdt', 0) > 0]
+        win_rate = len(wins) / total_trades if total_trades > 0 else 0.0
+        total_return_pct = (combined_balance - initial_balance) / initial_balance * 100 if initial_balance > 0 else 0.0
+        alpha = portfolio_lib.compute_alpha(total_return_pct, benchmark_return)
+
+        trade_returns = [t.get('pnl_pct', 0) for t in all_trades]
+        sharpe = portfolio_lib.compute_sharpe(trade_returns)
+
+        equity = [initial_balance]
+        running = initial_balance
+        for t in sorted(all_trades, key=lambda x: x.get('entry_time', '')):
+            running += t.get('pnl_usdt', 0)
+            equity.append(running)
+        max_dd = portfolio_lib.compute_peak_drawdown(equity)
+
+        notification = {
+            "type": "backtest_complete",
+            "data": {
+                "run_id": run_id,
+                "strategy": strategy,
+                "days": days,
+                "total_trades": total_trades,
+                "win_rate": round(win_rate, 3),
+                "total_return_pct": round(total_return_pct, 2),
+                "benchmark_return_pct": round(benchmark_return, 2),
+                "alpha": round(alpha, 2),
+                "sharpe": sharpe,
+                "max_drawdown_pct": max_dd,
+            },
+        }
+        self.db.rpush("notifications", json.dumps(notification))
+        log.info(
+            f"Backtester: Run {run_id} complete — "
+            f"{total_trades} trades | WR={win_rate*100:.0f}% | "
+            f"Return={total_return_pct:+.1f}% | Alpha={alpha:+.1f}% | Sharpe={sharpe}"
+        )
+
+    def run(self):
+        log.info("Backtester: Listening for backtest_request on Redis...")
+        while True:
+            try:
+                result = self.db.blpop('backtest_request', timeout=30)
+                if result:
+                    _, payload = result
+                    try:
+                        request = json.loads(payload)
+                        log.info(f"Backtester: Received request: {request}")
+                        self.process_request(request)
+                    except Exception as e:
+                        log.error(f"Backtester: Request processing failed: {e}")
+            except Exception as e:
+                log.error(f"Backtester: blpop error: {e}")
+                time.sleep(5)
+
+
+if __name__ == "__main__":
+    backtester = Backtester()
+    backtester.run()

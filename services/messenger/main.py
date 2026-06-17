@@ -82,6 +82,9 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 🧠 • *set decision* <gpt|code> — Switch Brain between GPT (default) and code-based decision engine.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 📊 • *analytics* <period> — AI performance report: last, today, week, month. Win rate, PnL, insights, recommended tweaks.
+🔬 • *backtest* [days] — Run walk-forward backtest (default 90 days). Results sent when complete.
+📊 • *portfolio* — Sector breakdown, exposure, current drawdown, win rate.
+📈 • *alpha* — Strategy return vs BTC buy-and-hold benchmark.
 ❓ • *help* — This message."""
 
 
@@ -846,6 +849,98 @@ class Messenger:
             await self._handle_stats(update, text)
         elif text == "analytics" or text.startswith("analytics "):
             await self._handle_analytics(update, text)
+        elif text == "backtest" or text.startswith("backtest "):
+            parts = text.split()
+            days = 90
+            if len(parts) > 1:
+                try:
+                    days = int(parts[1])
+                except ValueError:
+                    pass
+            days = max(7, min(days, 365))
+            strategy = self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE"
+            import json as _json
+            self.db.rpush("backtest_request", _json.dumps({
+                "strategy": strategy,
+                "symbols": [],
+                "days": days,
+                "initial_balance": 1000.0,
+            }))
+            await self._safe_reply(
+                update,
+                f"🔬 *Backtest started*\n\nStrategy: {strategy} | Period: {days} days\n"
+                "Results will appear here when complete (usually 1-2 min)."
+            )
+        elif text == "portfolio":
+            try:
+                from shared import portfolio as portfolio_lib
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    open_orders = shared_db.get_open_orders(conn)
+                    balance = shared_db.get_balance(conn, "USDT")
+                    dd = shared_db.get_current_drawdown_pct(conn)
+                    wr_stats = shared_db.get_win_rate_stats(conn)
+
+                sectors = {}
+                for o in open_orders:
+                    s = portfolio_lib.get_sector(o['symbol'])
+                    sectors[s] = sectors.get(s, 0) + 1
+
+                total_notional = sum(float(o.get('amount_usdt', 0)) for o in open_orders)
+                exposure_pct = (total_notional / balance * 100) if balance > 0 else 0
+
+                sector_lines = [f"  {s}: {n} position{'s' if n>1 else ''}" for s, n in sectors.items()] if sectors else ["  None"]
+
+                wr = wr_stats.get('win_rate')
+                wr_str = f"{wr*100:.0f}%" if wr is not None else "N/A"
+
+                msg = (
+                    f"📊 *Portfolio Risk*\n\n"
+                    f"Balance: ${balance:.2f}\n"
+                    f"Open positions: {len(open_orders)}\n"
+                    f"Total notional: ${total_notional:.2f} ({exposure_pct:.0f}% of balance)\n"
+                    f"Current drawdown: {dd:.1f}%\n\n"
+                    f"*Sector breakdown:*\n" + "\n".join(sector_lines) + "\n\n"
+                    f"*Win rate (last 20):* {wr_str}\n"
+                )
+                await self._safe_reply(update, msg)
+            except Exception as e:
+                await self._safe_reply(update, f"❌ Portfolio error: {e}")
+        elif text == "alpha" or text.startswith("alpha"):
+            try:
+                import ccxt as _ccxt
+                from shared import portfolio as portfolio_lib
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    balance = shared_db.get_balance(conn, "USDT")
+                    row = conn.execute(
+                        "SELECT MIN(balance_at_entry) as start_bal FROM orders WHERE balance_at_entry IS NOT NULL"
+                    ).fetchone()
+                    start_bal = float(row["start_bal"]) if row and row["start_bal"] else balance
+                    benchmark_start = shared_db.get_benchmark_price(conn, "BTC/USDT")
+
+                ex = _ccxt.binance({'enableRateLimit': True})
+                ticker = ex.fetch_ticker("BTC/USDT")
+                btc_now = float(ticker['last'])
+
+                strategy_return = (balance - start_bal) / start_bal * 100 if start_bal > 0 else 0.0
+
+                if benchmark_start and benchmark_start > 0:
+                    benchmark_return = (btc_now - benchmark_start) / benchmark_start * 100
+                    alpha = portfolio_lib.compute_alpha(strategy_return, benchmark_return)
+                    bench_str = f"BTC return: {benchmark_return:+.1f}%\nAlpha: {alpha:+.1f}%"
+                else:
+                    bench_str = "No benchmark start price recorded yet"
+
+                msg = (
+                    f"📈 *Alpha vs BTC*\n\n"
+                    f"Strategy return: {strategy_return:+.1f}%\n"
+                    f"{bench_str}\n\n"
+                    f"_(Starting balance ${start_bal:.2f} → Current ${balance:.2f})_"
+                )
+                await self._safe_reply(update, msg)
+            except Exception as e:
+                await self._safe_reply(update, f"❌ Alpha calc error: {e}")
         elif text == "help":
             await self._safe_reply(update, HELP_MESSAGE)
 
@@ -1045,6 +1140,25 @@ class Messenger:
                         detail = d.get('detail', '')
                         await self.send_telegram_msg(
                             f"🚨 *Risk Manager — {reason}*\n\n{detail}\n\nSend `start` to resume trading."
+                        )
+
+                    elif note['type'] == 'backtest_complete':
+                        d = note.get('data', {})
+                        strat = d.get('strategy', '?')
+                        days = d.get('days', '?')
+                        n = d.get('total_trades', 0)
+                        wr = d.get('win_rate', 0)
+                        ret = d.get('total_return_pct', 0)
+                        bench = d.get('benchmark_return_pct', 0)
+                        alpha = d.get('alpha', 0)
+                        sharpe = d.get('sharpe')
+                        mdd = d.get('max_drawdown_pct', 0)
+                        sharpe_str = f"{sharpe:.2f}" if sharpe is not None else "N/A"
+                        await self.send_telegram_msg(
+                            f"🔬 *Backtest Complete — {strat} ({days}d)*\n\n"
+                            f"Trades: {n} | Win rate: {wr*100:.0f}%\n"
+                            f"Return: {ret:+.1f}% | BTC: {bench:+.1f}% | Alpha: {alpha:+.1f}%\n"
+                            f"Sharpe: {sharpe_str} | Max DD: {mdd:.1f}%"
                         )
 
             except Exception as e:
