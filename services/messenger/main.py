@@ -84,6 +84,8 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 📊 • *analytics* <period> — AI performance report: last, today, week, month. Win rate, PnL, insights, recommended tweaks.
 🔬 • *backtest* [days] — Run walk-forward backtest on current strategy (default 90 days).
 🔬 • *backtest auto* [days] — Regime-switching backtest: auto-selects strategy per market condition.
+🔬 • *backtest runs* — List recent backtest runs with their IDs.
+🔬 • *backtest data* [run_id] — Dump all trades from a run as CSV (defaults to most recent).
 📊 • *portfolio* — Sector breakdown, exposure, current drawdown, win rate.
 📈 • *alpha* — Strategy return vs BTC buy-and-hold benchmark.
 ❓ • *help* — This message."""
@@ -882,6 +884,110 @@ class Messenger:
                 f"🔬 *Backtest started*\n\nStrategy: {label} | Period: {days} days\n"
                 "Results will appear here when complete (usually 2-3 min)."
             )
+        elif text == "backtest runs":
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    runs = conn.execute(
+                        """SELECT id, strategy, days, total_trades, win_rate,
+                                  total_return_pct, completed_at
+                           FROM backtest_runs ORDER BY id DESC LIMIT 10"""
+                    ).fetchall()
+                if not runs:
+                    await self._safe_reply(update, "No backtest runs found.")
+                else:
+                    lines = ["📋 *Recent backtest runs:*\n"]
+                    for r in runs:
+                        wr = f"{r['win_rate']*100:.0f}%" if r['win_rate'] is not None else "?"
+                        ret = f"{r['total_return_pct']:+.1f}%" if r['total_return_pct'] is not None else "?"
+                        date = (r['completed_at'] or '')[:10]
+                        lines.append(
+                            f"  `#{r['id']}` {r['strategy']} {r['days']}d — "
+                            f"{r['total_trades']} trades | WR {wr} | {ret} | {date}"
+                        )
+                    await self._safe_reply(update, "\n".join(lines))
+            except Exception as e:
+                log.error(f"Messenger: backtest runs error: {e}")
+                await self._safe_reply(update, f"Error: {e}")
+
+        elif text == "backtest data" or text.startswith("backtest data "):
+            try:
+                parts = text.split()
+                run_id = None
+                if len(parts) > 2:
+                    try:
+                        run_id = int(parts[2])
+                    except ValueError:
+                        pass
+
+                _reason_short = {
+                    "STOP-LOSS": "SL", "TAKE-PROFIT": "TP",
+                    "TIME-STOP": "TS", "END-OF-BACKTEST": "EB",
+                }
+
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    if run_id is None:
+                        row = conn.execute(
+                            "SELECT id FROM backtest_runs ORDER BY id DESC LIMIT 1"
+                        ).fetchone()
+                        if not row:
+                            await self._safe_reply(update, "No backtest runs found.")
+                            return
+                        run_id = row['id']
+
+                    run = conn.execute(
+                        "SELECT * FROM backtest_runs WHERE id=?", (run_id,)
+                    ).fetchone()
+                    if not run:
+                        await self._safe_reply(update, f"Run #{run_id} not found.")
+                        return
+
+                    trades = conn.execute(
+                        """SELECT symbol, strategy, regime, entry_time, exit_time,
+                                  sl_pct, tp_pct, pnl_pct, pnl_usdt,
+                                  close_reason, confidence, setup_grade
+                           FROM backtest_trades WHERE run_id=? ORDER BY entry_time""",
+                        (run_id,)
+                    ).fetchall()
+
+                header = (
+                    f"📊 *Backtest #{run_id} — {run['strategy']} ({run['days']}d)*\n"
+                    f"Trades: {run['total_trades']} | "
+                    f"Return: {(run['total_return_pct'] or 0):+.1f}% | "
+                    f"WR: {(run['win_rate'] or 0)*100:.0f}%\n\n"
+                    "```\nsym,strat,regime,sl%,tp%,pnl%,pnl$,exit,conf\n"
+                )
+                rows = []
+                for t in trades:
+                    sym    = (t['symbol'] or '').replace('/USDT', '')
+                    strat  = (t['strategy'] or '?')[:4]
+                    regime = (t['regime'] or '-')[:4]
+                    sl     = f"{t['sl_pct'] or 0:.1f}"
+                    tp     = f"{t['tp_pct'] or 0:.1f}"
+                    pnl_p  = f"{t['pnl_pct'] or 0:+.1f}"
+                    pnl_u  = f"{t['pnl_usdt'] or 0:+.2f}"
+                    reason = _reason_short.get(t['close_reason'] or '', '?')
+                    conf   = str(t['confidence'] or '?')
+                    rows.append(f"{sym},{strat},{regime},{sl},{tp},{pnl_p},{pnl_u},{reason},{conf}")
+
+                # Split into ≤3800-char chunks so Telegram doesn't truncate
+                chunks = []
+                current = header
+                for row in rows:
+                    if len(current) + len(row) + 1 > 3800:
+                        chunks.append(current + "```")
+                        current = "```\n"
+                    current += row + "\n"
+                chunks.append(current + "```")
+
+                for chunk in chunks:
+                    await self.send_telegram_msg(chunk)
+
+            except Exception as e:
+                log.error(f"Messenger: backtest data error: {e}")
+                await self._safe_reply(update, f"Error: {e}")
+
         elif text == "portfolio":
             try:
                 from shared import portfolio as portfolio_lib
