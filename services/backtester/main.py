@@ -536,6 +536,8 @@ def _backtest_portfolio(
     balance         = initial_balance
     open_positions  = {}  # symbol -> position dict
     prev_regime_name = None
+    recent_outcomes = []  # last 3 closed trade results: 'SL' or 'WIN'
+    circuit_broken  = False  # True = skip entries this 4h step
 
     for step_idx in range(backtest_start_idx, len(btc_15m) - STEP_BARS_15M, STEP_BARS_15M):
         current_ts_ms = btc_15m[step_idx][0]
@@ -598,6 +600,10 @@ def _backtest_portfolio(
                     "tp_pct":        pos.get('tp_pct'),
                 })
                 del open_positions[sym]
+                recent_outcomes.append('SL' if close_reason == 'STOP-LOSS' else 'WIN')
+                if len(recent_outcomes) > 3:
+                    recent_outcomes.pop(0)
+                circuit_broken = len(recent_outcomes) == 3 and all(r == 'SL' for r in recent_outcomes)
                 break
 
         # 2. Compute market regime at this timestamp
@@ -626,6 +632,11 @@ def _backtest_portfolio(
             prev_regime_name = regime['regime']
 
         if len(open_positions) >= MAX_OPEN_PORTFOLIO:
+            continue
+
+        if circuit_broken:
+            # 3 consecutive SLs — skip entries this step, reset on next tick
+            circuit_broken = False
             continue
 
         allowed_strategies = regime['active_strategies']
