@@ -852,38 +852,6 @@ class Messenger:
             await self._handle_stats(update, text)
         elif text == "analytics" or text.startswith("analytics "):
             await self._handle_analytics(update, text)
-        elif text == "backtest" or text.startswith("backtest "):
-            parts = text.split()
-            days = 90
-            auto_mode = len(parts) > 1 and parts[1].lower() == "auto"
-            if auto_mode:
-                if len(parts) > 2:
-                    try:
-                        days = int(parts[2])
-                    except ValueError:
-                        pass
-                strategy = "AUTO"
-            else:
-                if len(parts) > 1:
-                    try:
-                        days = int(parts[1])
-                    except ValueError:
-                        pass
-                strategy = self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE"
-            days = max(7, min(days, 365))
-            import json as _json
-            self.db.rpush("backtest_request", _json.dumps({
-                "strategy": strategy,
-                "symbols": [],
-                "days": days,
-                "initial_balance": 1000.0,
-            }))
-            label = "AUTO/Regime-switching" if auto_mode else strategy
-            await self._safe_reply(
-                update,
-                f"🔬 *Backtest started*\n\nStrategy: {label} | Period: {days} days\n"
-                "Results will appear here when complete (usually 2-3 min)."
-            )
         elif text == "backtest runs":
             try:
                 with shared_db.get_connection() as conn:
@@ -971,7 +939,6 @@ class Messenger:
                     conf   = str(t['confidence'] or '?')
                     rows.append(f"{sym},{strat},{regime},{sl},{tp},{pnl_p},{pnl_u},{reason},{conf}")
 
-                # Split into ≤3800-char chunks so Telegram doesn't truncate
                 chunks = []
                 current = header
                 for row in rows:
@@ -988,6 +955,38 @@ class Messenger:
                 log.error(f"Messenger: backtest data error: {e}")
                 await self._safe_reply(update, f"Error: {e}")
 
+        elif text == "backtest" or text.startswith("backtest "):
+            parts = text.split()
+            days = 90
+            auto_mode = len(parts) > 1 and parts[1].lower() == "auto"
+            if auto_mode:
+                if len(parts) > 2:
+                    try:
+                        days = int(parts[2])
+                    except ValueError:
+                        pass
+                strategy = "AUTO"
+            else:
+                if len(parts) > 1:
+                    try:
+                        days = int(parts[1])
+                    except ValueError:
+                        pass
+                strategy = self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE"
+            days = max(7, min(days, 365))
+            import json as _json
+            self.db.rpush("backtest_request", _json.dumps({
+                "strategy": strategy,
+                "symbols": [],
+                "days": days,
+                "initial_balance": 1000.0,
+            }))
+            label = "AUTO/Regime-switching" if auto_mode else strategy
+            await self._safe_reply(
+                update,
+                f"🔬 *Backtest started*\n\nStrategy: {label} | Period: {days} days\n"
+                "Results will appear here when complete (usually 2-3 min)."
+            )
         elif text == "portfolio":
             try:
                 from shared import portfolio as portfolio_lib
