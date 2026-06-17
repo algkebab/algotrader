@@ -38,6 +38,7 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
         ("balance_at_entry", "REAL"),
         ("initial_sl_price", "REAL"),
         ("partial_tp_hit", "INTEGER NOT NULL DEFAULT 0"),
+        ("bot_version", "TEXT"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
@@ -230,17 +231,18 @@ def insert_order(
     session: Optional[str] = None,
     signal_id: Optional[str] = None,
     balance_at_entry: Optional[float] = None,
+    bot_version: Optional[str] = None,
 ) -> int:
     now = datetime.utcnow().isoformat() + "Z"
     cur = conn.execute(
         """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price,
                                status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount,
                                hourly_interest_rate, strategy_name, session, signal_id, balance_at_entry,
-                               initial_sl_price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               initial_sl_price, bot_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id,
          now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session,
-         signal_id, balance_at_entry, sl_price),
+         signal_id, balance_at_entry, sl_price, bot_version),
     )
     return cur.lastrowid
 

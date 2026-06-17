@@ -282,6 +282,11 @@ class Executor:
                 # Lock margin and pay entry fee from virtual balance
                 shared_db.set_balance(conn, "USDT", current_bal - total_entry_cost)
                 session = get_trading_session()
+                try:
+                    from shared import version as _ver
+                    _bot_version = _ver.BOT_VERSION
+                except Exception:
+                    _bot_version = None
                 order_id = shared_db.insert_order(
                     conn,
                     symbol=symbol,
@@ -299,6 +304,7 @@ class Executor:
                     session=session,
                     signal_id=signal_id,
                     balance_at_entry=float(current_bal),
+                    bot_version=_bot_version,
                 )
             log.info(f"Executor: Risking ${risk_amount:.2f} to buy ${final_notional_usdt:.2f} worth of {symbol} (Leverage: {shared_config.LEVERAGE}x)")
             result = {
