@@ -254,9 +254,9 @@ class Filter:
             active_strategies = ["CONSERVATIVE", "REVERSAL"]
             size_mult = 1.0
         elif regime == "BEAR_TRENDING":
-            # CONSERVATIVE only: finds relative-strength symbols holding up in a down market
-            # REVERSAL removed: oversold bounces fail when macro trend is down
-            active_strategies = ["CONSERVATIVE"]
+            # No longs in bear — backtest shows all wins were TS exits (avg +1.1%), not TP;
+            # EV = 0.33×1.1 − 0.67×1.2 = −0.44 per trade.
+            active_strategies = []
             size_mult = 0.5
         elif regime == "RANGING":
             # REVERSAL only: mean-reversion from extremes works in sideways markets

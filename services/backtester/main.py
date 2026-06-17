@@ -204,7 +204,7 @@ def _backtest_symbol(
 
                 sl_hit = bar_low <= open_position['sl_price']
                 tp_hit = bar_high >= open_position['tp_price']
-                time_stop = (bar_ts - open_position['entry_ts_ms']) >= 24 * 3600 * 1000
+                time_stop = (bar_ts - open_position['entry_ts_ms']) >= 48 * 3600 * 1000
 
                 if sl_hit or tp_hit or time_stop:
                     if sl_hit and tp_hit:
@@ -450,7 +450,7 @@ def _compute_regime_from_slices(c4h_btc: list, c15_btc: list, sym_slices: dict) 
     if regime == "BULL_TRENDING":
         active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 1.0
     elif regime == "BEAR_TRENDING":
-        active_strategies, size_mult = ["CONSERVATIVE"], 0.5
+        active_strategies, size_mult = [], 0.5  # No longs in bear — all wins were TS exits, not TP
     elif regime == "RANGING":
         active_strategies, size_mult = ["REVERSAL"], 0.75
     else:
@@ -553,7 +553,7 @@ def _backtest_portfolio(
                 bar_low, bar_high, bar_close, bar_ts = bar[3], bar[2], bar[4], bar[0]
                 sl_hit    = bar_low  <= pos['sl_price']
                 tp_hit    = bar_high >= pos['tp_price']
-                time_stop = (bar_ts - pos['entry_ts_ms']) >= 24 * 3600 * 1000
+                time_stop = (bar_ts - pos['entry_ts_ms']) >= 48 * 3600 * 1000
 
                 if not (sl_hit or tp_hit or time_stop):
                     continue
