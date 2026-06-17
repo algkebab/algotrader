@@ -86,6 +86,7 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 🔬 • *backtest auto* [days] — Regime-switching backtest: auto-selects strategy per market condition.
 🔬 • *backtest runs* — List recent backtest runs with their IDs.
 🔬 • *backtest data* [run_id] — Dump all trades from a run as CSV (defaults to most recent).
+📊 • *trades data* [period] — Dump live closed trades as CSV (period: today, week, month, all).
 📊 • *portfolio* — Sector breakdown, exposure, current drawdown, win rate.
 📈 • *alpha* — Strategy return vs BTC buy-and-hold benchmark.
 ❓ • *help* — This message."""
@@ -955,6 +956,50 @@ class Messenger:
                 log.error(f"Messenger: backtest data error: {e}")
                 await self._safe_reply(update, f"Error: {e}")
 
+        elif text == "trades data" or text.startswith("trades data "):
+            try:
+                parts = text.split()
+                period = parts[2] if len(parts) > 2 else "month"
+                if period not in ("today", "yesterday", "week", "month", "all"):
+                    period = "month"
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    rows = shared_db.get_closed_orders_with_signals(conn, period)
+                if not rows:
+                    await self._safe_reply(update, f"No closed trades in period: {period}")
+                else:
+                    header = "sym,strat,regime,sl%,tp%,pnl%,pnl$,exit,conf,mfe%,mae%,hrs"
+                    lines = [header]
+                    for r in rows:
+                        entry = r.get("entry_price") or 0
+                        sl_pct = round((entry - (r.get("sl_price") or entry)) / entry * 100, 1) if entry else "?"
+                        tp_pct = round(((r.get("tp_price") or entry) - entry) / entry * 100, 1) if entry else "?"
+                        pnl_pct = r.get("pnl_percent")
+                        pnl_pct_str = f"{pnl_pct:+.1f}" if pnl_pct is not None else "?"
+                        pnl_usd = r.get("pnl_usdt")
+                        pnl_usd_str = f"{pnl_usd:+.2f}" if pnl_usd is not None else "?"
+                        close = (r.get("close_reason") or "?").replace("STOP-LOSS", "SL").replace("TAKE-PROFIT", "TP").replace("TIME-STOP", "TS").replace("Manual", "MAN")
+                        conf = r.get("ai_confidence") or "?"
+                        mfe = f"{r['mfe_pct']:.1f}" if r.get("mfe_pct") is not None else "?"
+                        mae = f"{r['mae_pct']:.1f}" if r.get("mae_pct") is not None else "?"
+                        hrs = f"{r['hours_held']:.1f}" if r.get("hours_held") is not None else "?"
+                        sym = (r.get("symbol") or "?").replace("/USDT", "")
+                        strat = (r.get("strategy_name") or "?")[:4].upper()
+                        regime = (r.get("regime") or "?")[:4].upper()
+                        lines.append(f"{sym},{strat},{regime},{sl_pct},{tp_pct},{pnl_pct_str},{pnl_usd_str},{close},{conf},{mfe},{mae},{hrs}")
+                    total = len(rows)
+                    wins = sum(1 for r in rows if (r.get("pnl_usdt") or 0) > 0)
+                    wr = round(wins / total * 100) if total else 0
+                    header_msg = f"📊 *Live trades — {period}*\nTrades: {total} | WR: {wr}%\n\n"
+                    chunk_size = 30
+                    for i in range(0, len(lines), chunk_size):
+                        chunk_lines = lines[i:i + chunk_size]
+                        prefix = header_msg if i == 0 else ""
+                        await self.send_telegram_msg(prefix + "```\n" + "\n".join(chunk_lines) + "\n```")
+            except Exception as e:
+                log.error(f"Messenger: trades data error: {e}")
+                await self._safe_reply(update, f"Error: {e}")
+
         elif text == "backtest" or text.startswith("backtest "):
             parts = text.split()
             days = 90
@@ -1462,6 +1507,7 @@ class Messenger:
                                             "take_profit_pct": take_profit_pct,
                                             "strategy_name": strategy_name,
                                             "signal_id": signal_id,
+                                            "regime": data.get("market_regime"),
                                         }
                                         self.db.rpush("trade_commands", json.dumps(command))
                                         sl_info = f"{float(stop_loss_pct):.2f}%" if isinstance(stop_loss_pct, (int, float)) else str(stop_loss_pct)

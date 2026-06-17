@@ -133,7 +133,7 @@ class Executor:
 
         return adjusted_sl, adjusted_tp
 
-    def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None, confidence=None, position_size_multiplier=1.0):
+    def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None, confidence=None, position_size_multiplier=1.0, regime=None):
         """Writes paper order to DB only (no live trading).
 
         RiskGuard caps stop-loss and enforces a minimum risk/reward ratio
@@ -305,6 +305,7 @@ class Executor:
                     signal_id=signal_id,
                     balance_at_entry=float(current_bal),
                     bot_version=_bot_version,
+                    regime=regime,
                 )
             log.info(f"Executor: Risking ${risk_amount:.2f} to buy ${final_notional_usdt:.2f} worth of {symbol} (Leverage: {shared_config.LEVERAGE}x)")
             result = {
@@ -343,6 +344,7 @@ class Executor:
                         signal_id=data.get("signal_id"),
                         confidence=data.get("confidence"),
                         position_size_multiplier=float(data.get("position_size_multiplier") or 1.0),
+                        regime=data.get("regime"),
                     )
                 except Exception as e:
                     log.error(f"Executor: Parsing error: {e}")

@@ -41,6 +41,7 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
         ("bot_version", "TEXT"),
         ("partial_exits_done", "INTEGER NOT NULL DEFAULT 0"),
         ("partial_pnl_usdt", "REAL NOT NULL DEFAULT 0"),
+        ("regime", "TEXT"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
@@ -246,17 +247,18 @@ def insert_order(
     signal_id: Optional[str] = None,
     balance_at_entry: Optional[float] = None,
     bot_version: Optional[str] = None,
+    regime: Optional[str] = None,
 ) -> int:
     now = datetime.utcnow().isoformat() + "Z"
     cur = conn.execute(
         """INSERT INTO orders (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price,
                                status, exchange_order_id, opened_at, entry_fee_usd, borrowed_amount,
                                hourly_interest_rate, strategy_name, session, signal_id, balance_at_entry,
-                               initial_sl_price, bot_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               initial_sl_price, bot_version, regime)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price, exchange_order_id,
          now, entry_fee_usd, borrowed_amount, hourly_interest_rate, strategy_name, session,
-         signal_id, balance_at_entry, sl_price, bot_version),
+         signal_id, balance_at_entry, sl_price, bot_version, regime),
     )
     return cur.lastrowid
 
@@ -514,7 +516,7 @@ def get_closed_orders_with_signals(
         SELECT
             o.id, o.symbol, o.strategy_name, o.entry_price, o.quantity, o.tp_price, o.sl_price,
             o.opened_at, o.closed_at, o.pnl_usdt, o.pnl_percent, o.close_reason, o.signal_id,
-            o.exit_price, o.hours_held, o.mfe_pct, o.mae_pct,
+            o.exit_price, o.hours_held, o.mfe_pct, o.mae_pct, o.regime,
             s.stats_json, s.response_json
         FROM orders o
         LEFT JOIN signals s ON o.signal_id = s.id
@@ -602,6 +604,7 @@ def get_closed_orders_with_signals(
             "hours_held": row_dict.get("hours_held"),
             "mfe_pct": row_dict.get("mfe_pct"),
             "mae_pct": row_dict.get("mae_pct"),
+            "regime": row_dict.get("regime"),
         })
     return rows
 
