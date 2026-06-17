@@ -30,7 +30,7 @@ STRATEGY_PROFILES = {
         "rsi_min": 40,           # exclude deeply oversold (counter-trend) in momentum mode
         "rsi_max": 70,
         "rsi_1h_max": 70,        # 1h not overbought — avoids entering late into extended moves
-        "min_change": 1.0,       # min price change over last 4h (16 × 15m bars); captures fresh moves
+        "min_change": 0.3,       # min price change over last 4h — was 1.0%, too strict in ranging/sideways
     },
     "AGGRESSIVE": {
         "min_24h_volume": 5_000_000,
@@ -537,7 +537,9 @@ class Filter:
             active_strategies = ["CONSERVATIVE", "AGGRESSIVE", "REVERSAL"]
             size_mult = 1.0
         elif regime == "BEAR_TRENDING":
-            active_strategies = ["REVERSAL"]   # only counter-trend longs in a downtrend
+            # REVERSAL for panic-selling setups; CONSERVATIVE allowed for relative-strength
+            # symbols (4h EMA gate below still blocks symbols trading against their own trend)
+            active_strategies = ["CONSERVATIVE", "REVERSAL"]
             size_mult = 0.5
         elif regime == "RANGING":
             active_strategies = ["CONSERVATIVE", "REVERSAL"]  # breakouts fail in ranges
@@ -725,14 +727,15 @@ class Filter:
                         continue
 
                     # 4h EMA mandatory trend gate: reject entries against the dominant 4h trend.
-                    # CONSERVATIVE: rejects BEARISH + WEAKENING (only allow neutral/bullish structures)
-                    # AGGRESSIVE: rejects BEARISH only (allow weakening if 15m momentum is strong)
+                    # CONSERVATIVE: rejects pure BEARISH only — WEAKENING allowed (pullback in
+                    #   broader uptrend, or relative-strength symbol in a weak market)
+                    # AGGRESSIVE: rejects BEARISH only (unchanged)
                     # REVERSAL: exempt (counter-trend by design — expects bearish 4h structure)
                     ema_4h = indicators.get('ema_stack_4h') or {}
                     ema_4h_align = ema_4h.get('alignment')
                     if ema_4h_align:
-                        if strategy_name == "CONSERVATIVE" and ema_4h_align in ("BEARISH", "WEAKENING"):
-                            log.debug(f"Filter: {symbol} skipped — 4h EMA {ema_4h_align} in CONSERVATIVE mode")
+                        if strategy_name == "CONSERVATIVE" and ema_4h_align == "BEARISH":
+                            log.debug(f"Filter: {symbol} skipped — 4h EMA BEARISH in CONSERVATIVE mode")
                             continue
                         elif strategy_name == "AGGRESSIVE" and ema_4h_align == "BEARISH":
                             log.debug(f"Filter: {symbol} skipped — 4h EMA BEARISH in AGGRESSIVE mode")

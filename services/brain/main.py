@@ -10,10 +10,10 @@ import redis
 from dotenv import load_dotenv
 from openai import OpenAI
 
-WAIT_CACHE_TTL_RSI_LOW = 3600  # 60 min (RSI < 60)
-WAIT_CACHE_TTL_RSI_MID = 1800  # 30 min (RSI 60-65)
-WAIT_CACHE_TTL_RSI_HOT = 900   # 15 min (RSI > 65)
-PRICE_SPIKE_BYPASS_PCT = 1.0   # 1% move bypasses cache
+WAIT_CACHE_TTL_RSI_LOW = 1200  # 20 min (RSI < 60) — was 60 min, too long in slow markets
+WAIT_CACHE_TTL_RSI_MID = 600   # 10 min (RSI 60-65)
+WAIT_CACHE_TTL_RSI_HOT = 300   #  5 min (RSI > 65)
+PRICE_SPIKE_BYPASS_PCT = 0.5   # 0.5% move bypasses cache — was 1.0%, too high for sideways markets
 
 # Allow importing shared.db (project root or /app in Docker)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -723,12 +723,15 @@ Respond with ONLY the JSON object.
             if btc_ctx:
                 btc_bias_now = self._get_btc_bias(btc_ctx)
                 if btc_bias_now == "STRONG_BEARISH":
-                    log.info(
-                        "Brain: STRONG_BEARISH BTC — blocking all altcoin analysis "
-                        "(correlated drawdown risk too high)"
-                    )
-                    time.sleep(5)
-                    continue
+                    strategy_now_for_btc = self._get_strategy_name()
+                    if strategy_now_for_btc != "REVERSAL":
+                        log.info(
+                            "Brain: STRONG_BEARISH BTC — blocking momentum/conservative analysis; "
+                            "REVERSAL allowed (panic selling creates reversal setups)"
+                        )
+                        time.sleep(5)
+                        continue
+                    log.info("Brain: STRONG_BEARISH BTC — REVERSAL strategy proceeding")
             else:
                 btc_bias_now = "NEUTRAL"
 
