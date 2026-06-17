@@ -147,6 +147,45 @@ def init_schema(conn: sqlite3.Connection) -> None:
             trade_count INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS backtest_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy TEXT NOT NULL,
+            symbol TEXT,
+            days INTEGER NOT NULL,
+            initial_balance REAL NOT NULL,
+            final_balance REAL NOT NULL,
+            total_trades INTEGER NOT NULL,
+            win_rate REAL,
+            sharpe REAL,
+            max_drawdown_pct REAL,
+            total_return_pct REAL,
+            benchmark_return_pct REAL,
+            alpha REAL,
+            params_json TEXT,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS backtest_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES backtest_runs(id),
+            symbol TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            entry_time TEXT NOT NULL,
+            exit_time TEXT,
+            entry_price REAL NOT NULL,
+            exit_price REAL,
+            sl_price REAL NOT NULL,
+            tp_price REAL NOT NULL,
+            quantity REAL NOT NULL,
+            notional_usdt REAL NOT NULL,
+            pnl_usdt REAL,
+            pnl_pct REAL,
+            close_reason TEXT,
+            confidence INTEGER,
+            setup_grade TEXT,
+            sl_pct REAL,
+            tp_pct REAL
+        );
     """)
     _add_signals_columns_if_missing(conn)
 
@@ -605,3 +644,61 @@ def get_max_open_orders() -> int:
     if val is None or not str(val).isdigit():
         return _cfg.MAX_OPEN_ORDERS_DEFAULT
     return max(_cfg.MAX_OPEN_ORDERS_MIN, min(_cfg.MAX_OPEN_ORDERS_MAX, int(val)))
+
+
+def get_equity_curve(conn, days: int = 90) -> list:
+    """Return list of (date, balance) tuples for equity curve. Uses daily_pnl + initial balance."""
+    rows = conn.execute(
+        "SELECT date, pnl_usdt FROM daily_pnl ORDER BY date ASC LIMIT ?", (days,)
+    ).fetchall()
+    return [(r["date"], r["pnl_usdt"]) for r in rows]
+
+
+def get_win_rate_stats(conn, limit: int = 20) -> dict:
+    """Win rate and avg pnl stats from last N closed orders (for Kelly sizing)."""
+    rows = conn.execute(
+        """SELECT pnl_usdt FROM orders WHERE status='closed' AND pnl_usdt IS NOT NULL
+           ORDER BY closed_at DESC LIMIT ?""", (limit,)
+    ).fetchall()
+    if not rows:
+        return {"win_rate": None, "avg_win_pct": None, "avg_loss_pct": None, "count": 0}
+    wins = [r["pnl_usdt"] for r in rows if r["pnl_usdt"] > 0]
+    losses = [abs(r["pnl_usdt"]) for r in rows if r["pnl_usdt"] < 0]
+    win_rate = len(wins) / len(rows) if rows else 0.0
+    avg_win = sum(wins) / len(wins) if wins else None
+    avg_loss = sum(losses) / len(losses) if losses else None
+    return {
+        "win_rate": round(win_rate, 3),
+        "avg_win_pct": round(avg_win, 4) if avg_win else None,
+        "avg_loss_pct": round(avg_loss, 4) if avg_loss else None,
+        "count": len(rows),
+    }
+
+
+def get_current_drawdown_pct(conn) -> float:
+    """Current drawdown from peak balance. Uses closed orders to reconstruct peak."""
+    bal = get_balance(conn, "USDT")
+    rows = conn.execute(
+        "SELECT MAX(balance_at_entry) as peak FROM orders WHERE balance_at_entry IS NOT NULL"
+    ).fetchone()
+    peak = float(rows["peak"]) if rows and rows["peak"] else bal
+    if peak <= 0:
+        return 0.0
+    dd = (peak - bal) / peak * 100
+    return max(0.0, round(dd, 2))
+
+
+def record_benchmark_price(conn, symbol: str, price: float) -> None:
+    """Store benchmark (BTC) price for alpha calculation. Uses settings table."""
+    conn.execute(
+        """INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+        (f"benchmark_price_{symbol.replace('/', '_')}", str(price)),
+    )
+
+
+def get_benchmark_price(conn, symbol: str) -> float | None:
+    """Retrieve stored benchmark price."""
+    key = f"benchmark_price_{symbol.replace('/', '_')}"
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return float(row["value"]) if row else None

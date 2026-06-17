@@ -10,10 +10,10 @@ import redis
 from dotenv import load_dotenv
 from openai import OpenAI
 
-WAIT_CACHE_TTL_RSI_LOW = 3600  # 60 min (RSI < 60)
-WAIT_CACHE_TTL_RSI_MID = 1800  # 30 min (RSI 60-65)
-WAIT_CACHE_TTL_RSI_HOT = 900   # 15 min (RSI > 65)
-PRICE_SPIKE_BYPASS_PCT = 1.0   # 1% move bypasses cache
+WAIT_CACHE_TTL_RSI_LOW = 1200  # 20 min (RSI < 60) — was 60 min, too long in slow markets
+WAIT_CACHE_TTL_RSI_MID = 600   # 10 min (RSI 60-65)
+WAIT_CACHE_TTL_RSI_HOT = 300   #  5 min (RSI > 65)
+PRICE_SPIKE_BYPASS_PCT = 0.5   # 0.5% move bypasses cache — was 1.0%, too high for sideways markets
 
 # Allow importing shared.db (project root or /app in Docker)
 _this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -704,6 +704,22 @@ Respond with ONLY the JSON object.
         except Exception as e:
             log.warning(f"Brain: Could not write bot_version to DB: {e}")
 
+        # Record BTC benchmark price on first start (for alpha calculation)
+        try:
+            btc_raw = self.db.get("market_data:BTC/USDT")
+            if btc_raw:
+                btc_data = json.loads(btc_raw)
+                btc_price = btc_data.get('last_price')
+                if btc_price:
+                    with shared_db.get_connection() as conn:
+                        shared_db.init_schema(conn)
+                        existing = shared_db.get_benchmark_price(conn, "BTC/USDT")
+                        if existing is None:
+                            shared_db.record_benchmark_price(conn, "BTC/USDT", float(btc_price))
+                            log.info(f"Brain: BTC benchmark price recorded: ${btc_price}")
+        except Exception as e:
+            log.warning(f"Brain: Could not record BTC benchmark: {e}")
+
         while True:
             if shared_db.get_setting_value(shared_config.SYSTEM_KEY_TRADING_PAUSED) == "1":
                 time.sleep(5)
@@ -723,12 +739,15 @@ Respond with ONLY the JSON object.
             if btc_ctx:
                 btc_bias_now = self._get_btc_bias(btc_ctx)
                 if btc_bias_now == "STRONG_BEARISH":
-                    log.info(
-                        "Brain: STRONG_BEARISH BTC — blocking all altcoin analysis "
-                        "(correlated drawdown risk too high)"
-                    )
-                    time.sleep(5)
-                    continue
+                    strategy_now_for_btc = self._get_strategy_name()
+                    if strategy_now_for_btc != "REVERSAL":
+                        log.info(
+                            "Brain: STRONG_BEARISH BTC — blocking momentum/conservative analysis; "
+                            "REVERSAL allowed (panic selling creates reversal setups)"
+                        )
+                        time.sleep(5)
+                        continue
+                    log.info("Brain: STRONG_BEARISH BTC — REVERSAL strategy proceeding")
             else:
                 btc_bias_now = "NEUTRAL"
 
@@ -801,7 +820,7 @@ Respond with ONLY the JSON object.
                 # --- SMART CACHE END ---
 
                 # Re-check again right before calling AI (no API call when at capacity)
-                if self._get_open_order_count() >= self._get_max_open_orders():
+                if shared_db.get_open_order_count() >= shared_db.get_max_open_orders():
                     log.info(f"Brain: Skipping AI for {symbol} (max open orders reached)")
                     break
 

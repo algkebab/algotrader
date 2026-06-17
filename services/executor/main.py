@@ -18,6 +18,7 @@ if _root not in sys.path:
 from shared import config as shared_config
 from shared import db as shared_db
 from shared import logger as shared_logger
+from shared import portfolio as portfolio_lib
 
 log = shared_logger.get_logger("executor")
 
@@ -132,7 +133,7 @@ class Executor:
 
         return adjusted_sl, adjusted_tp
 
-    def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None):
+    def place_smart_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None, confidence=None, position_size_multiplier=1.0):
         """Writes paper order to DB only (no live trading).
 
         RiskGuard caps stop-loss and enforces a minimum risk/reward ratio
@@ -163,6 +164,8 @@ class Executor:
                 take_profit_pct=guarded_tp,
                 strategy_name=strategy_name,
                 signal_id=signal_id,
+                confidence=confidence,
+                position_size_multiplier=position_size_multiplier,
             )
 
         except Exception as e:
@@ -180,9 +183,9 @@ class Executor:
         except Exception as e:
             log.warning(f"Executor: Failed to push trade_failed notification for {symbol}: {e}")
 
-    def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None):
+    def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None, confidence=None, position_size_multiplier=1.0):
         """Write order to DB only; no exchange, no Redis active_trades.
-        Position size is derived from balance, POSITION_RISK_PCT, and stop loss (no external amount)."""
+        Position size is derived from Kelly sizing (win rate, drawdown, confidence)."""
         try:
             with shared_db.get_connection() as conn:
                 shared_db.init_schema(conn)
@@ -193,8 +196,29 @@ class Executor:
                     self._push_failure(symbol, msg)
                     return {"status": "error", "message": msg}
 
-                # Position sizing: risk POSITION_RISK_PCT of balance per trade
-                risk_amount = current_bal * shared_config.POSITION_RISK_PCT
+                # Kelly-inspired position sizing
+                wr_stats = shared_db.get_win_rate_stats(conn)
+                current_dd = shared_db.get_current_drawdown_pct(conn)
+
+            kelly_risk_pct = portfolio_lib.kelly_position_size(
+                win_rate=wr_stats.get("win_rate"),
+                avg_win_pct=wr_stats.get("avg_win_pct"),
+                avg_loss_pct=wr_stats.get("avg_loss_pct"),
+                base_risk_pct=shared_config.POSITION_RISK_PCT,
+                confidence=confidence or 50,
+                current_drawdown_pct=current_dd,
+                regime_multiplier=float(position_size_multiplier),
+            )
+            risk_amount = current_bal * kelly_risk_pct
+            log.info(
+                f"Executor: Kelly risk_pct={kelly_risk_pct:.3%} "
+                f"(win_rate={wr_stats.get('win_rate')}, dd={current_dd:.1f}%, conf={confidence})"
+            )
+
+            with shared_db.get_connection() as conn:
+                shared_db.init_schema(conn)
+                current_bal = shared_db.get_balance(conn, "USDT")
+
                 # If AI provided stop_loss_pct, prefer it for risk sizing; otherwise derive from shared_config.SL_PERCENT
                 effective_stop_loss_pct = stop_loss_pct
                 if effective_stop_loss_pct is None or effective_stop_loss_pct <= 0:
@@ -223,12 +247,12 @@ class Executor:
                     self._push_failure(symbol, msg)
                     return {"status": "error", "message": msg}
 
-                # Public ticker for entry/tp/sl (no account interaction)
+                # Limit order simulation: post at bid price with tiny slippage (maker fill)
                 ticker = self.exchange.fetch_ticker(symbol)
-                base_price = float(ticker['last'])
-                # Apply slippage to simulate market order execution delay
-                entry_price = self.get_precision_price(symbol, base_price * (1 + shared_config.ENTRY_SLIPPAGE))
-                # Same TP/SL logic as live but from slipped entry price
+                bid_price = float(ticker.get('bid') or ticker['last'])
+                entry_price = self.get_precision_price(symbol, bid_price * (1 + shared_config.LIMIT_ORDER_SLIPPAGE))
+
+                # TP/SL from slipped entry price
                 if effective_stop_loss_pct is not None and effective_stop_loss_pct > 0:
                     sl_price = self.get_precision_price(symbol, entry_price * (1 - effective_stop_loss_pct / 100.0))
                 else:
@@ -243,10 +267,10 @@ class Executor:
                 qty = self.get_precision_amount(symbol, raw_qty)
                 final_notional_usdt = float(qty) * entry_price
 
-                # Margin required with leverage and entry fee (taker fee on notional)
+                # Margin required with leverage and entry fee (maker fee on notional)
                 margin_usdt = final_notional_usdt / shared_config.LEVERAGE
                 borrowed_amount = max(0.0, final_notional_usdt - margin_usdt)
-                entry_fee_usd = final_notional_usdt * shared_config.BINANCE_TAKER_FEE
+                entry_fee_usd = final_notional_usdt * shared_config.MAKER_FEE
                 total_entry_cost = margin_usdt + entry_fee_usd
                 if current_bal < total_entry_cost:
                     msg = (f"Insufficient balance for margin+fee "
@@ -285,6 +309,8 @@ class Executor:
                 "qty": float(qty),
                 "tp": float(tp_price),
                 "sl": float(sl_price),
+                "kelly_risk_pct": round(kelly_risk_pct, 4),
+                "confidence": confidence,
                 "timestamp": time.time()
             }
             self.db.rpush('notifications', json.dumps({"type": "trade_confirmed", "data": result}))
@@ -309,6 +335,8 @@ class Executor:
                         take_profit_pct=data.get("take_profit_pct"),
                         strategy_name=data.get("strategy_name"),
                         signal_id=data.get("signal_id"),
+                        confidence=data.get("confidence"),
+                        position_size_multiplier=float(data.get("position_size_multiplier") or 1.0),
                     )
                 except Exception as e:
                     log.error(f"Executor: Parsing error: {e}")
