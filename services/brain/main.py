@@ -403,7 +403,8 @@ class Brain:
         return "\n".join(lines) if lines else "  N/A (indicators unavailable)"
 
     def get_ai_verdict(self, symbol, price, rsi, rvol, candles_15m, candles_1h,
-                       high_24h, low_24h, indicators=None, change_24h=None, volume_24h=None):
+                       high_24h, low_24h, indicators=None, change_24h=None, volume_24h=None,
+                       strategy=None):
         """Send enriched technical data to GPT for a trading verdict with TP/SL targets.
 
         Returns a tuple: (parsed_response_dict, signal_id).
@@ -429,7 +430,7 @@ class Brain:
         high_str = "N/A" if high_24h is None else f"{high_24h}"
         low_str = "N/A" if low_24h is None else f"{low_24h}"
 
-        strategy = self._get_strategy_name()
+        strategy = strategy or self._get_strategy_name()
         symbol_base = symbol.split("/")[0] if "/" in symbol else symbol
         is_major = symbol_base in {"BTC", "ETH"}
 
@@ -599,7 +600,7 @@ Rules (non-negotiable):
 Respond with ONLY the JSON object.
 """
 
-        strategy_key = self._get_strategy_name().lower()
+        strategy_key = strategy.lower() if strategy else self._get_strategy_name().lower()
         system_content = STRATEGY_SYSTEM_MESSAGES.get(strategy_key, STRATEGY_SYSTEM_MESSAGES["conservative"])
         # Flatten key indicator values as top-level fields for ML training queries.
         # Nested dicts (ema_stack, bollinger, macd) are kept in indicators but critical
@@ -771,20 +772,29 @@ Respond with ONLY the JSON object.
                 time.sleep(5)
                 continue
 
-            # Market regime gating: block strategies not allowed by current regime,
-            # and reduce effective capacity during elevated volatility.
+            # Market regime gating: filter out candidates whose strategy isn't allowed
+            # by the current regime, and reduce capacity during elevated volatility.
             strategy_now = self._get_strategy_name()
             regime_now = self._get_market_regime()
             if regime_now:
                 allowed = regime_now.get('active_strategies', [])
-                if allowed and strategy_now not in allowed:
-                    log.info(
-                        f"Brain: Blocking batch — strategy {strategy_now} not active "
-                        f"in {regime_now['regime']} regime (active: {allowed})"
-                    )
-                    self.db.delete('filtered_candidates')
-                    time.sleep(5)
-                    continue
+                if allowed:
+                    before = len(candidates)
+                    candidates = [
+                        c for c in candidates
+                        if c.get('strategy_name', strategy_now) in allowed
+                    ]
+                    dropped = before - len(candidates)
+                    if dropped:
+                        log.info(
+                            f"Brain: Regime {regime_now['regime']} — dropped {dropped} candidate(s) "
+                            f"whose strategy isn't in active set {allowed}"
+                        )
+                    if not candidates:
+                        log.info(f"Brain: No candidates survive regime filter — skipping batch")
+                        self.db.delete('filtered_candidates')
+                        time.sleep(5)
+                        continue
                 vol = regime_now.get('vol_regime', 'NORMAL')
                 if vol == 'EXTREME':
                     max_open = max(1, math.ceil(max_open * 0.5))
@@ -837,6 +847,7 @@ Respond with ONLY the JSON object.
                 }
                 log.info(f"Brain: Analyzing {symbol} [{decision_mode.upper()}]...")
 
+                candidate_strategy = item.get('strategy_name', strategy_now)
                 if decision_mode == "code":
                     btc_bias_str = btc_bias_now if btc_bias_now else "NEUTRAL"
                     analysis, signal_id = shared_decision.make_decision(
@@ -851,7 +862,7 @@ Respond with ONLY the JSON object.
                         indicators=indicators_dict,
                         change_24h=item.get('change_24h'),
                         volume_24h=item.get('volume_24h'),
-                        strategy=strategy_now,
+                        strategy=candidate_strategy,
                         btc_bias=btc_bias_str,
                         regime_ctx=regime_now,
                     )
@@ -866,7 +877,7 @@ Respond with ONLY the JSON object.
                                 stats={
                                     "symbol": symbol, "price": current_price,
                                     "rsi": item['rsi'], "rvol": item['rvol'],
-                                    "strategy": strategy_now, "decision_mode": "code",
+                                    "strategy": candidate_strategy, "decision_mode": "code",
                                     "bot_version": BOT_VERSION,
                                     "indicators": indicators_dict,
                                 },
@@ -888,6 +899,7 @@ Respond with ONLY the JSON object.
                         indicators=indicators_dict,
                         change_24h=item.get('change_24h'),
                         volume_24h=item.get('volume_24h'),
+                        strategy=candidate_strategy,
                     )
 
                 # Negative cache: when AI says WAIT, cache symbol to avoid re-analyzing flat charts
