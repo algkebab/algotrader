@@ -1166,6 +1166,37 @@ class Messenger:
 
             await asyncio.sleep(1)
 
+    async def _send_startup_notification(self):
+        """Send a deployment notification to Telegram when the bot comes online."""
+        try:
+            from shared import version as shared_version
+            bot_version = shared_version.BOT_VERSION
+        except Exception:
+            bot_version = "unknown"
+
+        git_hash = "unknown"
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=3,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            if result.returncode == 0:
+                git_hash = result.stdout.strip()
+        except Exception:
+            pass
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        await self.send_telegram_msg(
+            f"✅ *Bot deployed and live*\n\n"
+            f"🏷️ Version: `{bot_version}`\n"
+            f"🔖 Commit: `{git_hash}`\n"
+            f"🕐 {now}\n\n"
+            f"_Send_ `status` _to see the full system state._"
+        )
+        log.info(f"Messenger: Startup notification sent (version={bot_version}, commit={git_hash})")
+
     async def run(self):
         """Main loop: Monitors signals from Brain and handles UI."""
         # Start the Telegram Application for callback listening
@@ -1176,6 +1207,7 @@ class Messenger:
         # Start background listener for Executor notifications
         asyncio.create_task(self.listen_for_notifications())
 
+        await self._send_startup_notification()
         log.info("Messenger: Monitoring 'signals' from Brain every 5s...")
 
         while True:
