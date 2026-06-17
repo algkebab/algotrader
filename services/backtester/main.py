@@ -448,13 +448,13 @@ def _compute_regime_from_slices(c4h_btc: list, c15_btc: list, sym_slices: dict) 
         confidence = 40
 
     if regime == "BULL_TRENDING":
-        active_strategies, size_mult = ["CONSERVATIVE", "AGGRESSIVE", "REVERSAL"], 1.0
+        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 1.0
     elif regime == "BEAR_TRENDING":
-        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 0.5
+        active_strategies, size_mult = ["CONSERVATIVE"], 0.5
     elif regime == "RANGING":
-        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 0.75
+        active_strategies, size_mult = ["REVERSAL"], 0.75
     else:
-        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 0.75
+        active_strategies, size_mult = ["CONSERVATIVE"], 0.75
 
     if vol_regime == "EXTREME":
         size_mult = round(size_mult * 0.5, 2)

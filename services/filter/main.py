@@ -246,20 +246,25 @@ class Filter:
             regime = "MIXED"
             confidence = 40
 
-        # Strategy gating per regime
+        # Strategy gating per regime — tuned from backtest data (90d AUTO run):
+        # AGGRESSIVE at 2:1 R:R needs 33% WR to break even; live WR was 21% → removed
+        # REVERSAL in BEAR = 0% WR (market keeps falling through oversold levels) → removed
+        # CONSERVATIVE in RANGING = 16% WR (no trend = momentum SL magnet) → removed
         if regime == "BULL_TRENDING":
-            active_strategies = ["CONSERVATIVE", "AGGRESSIVE", "REVERSAL"]
+            active_strategies = ["CONSERVATIVE", "REVERSAL"]
             size_mult = 1.0
         elif regime == "BEAR_TRENDING":
-            # REVERSAL for panic-selling setups; CONSERVATIVE allowed for relative-strength
-            # symbols (4h EMA gate below still blocks symbols trading against their own trend)
-            active_strategies = ["CONSERVATIVE", "REVERSAL"]
+            # CONSERVATIVE only: finds relative-strength symbols holding up in a down market
+            # REVERSAL removed: oversold bounces fail when macro trend is down
+            active_strategies = ["CONSERVATIVE"]
             size_mult = 0.5
         elif regime == "RANGING":
-            active_strategies = ["CONSERVATIVE", "REVERSAL"]  # breakouts fail in ranges
+            # REVERSAL only: mean-reversion from extremes works in sideways markets
+            # CONSERVATIVE removed: trend-following fails without a trend
+            active_strategies = ["REVERSAL"]
             size_mult = 0.75
         else:  # MIXED
-            active_strategies = ["CONSERVATIVE", "REVERSAL"]
+            active_strategies = ["CONSERVATIVE"]
             size_mult = 0.75
 
         # Volatility overlay reduces sizing further on top of regime
