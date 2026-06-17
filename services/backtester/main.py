@@ -388,12 +388,8 @@ def _store_results(
     total_return_pct = (final_balance - initial_balance) / initial_balance * 100 if initial_balance > 0 else 0.0
     alpha = portfolio_lib.compute_alpha(total_return_pct, benchmark_return_pct)
 
-    # Build daily returns for Sharpe
-    if all_trades:
-        trade_returns = [t.get('pnl_pct', 0) for t in all_trades]
-        sharpe = portfolio_lib.compute_sharpe(trade_returns)
-    else:
-        sharpe = None
+    daily_returns = _daily_returns_from_trades(all_trades, initial_balance, days)
+    sharpe = portfolio_lib.compute_sharpe(daily_returns) if daily_returns else None
 
     # Equity curve for max drawdown
     equity = [initial_balance]
@@ -448,6 +444,40 @@ def _store_results(
             )
 
     return run_id
+
+
+def _daily_returns_from_trades(all_trades: list, initial_balance: float, days: int) -> list:
+    """Build a daily PnL% series covering `days` calendar days.
+
+    Trades are bucketed by exit date. Days with no closed trades contribute 0%.
+    This gives compute_sharpe the full time-series so idle days suppress the ratio.
+    """
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+
+    # Map each trade's PnL to its exit date
+    daily_pnl: dict[str, float] = {}
+    for t in all_trades:
+        exit_time = t.get('exit_time')
+        if not exit_time:
+            continue
+        try:
+            dt = datetime.fromisoformat(exit_time).date()
+        except ValueError:
+            continue
+        key = dt.isoformat()
+        daily_pnl[key] = daily_pnl.get(key, 0.0) + float(t.get('pnl_usdt', 0.0))
+
+    # Build day-by-day equity and compute daily return %
+    returns = []
+    equity = initial_balance
+    for offset in range(days):
+        day = (start + timedelta(days=offset + 1)).date().isoformat()
+        pnl = daily_pnl.get(day, 0.0)
+        day_return_pct = (pnl / equity * 100) if equity > 0 else 0.0
+        equity = max(equity + pnl, 0.01)
+        returns.append(day_return_pct)
+    return returns
 
 
 def _get_benchmark_return(exchange, days: int) -> float:
@@ -525,8 +555,8 @@ class Backtester:
         total_return_pct = (combined_balance - initial_balance) / initial_balance * 100 if initial_balance > 0 else 0.0
         alpha = portfolio_lib.compute_alpha(total_return_pct, benchmark_return)
 
-        trade_returns = [t.get('pnl_pct', 0) for t in all_trades]
-        sharpe = portfolio_lib.compute_sharpe(trade_returns)
+        daily_returns = _daily_returns_from_trades(all_trades, initial_balance, days)
+        sharpe = portfolio_lib.compute_sharpe(daily_returns) if daily_returns else None
 
         equity = [initial_balance]
         running = initial_balance
