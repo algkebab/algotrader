@@ -1,1 +1,1 @@
-# Add dependencies as needed
+redis>=5.0.0

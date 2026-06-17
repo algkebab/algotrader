@@ -1039,6 +1039,14 @@ class Messenger:
                         ]
                         await self.send_telegram_msg("\n".join(lines))
 
+                    elif note['type'] == 'risk_manager_alert':
+                        d = note.get('data', {})
+                        reason = d.get('reason', 'Risk limit hit')
+                        detail = d.get('detail', '')
+                        await self.send_telegram_msg(
+                            f"🚨 *Risk Manager — {reason}*\n\n{detail}\n\nSend `start` to resume trading."
+                        )
+
             except Exception as e:
                 log.error(f"Messenger: notification processing error: {e}")
 

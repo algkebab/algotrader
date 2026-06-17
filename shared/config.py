@@ -40,6 +40,11 @@ SYSTEM_KEY_TIMEZONE_OFFSET_MIN = "timezone_offset_min"
 SYSTEM_KEY_SIGNAL_WAIT = "signal_wait"
 SYSTEM_KEY_DECISION_MODE = "decision_mode"  # "gpt" (default) | "code"
 
+# --- Risk-Manager thresholds (overridable via env vars) ---
+RISK_DAILY_DRAWDOWN_PCT = 3.0      # pause if today's loss > 3% of balance
+RISK_PORTFOLIO_EXPOSURE_PCT = 150.0  # pause if open notional > 150% of balance (3x lev * 50%)
+RISK_MIN_BALANCE_USDT = 50.0       # pause if balance drops below $50
+
 # --- Redis key (pipeline data; Scout writes, Filter reads) ---
 REDIS_KEY_ACTIVE_SYMBOLS = "active_symbols"
 REDIS_KEY_BTC_CONTEXT = "btc_context"        # Filter writes, Brain reads for macro bias

@@ -801,7 +801,7 @@ Respond with ONLY the JSON object.
                 # --- SMART CACHE END ---
 
                 # Re-check again right before calling AI (no API call when at capacity)
-                if self._get_open_order_count() >= self._get_max_open_orders():
+                if shared_db.get_open_order_count() >= shared_db.get_max_open_orders():
                     log.info(f"Brain: Skipping AI for {symbol} (max open orders reached)")
                     break
 

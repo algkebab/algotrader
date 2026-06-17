@@ -8,8 +8,8 @@ Updated with professional trading review on 2026-03-22.
 ## Critical — Do Not Deploy Real Capital Without These
 
 - [ ] **Backtesting Framework** — Replay historical OHLCV data through Filter + simulated Brain to validate strategy changes in minutes instead of weeks of live paper trading. Without this there is no evidence the core signal has positive expectancy.
-- [ ] **Daily Drawdown Circuit Breaker** — Auto-pause trading if daily loss exceeds a threshold (e.g. 3% of capital). Every prop firm and hedge fund has this. Bot currently trades through losing streaks indefinitely.
-- [ ] **Portfolio-Level Risk Cap** — `POSITION_RISK_PCT` controls per-trade risk but nothing prevents 10 positions opening simultaneously with 30%+ of capital deployed. Add a hard cap on total open notional exposure.
+- [x] **Daily Drawdown Circuit Breaker** — Auto-pause trading if daily loss exceeds a threshold (e.g. 3% of capital). Every prop firm and hedge fund has this. Bot currently trades through losing streaks indefinitely.
+- [x] **Portfolio-Level Risk Cap** — `POSITION_RISK_PCT` controls per-trade risk but nothing prevents 10 positions opening simultaneously with 30%+ of capital deployed. Add a hard cap on total open notional exposure.
 - [ ] **Correlation Guard** — Before execution, Executor checks how many open positions are in the same correlation bucket (e.g. BTC-correlated altcoins) and skips if too many are open at once. Opening 5 "different" alts during a BTC dump is one leveraged macro bet.
 
 ---
@@ -17,7 +17,7 @@ Updated with professional trading review on 2026-03-22.
 ## High Impact
 
 - [ ] **Trailing Stop-Loss** — Monitor updates SL in SQLite as price moves favorably, locking in profits. Especially useful for AGGRESSIVE strategy.
-- [ ] **Real Risk Manager** — Implement the placeholder `risk-manager` service with: daily drawdown limit (e.g. stop trading if day's loss > 5%), max concurrent exposure per sector, session-based trading hour restrictions.
+- [x] **Real Risk Manager** — Implement the placeholder `risk-manager` service with: daily drawdown limit (e.g. stop trading if day's loss > 5%), max concurrent exposure per sector, session-based trading hour restrictions.
 - [ ] **Signal Feedback Loop** — After a trade closes, update the `signals` table with outcome (win/loss/PnL). Include recent win rate in Brain's GPT-4o prompt so AI self-calibrates over time.
 - [ ] **Partial Take-Profit** — Close 50% of position at TP1, let the rest ride to TP2 (e.g. 2× original TP distance). Monitor already has all the machinery.
 - [ ] **Market Regime Detection** — Detect trending vs ranging vs high-volatility regime before entering. In a ranging market, fade the edges and use tighter TP. In high volatility, reduce size or stand aside. BTC 30-day ATR relative to its historical average is a simple proxy.
