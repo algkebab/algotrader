@@ -4,6 +4,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import ccxt
 import redis
 from dotenv import load_dotenv
 
@@ -58,6 +59,10 @@ class Filter:
     def __init__(self):
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
+        self._exchange_futures = ccxt.binance({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'},
+        })
 
     # ------------------------------------------------------------------
     # Indicator method delegates — all logic lives in shared/indicators.py
@@ -291,6 +296,23 @@ class Filter:
             name = STRATEGY_DEFAULT
         return name, STRATEGY_PROFILES[name]
 
+    def _get_funding_rate(self, symbol: str) -> float | None:
+        """Fetch Binance perp funding rate for symbol. Cached 15 min in Redis."""
+        cache_key = f"funding_rate:{symbol}"
+        cached = self.db.get(cache_key)
+        if cached is not None:
+            try:
+                return float(cached)
+            except (TypeError, ValueError):
+                pass
+        try:
+            data = self._exchange_futures.fetch_funding_rate(symbol)
+            rate = float(data.get('fundingRate') or 0)
+            self.db.set(cache_key, str(rate), ex=900)
+            return rate
+        except Exception:
+            return None
+
     def run(self):
         log.info("Filter: Analyzing Volume & RSI indicators...")
         PAUSED_KEY = shared_config.SYSTEM_KEY_TRADING_PAUSED
@@ -455,6 +477,16 @@ class Filter:
                         log.debug(f"Filter: {symbol}/{strategy_name} skipped — correlation guard: {corr_reason}")
                         continue
 
+                    # 4. Funding rate gate: extreme positive funding = crowded longs, skip non-REVERSAL.
+                    if strategy_name != "REVERSAL":
+                        funding = self._get_funding_rate(symbol)
+                        if funding is not None and funding > shared_config.FUNDING_RATE_BLOCK_LONG:
+                            log.debug(
+                                f"Filter: {symbol}/{strategy_name} skipped — "
+                                f"extreme funding rate {funding:.4%}"
+                            )
+                            continue
+
                     # 4. Pre-filter: skip full bearish EMA stack for momentum strategies.
                     if strategy_name != "REVERSAL" and ema_15m.get('alignment') == "BEARISH":
                         log.debug(f"Filter: {symbol} skipped — bearish 15m EMA stack in {strategy_name} mode")
@@ -482,6 +514,8 @@ class Filter:
                     candidate['rsi_1h'] = rsi_1h
                     candidate['recent_change'] = recent_change
                     candidate.update(indicators)
+                    funding_rate = self._get_funding_rate(symbol)
+                    candidate['funding_rate'] = funding_rate
                     candidate['filter_score'] = self._score_candidate(candidate, strategy_name)
 
                     log.info(

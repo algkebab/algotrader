@@ -56,3 +56,12 @@ CORR_MAX_PER_SECTOR = 2
 REDIS_KEY_ACTIVE_SYMBOLS = "active_symbols"
 REDIS_KEY_BTC_CONTEXT = "btc_context"        # Filter writes, Brain reads for macro bias
 REDIS_KEY_MARKET_REGIME = "market_regime"    # Filter writes, Brain/Dashboard reads
+
+# Partial exits (staged position reduction)
+PARTIAL_EXIT_1_PCT = 3.0    # First partial at +3% gain
+PARTIAL_EXIT_1_FRAC = 0.40  # Close 40% of position
+PARTIAL_EXIT_2_PCT = 6.0    # Second partial at +6% gain
+PARTIAL_EXIT_2_FRAC = 0.30  # Close 30% of position
+
+# Funding rate gate (Binance perp market sentiment)
+FUNDING_RATE_BLOCK_LONG = 0.001  # Block longs when perp funding > 0.1% per 8h

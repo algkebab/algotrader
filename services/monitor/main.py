@@ -43,7 +43,8 @@ class Monitor:
                 shared_db.init_schema(conn)
                 cur = conn.execute(
                     """SELECT id, symbol, entry_price, quantity, tp_price, sl_price, opened_at,
-                              mfe_pct, mae_pct, partial_tp_hit, initial_sl_price
+                              mfe_pct, mae_pct, partial_tp_hit, initial_sl_price,
+                              partial_exits_done, partial_pnl_usdt, amount_usdt, borrowed_amount
                        FROM orders WHERE status = 'open' ORDER BY opened_at DESC"""
                 )
                 rows = [dict(r) for r in cur.fetchall()]
@@ -59,6 +60,10 @@ class Monitor:
                     "mae_pct": r.get("mae_pct"),
                     "partial_tp_hit": bool(r.get("partial_tp_hit")),
                     "initial_sl": float(r["initial_sl_price"]) if r.get("initial_sl_price") is not None else None,
+                    "partial_exits_done": int(r.get("partial_exits_done") or 0),
+                    "partial_pnl_usdt": float(r.get("partial_pnl_usdt") or 0.0),
+                    "amount_usdt": float(r["amount_usdt"]),
+                    "borrowed_amount": float(r.get("borrowed_amount") or 0.0),
                 })
                 for r in rows
             ]
@@ -87,48 +92,107 @@ class Monitor:
             return None
 
     def _handle_partial_profit(self, symbol: str, trade: dict, current_price: float) -> bool:
-        """Close 50% of position at 1R target, move SL to breakeven. Returns True if executed."""
-        if trade.get('partial_tp_hit'):
-            return False
-        initial_sl = trade.get('initial_sl')
+        """Staged partial exits: 40% at +3%, 30% at +6%. Returns True if a partial was executed."""
+        from shared import config as shared_config
+        partial_exits_done = trade.get('partial_exits_done', 0)
         entry = trade['entry']
-        if initial_sl is None:
-            return False
-        one_r_target = entry + (entry - initial_sl)
-        if current_price < one_r_target:
-            return False
-        try:
-            with shared_db.get_connection() as conn:
-                shared_db.init_schema(conn)
-                row = shared_db.get_open_order_for_symbol(conn, symbol)
-                if not row:
-                    return False
-                qty = float(row['quantity'])
-                half_qty = qty / 2
-                half_amount = float(row['amount_usdt']) / 2
-                entry_price = float(row['entry_price'])
-                gross_pnl = (current_price - entry_price) * half_qty
-                exit_fee = half_qty * current_price * shared_config.BINANCE_TAKER_FEE
-                margin_per_half = half_amount / shared_config.LEVERAGE
-                bal = shared_db.get_balance(conn, "USDT")
-                shared_db.set_balance(conn, "USDT", bal + margin_per_half + gross_pnl - exit_fee)
-                borrowed = float(row.get('borrowed_amount') or 0)
-                shared_db.update_order_partial_close(
-                    conn,
-                    order_id=row['id'],
-                    new_quantity=half_qty,
-                    new_amount_usdt=half_amount,
-                    new_sl_price=entry_price,
-                    new_borrowed_amount=borrowed / 2,
+        order_id = trade['id']
+
+        # Stage 1: +3% gain — close 40% of position, move SL to breakeven
+        if partial_exits_done == 0:
+            target = entry * (1 + shared_config.PARTIAL_EXIT_1_PCT / 100)
+            if current_price < target:
+                return False
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    row = shared_db.get_open_order_for_symbol(conn, symbol)
+                    if not row:
+                        return False
+                    orig_qty = float(row['quantity'])
+                    orig_notional = float(row['amount_usdt'])
+                    orig_borrowed = float(row.get('borrowed_amount') or 0)
+                    close_qty = orig_qty * shared_config.PARTIAL_EXIT_1_FRAC
+                    remain_qty = orig_qty - close_qty
+                    remain_frac = remain_qty / orig_qty
+                    remain_notional = orig_notional * remain_frac
+                    remain_borrowed = orig_borrowed * remain_frac
+                    gross_pnl = (current_price - entry) * close_qty
+                    exit_fee = close_qty * current_price * shared_config.BINANCE_TAKER_FEE
+                    partial_pnl = gross_pnl - exit_fee
+                    margin_released = (close_qty * entry) / shared_config.LEVERAGE
+                    bal = shared_db.get_balance(conn, "USDT")
+                    shared_db.set_balance(conn, "USDT", bal + margin_released + partial_pnl)
+                    existing_partial_pnl = float(row.get('partial_pnl_usdt') or 0)
+                    shared_db.update_order_partial_exit(
+                        conn,
+                        order_id=row['id'],
+                        new_quantity=remain_qty,
+                        new_amount_usdt=remain_notional,
+                        new_sl_price=entry,
+                        new_borrowed_amount=remain_borrowed,
+                        partial_exits_done=1,
+                        partial_pnl_usdt=existing_partial_pnl + partial_pnl,
+                    )
+                log.info(
+                    f"Monitor: Partial exit 1 {symbol}: 40% closed at {current_price:.6g} "
+                    f"(+{shared_config.PARTIAL_EXIT_1_PCT}%), PnL={partial_pnl:+.2f}, SL→breakeven"
                 )
-            log.info(
-                f"Monitor: Partial profit {symbol}: 50% closed at {current_price:.6g} "
-                f"(1R={one_r_target:.6g}, entry={entry_price:.6g}), SL moved to breakeven"
-            )
-            return True
-        except Exception as e:
-            log.error(f"Monitor: Partial profit failed for {symbol}: {e}")
-            return False
+                return True
+            except Exception as e:
+                log.error(f"Monitor: Partial exit 1 failed for {symbol}: {e}")
+                return False
+
+        # Stage 2: +6% gain — close 30% of original (= 50% of current remaining)
+        if partial_exits_done == 1:
+            target = entry * (1 + shared_config.PARTIAL_EXIT_2_PCT / 100)
+            if current_price < target:
+                return False
+            try:
+                with shared_db.get_connection() as conn:
+                    shared_db.init_schema(conn)
+                    row = shared_db.get_open_order_for_symbol(conn, symbol)
+                    if not row:
+                        return False
+                    cur_qty = float(row['quantity'])
+                    cur_notional = float(row['amount_usdt'])
+                    cur_borrowed = float(row.get('borrowed_amount') or 0)
+                    # close_qty is 30% of original = half of the remaining 60%
+                    close_qty = cur_qty * shared_config.PARTIAL_EXIT_2_FRAC / (1 - shared_config.PARTIAL_EXIT_1_FRAC)
+                    close_qty = min(close_qty, cur_qty)
+                    remain_qty = cur_qty - close_qty
+                    remain_frac = remain_qty / cur_qty if cur_qty > 0 else 0
+                    remain_notional = cur_notional * remain_frac
+                    remain_borrowed = cur_borrowed * remain_frac
+                    gross_pnl = (current_price - entry) * close_qty
+                    exit_fee = close_qty * current_price * shared_config.BINANCE_TAKER_FEE
+                    partial_pnl = gross_pnl - exit_fee
+                    margin_released = (close_qty * entry) / shared_config.LEVERAGE
+                    bal = shared_db.get_balance(conn, "USDT")
+                    shared_db.set_balance(conn, "USDT", bal + margin_released + partial_pnl)
+                    existing_partial_pnl = float(row.get('partial_pnl_usdt') or 0)
+                    # Trailing SL starts at current_price × 0.98 (existing trail logic takes over)
+                    trail_sl = current_price * (1 - 0.02)
+                    shared_db.update_order_partial_exit(
+                        conn,
+                        order_id=row['id'],
+                        new_quantity=remain_qty,
+                        new_amount_usdt=remain_notional,
+                        new_sl_price=trail_sl,
+                        new_borrowed_amount=remain_borrowed,
+                        partial_exits_done=2,
+                        partial_pnl_usdt=existing_partial_pnl + partial_pnl,
+                    )
+                log.info(
+                    f"Monitor: Partial exit 2 {symbol}: 30% closed at {current_price:.6g} "
+                    f"(+{shared_config.PARTIAL_EXIT_2_PCT}%), PnL={partial_pnl:+.2f}, trail SL set"
+                )
+                return True
+            except Exception as e:
+                log.error(f"Monitor: Partial exit 2 failed for {symbol}: {e}")
+                return False
+
+        return False
 
     def run(self):
         log.info("Monitor: Tracking active positions...")
@@ -298,9 +362,11 @@ class Monitor:
 
                 trade_mfe = self._extremes.get(order_id, {}).get('mfe')
                 trade_mae = self._extremes.get(order_id, {}).get('mae')
+                partial_pnl = float(row.get('partial_pnl_usdt') or 0)
+                total_pnl_usdt = round(fin['net_pnl_usdt'] + partial_pnl, 2)
                 shared_db.update_order_closed(
                     conn, order_id,
-                    pnl_usdt=round(fin['net_pnl_usdt'], 2),
+                    pnl_usdt=total_pnl_usdt,
                     pnl_percent=round(fin['net_pnl_pct'], 2),
                     close_reason=reason,
                     exit_fee_usd=round(fin['exit_fee_usd'], 4),
@@ -343,7 +409,7 @@ class Monitor:
                 "symbol": symbol,
                 "entry": float(row["entry_price"]),
                 "exit": price,
-                "pnl_usdt": round(fin['net_pnl_usdt'], 2),
+                "pnl_usdt": round(fin['net_pnl_usdt'] + float(row.get('partial_pnl_usdt') or 0), 2),
                 "pnl_percent": round(fin['net_pnl_pct'], 2),
                 "reason": reason,
                 "gross_pnl_usdt": round(fin['gross_pnl_usdt'], 2),
