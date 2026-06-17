@@ -39,6 +39,8 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
         ("initial_sl_price", "REAL"),
         ("partial_tp_hit", "INTEGER NOT NULL DEFAULT 0"),
         ("bot_version", "TEXT"),
+        ("partial_exits_done", "INTEGER NOT NULL DEFAULT 0"),
+        ("partial_pnl_usdt", "REAL NOT NULL DEFAULT 0"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {spec}")
@@ -433,6 +435,27 @@ def update_order_partial_close(
            SET quantity = ?, amount_usdt = ?, sl_price = ?, borrowed_amount = ?, partial_tp_hit = 1
            WHERE id = ? AND status = 'open'""",
         (new_quantity, new_amount_usdt, new_sl_price, new_borrowed_amount, order_id),
+    )
+
+
+def update_order_partial_exit(
+    conn: sqlite3.Connection,
+    order_id: int,
+    new_quantity: float,
+    new_amount_usdt: float,
+    new_sl_price: float,
+    new_borrowed_amount: float,
+    partial_exits_done: int,
+    partial_pnl_usdt: float,
+) -> None:
+    """Update order after a staged partial exit: reduce size, update SL, track partial PnL."""
+    conn.execute(
+        """UPDATE orders
+           SET quantity = ?, amount_usdt = ?, sl_price = ?, borrowed_amount = ?,
+               partial_exits_done = ?, partial_pnl_usdt = ?, partial_tp_hit = 1
+           WHERE id = ? AND status = 'open'""",
+        (new_quantity, new_amount_usdt, new_sl_price, new_borrowed_amount,
+         partial_exits_done, partial_pnl_usdt, order_id),
     )
 
 

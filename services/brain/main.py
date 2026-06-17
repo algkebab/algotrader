@@ -108,8 +108,9 @@ class Brain:
         redis_host = os.getenv('REDIS_HOST', 'localhost')
         self.db = redis.Redis(host=redis_host, port=6379, decode_responses=True)
 
-        # AI setup
-        self.client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        # AI setup (optional — only used when decision_mode=gpt)
+        api_key = os.getenv('OPENAI_API_KEY')
+        self.client = OpenAI(api_key=api_key) if api_key else None
 
     def _get_strategy_name(self):
         """Return current strategy name (default CONSERVATIVE)."""
@@ -120,11 +121,11 @@ class Brain:
         return name
 
     def _get_decision_mode(self) -> str:
-        """Return 'gpt' or 'code' (default: gpt)."""
+        """Return 'gpt' or 'code' (default: code)."""
         val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_DECISION_MODE)
-        if val and val.lower() == "code":
-            return "code"
-        return "gpt"
+        if val and val.lower() == "gpt":
+            return "gpt"
+        return "code"
 
     def should_analyze(self, symbol, current_price):
         """
