@@ -47,6 +47,17 @@ def _add_orders_columns_if_missing(conn: sqlite3.Connection) -> None:
             existing.add(col)
 
 
+def _add_backtest_trades_columns_if_missing(conn: sqlite3.Connection) -> None:
+    """Add new backtest_trades columns for existing DBs created before these columns existed."""
+    cur = conn.execute("PRAGMA table_info(backtest_trades)")
+    existing = {row[1] for row in cur.fetchall()}
+    for col, spec in [
+        ("regime", "TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE backtest_trades ADD COLUMN {col} {spec}")
+
+
 def _add_signals_columns_if_missing(conn: sqlite3.Connection) -> None:
     """Add new signal columns for existing DBs that were created before these columns existed."""
     cur = conn.execute("PRAGMA table_info(signals)")
@@ -191,6 +202,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
     """)
     _add_signals_columns_if_missing(conn)
+    _add_backtest_trades_columns_if_missing(conn)
 
 
 def get_setting(conn: sqlite3.Connection, key: str, default: Optional[str] = None) -> Optional[str]:

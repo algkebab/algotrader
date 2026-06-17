@@ -9,6 +9,7 @@ Stores results in SQLite backtest_runs and backtest_trades tables.
 Pushes 'backtest_complete' notification to Redis when done.
 """
 
+import bisect
 import json
 import os
 import sys
@@ -74,6 +75,9 @@ FETCH_SLEEP_S = 0.15
 
 # Step interval for walk-forward: every 4h (in number of 15m bars)
 STEP_BARS_15M = 16  # 16 × 15m = 4h
+
+# Maximum simultaneous open positions in AUTO portfolio backtest
+MAX_OPEN_PORTFOLIO = 5
 
 
 def _fetch_ohlcv_full(exchange, symbol: str, timeframe: str, since_ms: int, limit_per_call: int = 1000) -> list:
@@ -372,6 +376,397 @@ def _backtest_symbol(
     return trades, balance
 
 
+def _compute_regime_from_slices(c4h_btc: list, c15_btc: list, sym_slices: dict) -> dict:
+    """Compute market regime from pre-sliced BTC candles and symbol breadth slices.
+
+    Mirrors filter._compute_and_store_market_regime() but operates on historical data.
+    sym_slices: {symbol: (c15_slice, c4h_slice)} already trimmed to current timestamp.
+    """
+    if len(c4h_btc) < 30:
+        return {
+            "regime": "MIXED", "confidence": 40,
+            "active_strategies": ["CONSERVATIVE", "REVERSAL"],
+            "position_size_multiplier": 0.75, "vol_regime": "NORMAL",
+            "btc_4h_align": "MIXED", "adx_4h": 0.0, "breadth_bull_pct": 50.0,
+        }
+
+    closes_4h    = [c[4] for c in c4h_btc]
+    ema_stack_4h = ind_lib.compute_ema_stack(closes_4h)
+    adx_4h       = ind_lib.compute_adx(c4h_btc) or 0.0
+    btc_rsi      = ind_lib.compute_rsi(c15_btc) if len(c15_btc) >= 15 else 50.0
+
+    atr_ratio = 1.0
+    if len(c4h_btc) >= 65:
+        recent_ret = [(c4h_btc[i][4] - c4h_btc[i-1][4]) / c4h_btc[i-1][4]
+                      for i in range(len(c4h_btc) - 14, len(c4h_btc))]
+        hist_ret   = [(c4h_btc[i][4] - c4h_btc[i-1][4]) / c4h_btc[i-1][4]
+                      for i in range(len(c4h_btc) - 50, len(c4h_btc))]
+        vol_r = (sum(r * r for r in recent_ret) / len(recent_ret)) ** 0.5
+        vol_h = (sum(r * r for r in hist_ret)   / len(hist_ret))   ** 0.5
+        atr_ratio = vol_r / vol_h if vol_h > 0 else 1.0
+
+    bullish_4h_count = rsi_above_50_count = total = 0
+    for sym, (c15_sym, c4h_sym) in sym_slices.items():
+        if len(c4h_sym) < 50:
+            continue
+        total += 1
+        ema = ind_lib.compute_ema_stack([c[4] for c in c4h_sym])
+        if ema and ema.get('alignment') in ('BULLISH', 'RECOVERING'):
+            bullish_4h_count += 1
+        if len(c15_sym) >= 15 and ind_lib.compute_rsi(c15_sym) >= 50:
+            rsi_above_50_count += 1
+
+    breadth_bull_pct = round(bullish_4h_count / total * 100, 1) if total > 0 else 50.0
+    breadth_rsi_pct  = round(rsi_above_50_count / total * 100, 1) if total > 0 else 50.0
+    btc_4h_align     = (ema_stack_4h or {}).get('alignment', 'MIXED')
+
+    vol_regime = "EXTREME" if atr_ratio > 2.0 else "ELEVATED" if atr_ratio > 1.5 else "NORMAL"
+
+    bull_votes = bear_votes = 0
+    if btc_4h_align in ('BULLISH', 'RECOVERING'):                           bull_votes += 1
+    if btc_4h_align in ('BEARISH', 'WEAKENING'):                            bear_votes += 1
+    if breadth_bull_pct >= 55:                                               bull_votes += 1
+    if breadth_bull_pct <= 40:                                               bear_votes += 1
+    if adx_4h >= 25 and btc_4h_align in ('BULLISH', 'RECOVERING'):        bull_votes += 1
+    if adx_4h >= 25 and btc_4h_align in ('BEARISH', 'WEAKENING'):         bear_votes += 1
+    if btc_rsi >= 50:                                                        bull_votes += 1
+    if btc_rsi < 50:                                                         bear_votes += 1
+    if breadth_rsi_pct >= 55:                                                bull_votes += 1
+    if breadth_rsi_pct < 45:                                                 bear_votes += 1
+
+    if 0 < adx_4h < 20:
+        regime     = "RANGING"
+        confidence = max(30, int((1 - adx_4h / 20) * 80))
+    elif bull_votes >= 3:
+        regime     = "BULL_TRENDING"
+        confidence = int(bull_votes / 5 * 100)
+    elif bear_votes >= 3:
+        regime     = "BEAR_TRENDING"
+        confidence = int(bear_votes / 5 * 100)
+    else:
+        regime     = "MIXED"
+        confidence = 40
+
+    if regime == "BULL_TRENDING":
+        active_strategies, size_mult = ["CONSERVATIVE", "AGGRESSIVE", "REVERSAL"], 1.0
+    elif regime == "BEAR_TRENDING":
+        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 0.5
+    elif regime == "RANGING":
+        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 0.75
+    else:
+        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 0.75
+
+    if vol_regime == "EXTREME":
+        size_mult = round(size_mult * 0.5, 2)
+    elif vol_regime == "ELEVATED":
+        size_mult = round(size_mult * 0.75, 2)
+
+    return {
+        "regime": regime, "confidence": confidence,
+        "active_strategies": active_strategies,
+        "position_size_multiplier": size_mult,
+        "vol_regime": vol_regime,
+        "btc_4h_align": btc_4h_align,
+        "adx_4h": round(adx_4h, 2),
+        "breadth_bull_pct": breadth_bull_pct,
+    }
+
+
+def _backtest_portfolio(
+    exchange,
+    symbols: list,
+    days: int,
+    initial_balance: float,
+) -> tuple[list, float]:
+    """Portfolio-level walk-forward backtest with regime-switching strategy selection.
+
+    Uses a single shared balance and position cap (MAX_OPEN_PORTFOLIO).
+    At each 4h step: computes market regime from BTC historical data + symbol breadth,
+    selects allowed strategies, evaluates all symbols, opens trades from active strategies.
+    Returns (all_trades, final_balance).
+    """
+    now_ms          = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_cutoff_ms = now_ms - days * 24 * 3600 * 1000
+
+    log.info("Backtester[AUTO]: Fetching BTC candles for regime detection...")
+    btc_4h  = _fetch_ohlcv_full(exchange, "BTC/USDT", "4h",
+                                  now_ms - (days + 30) * 24 * 3600 * 1000)
+    time.sleep(FETCH_SLEEP_S)
+    btc_15m = _fetch_ohlcv_full(exchange, "BTC/USDT", "15m",
+                                  now_ms - (days + 2) * 24 * 3600 * 1000)
+    time.sleep(FETCH_SLEEP_S)
+
+    all_symbol_data = {}
+    for sym in symbols:
+        log.info(f"Backtester[AUTO]: Fetching {sym}...")
+        c15 = _fetch_ohlcv_full(exchange, sym, "15m",
+                                  now_ms - (days + 2) * 24 * 3600 * 1000)
+        time.sleep(FETCH_SLEEP_S)
+        c1h = _fetch_ohlcv_full(exchange, sym, "1h",
+                                  now_ms - (days + 7) * 24 * 3600 * 1000)
+        time.sleep(FETCH_SLEEP_S)
+        c4h = _fetch_ohlcv_full(exchange, sym, "4h",
+                                  now_ms - (days + 30) * 24 * 3600 * 1000)
+        time.sleep(FETCH_SLEEP_S)
+        if c15 and len(c15) >= 100:
+            all_symbol_data[sym] = (c15, c1h, c4h)
+        else:
+            log.warning(f"Backtester[AUTO]: Insufficient data for {sym}, skipping")
+
+    if not all_symbol_data or not btc_15m:
+        log.warning("Backtester[AUTO]: No usable data, aborting")
+        return [], initial_balance
+
+    # Precompute timestamp arrays once for O(log n) bisect lookups in the main loop
+    btc_ts_4h  = [c[0] for c in btc_4h]
+    btc_ts_15m = [c[0] for c in btc_15m]
+    sym_ts = {
+        sym: (
+            [c[0] for c in d[0]],
+            [c[0] for c in d[1]],
+            [c[0] for c in d[2]],
+        )
+        for sym, d in all_symbol_data.items()
+    }
+
+    backtest_start_idx = bisect.bisect_left(btc_ts_15m, start_cutoff_ms)
+    backtest_start_idx = max(backtest_start_idx, 150)
+
+    all_trades      = []
+    balance         = initial_balance
+    open_positions  = {}  # symbol -> position dict
+    prev_regime_name = None
+
+    for step_idx in range(backtest_start_idx, len(btc_15m) - STEP_BARS_15M, STEP_BARS_15M):
+        current_ts_ms = btc_15m[step_idx][0]
+        next_ts_ms    = btc_15m[min(step_idx + STEP_BARS_15M, len(btc_15m) - 1)][0]
+
+        # 1. Check exits for all open positions
+        for sym in list(open_positions.keys()):
+            pos    = open_positions[sym]
+            c15s   = all_symbol_data[sym][0]
+            ts15s  = sym_ts[sym][0]
+            start_i = bisect.bisect_right(ts15s, pos['entry_ts_ms'])
+            end_i   = bisect.bisect_right(ts15s, next_ts_ms)
+
+            for bar in c15s[start_i:end_i]:
+                bar_low, bar_high, bar_close, bar_ts = bar[3], bar[2], bar[4], bar[0]
+                sl_hit    = bar_low  <= pos['sl_price']
+                tp_hit    = bar_high >= pos['tp_price']
+                time_stop = (bar_ts - pos['entry_ts_ms']) >= 24 * 3600 * 1000
+
+                if not (sl_hit or tp_hit or time_stop):
+                    continue
+
+                if sl_hit and tp_hit:
+                    exit_price, close_reason = pos['sl_price'], "STOP-LOSS"
+                elif sl_hit:
+                    exit_price, close_reason = pos['sl_price'], "STOP-LOSS"
+                elif tp_hit:
+                    exit_price, close_reason = pos['tp_price'], "TAKE-PROFIT"
+                else:
+                    exit_price, close_reason = bar_close, "TIME-STOP"
+
+                qty         = pos['quantity']
+                notional    = pos['notional_usdt']
+                entry_price = pos['entry_price']
+                gross_pnl   = (exit_price - entry_price) * qty
+                exit_fee    = qty * exit_price * shared_config.MAKER_FEE
+                pnl_usdt    = gross_pnl - exit_fee
+                pnl_pct     = (exit_price - entry_price) / entry_price * 100
+                balance    += notional / shared_config.LEVERAGE + pnl_usdt
+
+                exit_dt = datetime.fromtimestamp(bar_ts / 1000, tz=timezone.utc)
+                all_trades.append({
+                    "symbol":        sym,
+                    "strategy":      pos['strategy'],
+                    "regime":        pos.get('regime', 'MIXED'),
+                    "entry_time":    pos['entry_time'],
+                    "exit_time":     exit_dt.isoformat(),
+                    "entry_price":   entry_price,
+                    "exit_price":    exit_price,
+                    "sl_price":      pos['sl_price'],
+                    "tp_price":      pos['tp_price'],
+                    "quantity":      qty,
+                    "notional_usdt": notional,
+                    "pnl_usdt":      round(pnl_usdt, 4),
+                    "pnl_pct":       round(pnl_pct, 4),
+                    "close_reason":  close_reason,
+                    "confidence":    pos.get('confidence'),
+                    "setup_grade":   pos.get('setup_grade'),
+                    "sl_pct":        pos.get('sl_pct'),
+                    "tp_pct":        pos.get('tp_pct'),
+                })
+                del open_positions[sym]
+                break
+
+        # 2. Compute market regime at this timestamp
+        c4h_end   = bisect.bisect_right(btc_ts_4h, current_ts_ms)
+        c15_end   = bisect.bisect_right(btc_ts_15m, current_ts_ms)
+        c4h_slice = btc_4h[max(0, c4h_end - 100):c4h_end]
+        c15_slice = btc_15m[max(0, c15_end - 150):c15_end]
+
+        sym_slices = {}
+        for sym, (c15s, _, c4hs) in all_symbol_data.items():
+            i15 = bisect.bisect_right(sym_ts[sym][0], current_ts_ms)
+            i4  = bisect.bisect_right(sym_ts[sym][2], current_ts_ms)
+            sym_slices[sym] = (
+                c15s[max(0, i15 - 60):i15],
+                c4hs[max(0, i4  - 60):i4],
+            )
+
+        regime = _compute_regime_from_slices(c4h_slice, c15_slice, sym_slices)
+        if regime['regime'] != prev_regime_name:
+            ts_str = datetime.fromtimestamp(current_ts_ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+            log.info(
+                f"Backtester[AUTO]: Regime → {regime['regime']} @ {ts_str} "
+                f"| ADX={regime['adx_4h']:.1f} | BTC_4h={regime['btc_4h_align']} "
+                f"| Breadth={regime['breadth_bull_pct']:.0f}%"
+            )
+            prev_regime_name = regime['regime']
+
+        if len(open_positions) >= MAX_OPEN_PORTFOLIO:
+            continue
+
+        allowed_strategies = regime['active_strategies']
+        size_mult = regime['position_size_multiplier']
+        btc_align = regime.get('btc_4h_align', 'MIXED')
+        btc_bias  = (
+            "BULLISH_TAILWIND" if btc_align in ('BULLISH', 'RECOVERING') else
+            "BEARISH_HEADWIND" if btc_align in ('BEARISH', 'WEAKENING') else
+            "NEUTRAL"
+        )
+
+        # 3. Scan symbols for new entries
+        for sym, (c15s, c1hs, c4hs) in all_symbol_data.items():
+            if sym in open_positions or len(open_positions) >= MAX_OPEN_PORTFOLIO:
+                break
+
+            i15 = bisect.bisect_right(sym_ts[sym][0], current_ts_ms)
+            i1h = bisect.bisect_right(sym_ts[sym][1], current_ts_ms)
+            i4  = bisect.bisect_right(sym_ts[sym][2], current_ts_ms)
+            c15 = c15s[max(0, i15 - 150):i15]
+            c1h = c1hs[max(0, i1h - 150):i1h]
+            c4h = c4hs[max(0, i4  - 100):i4]
+
+            if len(c15) < 60:
+                continue
+
+            for strategy in allowed_strategies:
+                profile = STRATEGY_PROFILES[strategy]
+                if not _passes_filter(c15, c1h, profile, strategy):
+                    continue
+
+                indicators = ind_lib.compute_all_indicators(
+                    c15, c1h, c4h, as_of_ts_ms=current_ts_ms
+                )
+                rsi_val   = ind_lib.compute_rsi(c15)
+                rvol_val  = ind_lib.compute_rvol(c15)
+                cur_price = c15[-1][4]
+                high_24h  = max(c[2] for c in c15[-96:]) if len(c15) >= 96 else max(c[2] for c in c15)
+                low_24h   = min(c[3] for c in c15[-96:]) if len(c15) >= 96 else min(c[3] for c in c15)
+
+                try:
+                    analysis, _ = shared_decision.make_decision(
+                        symbol=sym, price=cur_price, rsi=rsi_val, rvol=rvol_val,
+                        candles_15m=c15, candles_1h=c1h,
+                        high_24h=high_24h, low_24h=low_24h,
+                        indicators=indicators, strategy=strategy,
+                        btc_bias=btc_bias, regime_ctx=regime,
+                    )
+                except Exception as e:
+                    log.warning(f"Backtester[AUTO]: Decision error {sym}/{strategy}: {e}")
+                    continue
+
+                if analysis.get('verdict') != 'BUY':
+                    continue
+
+                sl_pct = float(analysis.get('stop_loss_pct') or 1.5)
+                tp_pct = float(analysis.get('take_profit_pct') or 3.0)
+                if sl_pct <= 0:
+                    continue
+
+                next_bar_i = bisect.bisect_right(sym_ts[sym][0], current_ts_ms)
+                if next_bar_i >= len(c15s):
+                    continue
+                entry_bar   = c15s[next_bar_i]
+                entry_price = entry_bar[1]
+                entry_ts_ms = entry_bar[0]
+
+                sl_price = entry_price * (1 - sl_pct / 100)
+                tp_price = entry_price * (1 + tp_pct / 100)
+
+                risk_amount   = balance * shared_config.POSITION_RISK_PCT * size_mult
+                notional_usdt = min(risk_amount / (sl_pct / 100),
+                                    balance * shared_config.LEVERAGE)
+                if notional_usdt <= 0:
+                    continue
+                margin_usdt = notional_usdt / shared_config.LEVERAGE
+                qty         = notional_usdt / entry_price
+                entry_fee   = notional_usdt * shared_config.MAKER_FEE
+                total_cost  = margin_usdt + entry_fee
+                if balance < total_cost:
+                    continue
+
+                balance -= total_cost
+                entry_dt = datetime.fromtimestamp(entry_ts_ms / 1000, tz=timezone.utc)
+                open_positions[sym] = {
+                    'strategy':      strategy,
+                    'regime':        regime['regime'],
+                    'entry_price':   entry_price,
+                    'entry_ts_ms':   entry_ts_ms,
+                    'entry_time':    entry_dt.isoformat(),
+                    'sl_price':      sl_price,
+                    'tp_price':      tp_price,
+                    'quantity':      qty,
+                    'notional_usdt': notional_usdt,
+                    'confidence':    analysis.get('confidence'),
+                    'setup_grade':   analysis.get('setup_grade'),
+                    'sl_pct':        sl_pct,
+                    'tp_pct':        tp_pct,
+                }
+                break  # one strategy per symbol per step
+
+    # Close any still-open positions at end of backtest
+    for sym, pos in open_positions.items():
+        c15s = all_symbol_data[sym][0]
+        if not c15s:
+            continue
+        last_bar    = c15s[-1]
+        exit_price  = last_bar[4]
+        qty         = pos['quantity']
+        notional    = pos['notional_usdt']
+        entry_price = pos['entry_price']
+        gross_pnl   = (exit_price - entry_price) * qty
+        exit_fee    = qty * exit_price * shared_config.MAKER_FEE
+        pnl_usdt    = gross_pnl - exit_fee
+        pnl_pct     = (exit_price - entry_price) / entry_price * 100
+        balance    += notional / shared_config.LEVERAGE + pnl_usdt
+        exit_dt     = datetime.fromtimestamp(last_bar[0] / 1000, tz=timezone.utc)
+        all_trades.append({
+            "symbol":        sym,
+            "strategy":      pos['strategy'],
+            "regime":        pos.get('regime', 'MIXED'),
+            "entry_time":    pos['entry_time'],
+            "exit_time":     exit_dt.isoformat(),
+            "entry_price":   entry_price,
+            "exit_price":    exit_price,
+            "sl_price":      pos['sl_price'],
+            "tp_price":      pos['tp_price'],
+            "quantity":      qty,
+            "notional_usdt": notional,
+            "pnl_usdt":      round(pnl_usdt, 4),
+            "pnl_pct":       round(pnl_pct, 4),
+            "close_reason":  "END-OF-BACKTEST",
+            "confidence":    pos.get('confidence'),
+            "setup_grade":   pos.get('setup_grade'),
+            "sl_pct":        pos.get('sl_pct'),
+            "tp_pct":        pos.get('tp_pct'),
+        })
+
+    return all_trades, balance
+
+
 def _store_results(
     strategy: str,
     symbols: list,
@@ -430,12 +825,13 @@ def _store_results(
         for t in all_trades:
             conn.execute(
                 """INSERT INTO backtest_trades
-                   (run_id, symbol, strategy, entry_time, exit_time, entry_price, exit_price,
+                   (run_id, symbol, strategy, regime, entry_time, exit_time, entry_price, exit_price,
                     sl_price, tp_price, quantity, notional_usdt, pnl_usdt, pnl_pct,
                     close_reason, confidence, setup_grade, sl_pct, tp_pct)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    run_id, t['symbol'], t['strategy'], t['entry_time'], t.get('exit_time'),
+                    run_id, t['symbol'], t['strategy'], t.get('regime'),
+                    t['entry_time'], t.get('exit_time'),
                     t['entry_price'], t.get('exit_price'), t['sl_price'], t['tp_price'],
                     t['quantity'], t['notional_usdt'], t.get('pnl_usdt'), t.get('pnl_pct'),
                     t.get('close_reason'), t.get('confidence'), t.get('setup_grade'),
@@ -509,7 +905,7 @@ class Backtester:
         days = int(request.get('days', 90))
         initial_balance = float(request.get('initial_balance', 1000.0))
 
-        if strategy not in STRATEGY_PROFILES:
+        if strategy != "AUTO" and strategy not in STRATEGY_PROFILES:
             log.warning(f"Backtester: Unknown strategy {strategy}, using CONSERVATIVE")
             strategy = 'CONSERVATIVE'
 
@@ -519,6 +915,69 @@ class Backtester:
         # Fetch benchmark once
         benchmark_return = _get_benchmark_return(self.exchange, days)
         log.info(f"Backtester: BTC benchmark return over {days}d: {benchmark_return:+.1f}%")
+
+        if strategy == "AUTO":
+            all_trades, final_balance = _backtest_portfolio(
+                self.exchange, symbols, days, initial_balance
+            )
+
+            breakdown = {}
+            for t in all_trades:
+                s = t.get('strategy', 'UNKNOWN')
+                if s not in breakdown:
+                    breakdown[s] = {'trades': 0, 'wins': 0, 'pnl_usdt': 0.0}
+                breakdown[s]['trades'] += 1
+                if t.get('pnl_usdt', 0) > 0:
+                    breakdown[s]['wins'] += 1
+                breakdown[s]['pnl_usdt'] += t.get('pnl_usdt', 0)
+
+            run_id = _store_results(
+                strategy="AUTO", symbols=symbols, days=days,
+                initial_balance=initial_balance, final_balance=final_balance,
+                all_trades=all_trades, benchmark_return_pct=benchmark_return,
+            )
+
+            total_trades = len(all_trades)
+            wins         = [t for t in all_trades if t.get('pnl_usdt', 0) > 0]
+            win_rate     = len(wins) / total_trades if total_trades > 0 else 0.0
+            total_return_pct = (final_balance - initial_balance) / initial_balance * 100 if initial_balance > 0 else 0.0
+            alpha        = portfolio_lib.compute_alpha(total_return_pct, benchmark_return)
+            daily_returns = _daily_returns_from_trades(all_trades, initial_balance, days)
+            sharpe       = portfolio_lib.compute_sharpe(daily_returns) if daily_returns else None
+            equity       = [initial_balance]
+            running      = initial_balance
+            for t in sorted(all_trades, key=lambda x: x.get('entry_time', '')):
+                running += t.get('pnl_usdt', 0)
+                equity.append(running)
+            max_dd = portfolio_lib.compute_peak_drawdown(equity)
+
+            self.db.rpush("notifications", json.dumps({
+                "type": "backtest_complete",
+                "data": {
+                    "run_id": run_id, "strategy": "AUTO", "days": days,
+                    "total_trades": total_trades,
+                    "win_rate": round(win_rate, 3),
+                    "total_return_pct": round(total_return_pct, 2),
+                    "benchmark_return_pct": round(benchmark_return, 2),
+                    "alpha": round(alpha, 2),
+                    "sharpe": sharpe,
+                    "max_drawdown_pct": max_dd,
+                    "strategy_breakdown": {
+                        s: {
+                            "trades":   v['trades'],
+                            "win_rate": round(v['wins'] / v['trades'], 3) if v['trades'] > 0 else 0.0,
+                            "pnl_usdt": round(v['pnl_usdt'], 2),
+                        }
+                        for s, v in breakdown.items()
+                    },
+                },
+            }))
+            log.info(
+                f"Backtester: AUTO run {run_id} complete — "
+                f"{total_trades} trades | WR={win_rate*100:.0f}% | "
+                f"Return={total_return_pct:+.1f}% | Alpha={alpha:+.1f}% | Sharpe={sharpe}"
+            )
+            return
 
         all_trades = []
         combined_balance = initial_balance

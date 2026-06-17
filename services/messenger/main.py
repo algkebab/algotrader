@@ -82,7 +82,8 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 🧠 • *set decision* <gpt|code> — Switch Brain between GPT (default) and code-based decision engine.
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 📊 • *analytics* <period> — AI performance report: last, today, week, month. Win rate, PnL, insights, recommended tweaks.
-🔬 • *backtest* [days] — Run walk-forward backtest (default 90 days). Results sent when complete.
+🔬 • *backtest* [days] — Run walk-forward backtest on current strategy (default 90 days).
+🔬 • *backtest auto* [days] — Regime-switching backtest: auto-selects strategy per market condition.
 📊 • *portfolio* — Sector breakdown, exposure, current drawdown, win rate.
 📈 • *alpha* — Strategy return vs BTC buy-and-hold benchmark.
 ❓ • *help* — This message."""
@@ -852,13 +853,22 @@ class Messenger:
         elif text == "backtest" or text.startswith("backtest "):
             parts = text.split()
             days = 90
-            if len(parts) > 1:
-                try:
-                    days = int(parts[1])
-                except ValueError:
-                    pass
+            auto_mode = len(parts) > 1 and parts[1].lower() == "auto"
+            if auto_mode:
+                if len(parts) > 2:
+                    try:
+                        days = int(parts[2])
+                    except ValueError:
+                        pass
+                strategy = "AUTO"
+            else:
+                if len(parts) > 1:
+                    try:
+                        days = int(parts[1])
+                    except ValueError:
+                        pass
+                strategy = self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE"
             days = max(7, min(days, 365))
-            strategy = self._get_setting(shared_config.SYSTEM_KEY_STRATEGY) or "CONSERVATIVE"
             import json as _json
             self.db.rpush("backtest_request", _json.dumps({
                 "strategy": strategy,
@@ -866,10 +876,11 @@ class Messenger:
                 "days": days,
                 "initial_balance": 1000.0,
             }))
+            label = "AUTO/Regime-switching" if auto_mode else strategy
             await self._safe_reply(
                 update,
-                f"🔬 *Backtest started*\n\nStrategy: {strategy} | Period: {days} days\n"
-                "Results will appear here when complete (usually 1-2 min)."
+                f"🔬 *Backtest started*\n\nStrategy: {label} | Period: {days} days\n"
+                "Results will appear here when complete (usually 2-3 min)."
             )
         elif text == "portfolio":
             try:
@@ -1154,12 +1165,25 @@ class Messenger:
                         sharpe = d.get('sharpe')
                         mdd = d.get('max_drawdown_pct', 0)
                         sharpe_str = f"{sharpe:.2f}" if sharpe is not None else "N/A"
-                        await self.send_telegram_msg(
-                            f"🔬 *Backtest Complete — {strat} ({days}d)*\n\n"
+                        label = "AUTO/Regime-switching" if strat == "AUTO" else strat
+                        msg = (
+                            f"🔬 *Backtest Complete — {label} ({days}d)*\n\n"
                             f"Trades: {n} | Win rate: {wr*100:.0f}%\n"
                             f"Return: {ret:+.1f}% | BTC: {bench:+.1f}% | Alpha: {alpha:+.1f}%\n"
                             f"Sharpe: {sharpe_str} | Max DD: {mdd:.1f}%"
                         )
+                        breakdown = d.get('strategy_breakdown')
+                        if breakdown:
+                            lines = []
+                            for s, v in sorted(breakdown.items()):
+                                wr_b  = v.get('win_rate', 0)
+                                pnl_b = v.get('pnl_usdt', 0)
+                                tr_b  = v.get('trades', 0)
+                                lines.append(
+                                    f"  • {s}: {tr_b} trades | WR: {wr_b*100:.0f}% | P&L: ${pnl_b:+.2f}"
+                                )
+                            msg += "\n\n*By strategy:*\n" + "\n".join(lines)
+                        await self.send_telegram_msg(msg)
 
             except Exception as e:
                 log.error(f"Messenger: notification processing error: {e}")
