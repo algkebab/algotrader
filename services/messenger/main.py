@@ -181,6 +181,8 @@ class Messenger:
             symbol = o["symbol"]
             entry = float(o["entry_price"])
             qty = float(o["quantity"])
+            strategy_tag = o.get("strategy_name") or "?"
+            regime_tag = o.get("regime") or "?"
             try:
                 ticker = await asyncio.to_thread(self.exchange.fetch_ticker, symbol)
                 now_price = ticker.get("last")
@@ -198,7 +200,7 @@ class Messenger:
                 now_str = f"⚠️ price error: {e}"
                 pnl_line = ""
             lines.append(
-                f"{i}. {symbol}\n"
+                f"{i}. {symbol} · `{strategy_tag}` · `{regime_tag}`\n"
                 f"   💵 Entry: {o['entry_price']} · Qty: {o['quantity']}\n"
                 f"   📈 Now: {now_str}\n"
                 f"   🎯 TP: {o['tp_price']} · 🛑 SL: {o['sl_price']}"
@@ -693,8 +695,51 @@ class Messenger:
                 open_count = len(open_orders)
                 open_symbols = ", ".join(o["symbol"] for o in open_orders) if open_orders else "—"
 
+                # Market regime
+                regime_line = ""
+                try:
+                    regime_raw = self.db.get(shared_config.REDIS_KEY_MARKET_REGIME)
+                    if regime_raw:
+                        rg = json.loads(regime_raw)
+                        rg_name = rg.get("regime", "MIXED")
+                        rg_conf = rg.get("confidence", "?")
+                        rg_strats = rg.get("active_strategies") or []
+                        rg_size = rg.get("position_size_multiplier", 1.0)
+                        rg_adx = rg.get("adx_4h")
+                        rg_breadth = rg.get("breadth_bullish_pct")
+                        rg_vol = rg.get("vol_regime", "")
+                        rg_emoji = {"BULL_TRENDING": "🟢", "BEAR_TRENDING": "🔴", "RANGING": "🟡"}.get(rg_name, "⚪")
+                        strats_str = ", ".join(rg_strats) if rg_strats else "NONE (sitting out)"
+                        adx_str = f" · ADX {rg_adx:.0f}" if rg_adx else ""
+                        breadth_str = f" · {rg_breadth:.0f}% bullish" if rg_breadth is not None else ""
+                        vol_str = f" · Vol: {rg_vol}" if rg_vol and rg_vol != "NORMAL" else ""
+                        regime_line = (
+                            f"{rg_emoji} Regime: {rg_name} ({rg_conf}% conf){adx_str}{breadth_str}{vol_str}\n"
+                            f"   Active: {strats_str} · {rg_size}× sizing"
+                        )
+                    else:
+                        regime_line = "⚪ Regime: — (Filter not ready)"
+                except Exception:
+                    regime_line = "⚪ Regime: — (error)"
+
+                # Live win rate (last 20 resolved signals)
+                wr_line = ""
+                try:
+                    with shared_db.get_connection() as conn:
+                        shared_db.init_schema(conn)
+                        wr_stats = shared_db.get_recent_signal_win_rate(conn, limit=20)
+                        dd_pct = shared_db.get_current_drawdown_pct(conn)
+                    if wr_stats["total"] > 0:
+                        wr_line = f"📊 Live WR: {wr_stats['win_rate_pct']}% (last {wr_stats['total']} trades) · avg {wr_stats['avg_pnl_usdt']:+.2f} USDT"
+                    else:
+                        wr_line = "📊 Live WR: — (no closed trades yet)"
+                    dd_line = f"📉 Drawdown: {dd_pct:.1f}% from peak" if dd_pct > 0 else ""
+                except Exception:
+                    wr_line = ""
+                    dd_line = ""
+
                 lines = [
-                    "📊 Status",
+                    "📊 *Status*",
                     "",
                     "📌 Pipeline: " + ("⏸️ paused (send \"start\" to resume)" if paused == "1" else "▶️ running"),
                     "🤖 Autopilot: " + ("ON (auto orders, no button)" if autopilot == "1" else "OFF (Buy button on signals)"),
@@ -702,10 +747,10 @@ class Messenger:
                     f"📈 Symbols: top {symbols_n} by volume",
                     f"📋 Open orders: {open_count} / {max_open} — {open_symbols}",
                     "📢 WAIT signals: " + ("ON" if signal_wait == "1" else "OFF"),
-                    "⚙️ Model: 3x leverage · 0.1% taker fee · 0.001%/h margin interest",
                 ]
-
-                # Balance + today's PnL
+                if regime_line:
+                    lines.append("")
+                    lines.append(regime_line)
                 lines.append("")
                 if balance is not None:
                     pnl_emoji = "📈" if today_pnl and today_pnl > 0 else ("📉" if today_pnl and today_pnl < 0 else "➡️")
@@ -714,6 +759,10 @@ class Messenger:
                     lines.append(f"💵 Balance: {balance:.2f} USDT · {pnl_str}")
                 else:
                     lines.append("💵 Balance: — (DB error)")
+                if dd_line:
+                    lines.append(dd_line)
+                if wr_line:
+                    lines.append(wr_line)
 
                 # BTC market bias — try full computed context first, then raw Scout data, then live fetch
                 try:

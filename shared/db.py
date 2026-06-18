@@ -289,7 +289,7 @@ def get_open_orders(conn: sqlite3.Connection) -> List[Any]:
     """Return all open orders (status='open'), newest first."""
     cur = conn.execute(
         """SELECT id, symbol, side, amount_usdt, entry_price, quantity, tp_price, sl_price,
-                  exchange_order_id, opened_at, mfe_pct, mae_pct
+                  exchange_order_id, opened_at, mfe_pct, mae_pct, strategy_name, regime
            FROM orders WHERE status = 'open' ORDER BY opened_at DESC"""
     )
     return [dict(row) for row in cur.fetchall()]
