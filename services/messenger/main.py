@@ -514,24 +514,30 @@ class Messenger:
         await self._safe_reply(update, f"✅ Symbols updated\n\n📈 Scout will fetch top {n} symbols by volume.")
 
     async def _handle_set_decision(self, update, text: str) -> None:
-        """Set decision mode. Usage: set decision <gpt|code>."""
+        """Set decision mode. Usage: set decision <ml|code|gpt>."""
         rest = text[len("set decision "):].strip().lower()
-        if rest not in ("gpt", "code"):
+        if rest not in ("ml", "gpt", "code"):
             await self._safe_reply(
                 update,
-                "🧠 Decision mode\n\nUsage: set decision <gpt|code>\n\n"
-                "gpt  — GPT-4o AI analysis (default, requires OpenAI API)\n"
-                "code — Deterministic rule engine (fast, no API cost)",
+                "🧠 Decision mode\n\nUsage: set decision <ml|code|gpt>\n\n"
+                "ml   — LightGBM probability model (recommended; falls back to code "
+                "if no trained model is present)\n"
+                "code — Deterministic rule engine (fast, no API cost)\n"
+                "gpt  — GPT-4o AI analysis (deprecated; for A/B comparison only)",
             )
             return
         self._set_setting(shared_config.SYSTEM_KEY_DECISION_MODE, rest)
         log.info(f"Messenger: decision_mode set to {rest}")
-        mode_emoji = "🤖" if rest == "gpt" else "⚙️"
+        mode_emoji = {"ml": "📊", "gpt": "🤖"}.get(rest, "⚙️")
+        blurb = {
+            "ml": "LightGBM model will score candidates (P(win)); "
+                  "auto-falls back to the code engine if the model is missing.",
+            "gpt": "GPT-4o will analyze candidates.",
+            "code": "Code rule engine will analyze candidates (fast, deterministic).",
+        }[rest]
         await self._safe_reply(
             update,
-            f"{mode_emoji} Decision mode set to {rest.upper()}\n\n"
-            + ("GPT-4o will analyze candidates." if rest == "gpt"
-               else "Code rule engine will analyze candidates (fast, deterministic)."),
+            f"{mode_emoji} Decision mode set to {rest.upper()}\n\n{blurb}",
         )
 
     async def _handle_strategy(self, update, text: str) -> None:

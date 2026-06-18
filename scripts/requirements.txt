@@ -1,0 +1,6 @@
+# Offline ML training dependencies (not needed by the live services).
+# Install where you run scripts/train_model.py.
+ccxt==4.2.42
+numpy==1.26.4
+lightgbm==4.5.0
+scikit-learn==1.4.2

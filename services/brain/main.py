@@ -24,7 +24,9 @@ if _root not in sys.path:
 from shared import config as shared_config
 from shared import db as shared_db
 from shared import decision as shared_decision
+from shared import features as shared_features
 from shared import logger as shared_logger
+from shared import ml_model as shared_ml
 from shared.version import BOT_VERSION
 
 load_dotenv()
@@ -112,6 +114,9 @@ class Brain:
         api_key = os.getenv('OPENAI_API_KEY')
         self.client = OpenAI(api_key=api_key) if api_key else None
 
+        # ML signal model (lazy-loaded; degrades to code engine if unavailable)
+        self.ml_model = shared_ml.MLSignalModel()
+
     def _get_strategy_name(self):
         """Return current strategy name (default CONSERVATIVE)."""
         val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_STRATEGY)
@@ -121,11 +126,40 @@ class Brain:
         return name
 
     def _get_decision_mode(self) -> str:
-        """Return 'gpt' or 'code' (default: code)."""
+        """Return 'ml', 'code', or 'gpt' (default: code).
+
+        'ml'   — LightGBM probability model (falls back to code if unavailable)
+        'code' — deterministic confluence engine (baseline)
+        'gpt'  — deprecated LLM path, kept for A/B comparison only
+        """
         val = shared_db.get_setting_value(shared_config.SYSTEM_KEY_DECISION_MODE)
-        if val and val.lower() == "gpt":
-            return "gpt"
+        mode = (val or "").lower()
+        if mode in ("ml", "gpt", "code"):
+            return mode
         return "code"
+
+    def _compute_xs_momentum_ranks(self, candidates: list) -> dict:
+        """Map symbol -> cross-sectional momentum rank in [0,1] across the basket.
+
+        Uses each candidate's 16-bar (4h) 15m return so the ML model can see which
+        symbols are strongest relative to peers right now. Neutral 0.5 on failure.
+        """
+        moms = {}
+        for c in candidates:
+            c15 = c.get('candles_15m') or []
+            if len(c15) >= 17:
+                a = float(c15[-17][4])
+                b = float(c15[-1][4])
+                moms[c['symbol']] = (b - a) / a if a > 0 else 0.0
+        peer_vals = list(moms.values())
+        ranks = {}
+        for sym, m in moms.items():
+            others = [v for s, v in moms.items() if s != sym]
+            ranks[sym] = shared_features.cross_sectional_rank(m, others) if others else 0.5
+        # Symbols without enough history default to neutral
+        for c in candidates:
+            ranks.setdefault(c['symbol'], 0.5)
+        return ranks
 
     def should_analyze(self, symbol, current_price):
         """
@@ -813,6 +847,10 @@ Respond with ONLY the JSON object.
                     max_open = max(1, math.ceil(max_open * 0.75))
                     log.info(f"Brain: ELEVATED volatility — reducing effective max_open to {max_open}")
 
+            # Cross-sectional momentum ranks across the candidate basket — computed
+            # once so each symbol's ML feature vector knows its relative strength.
+            xs_ranks = self._compute_xs_momentum_ranks(candidates)
+
             for item in candidates:
                 # Re-check live count each iteration (another process may have opened one)
                 # but keep max_open from the regime-computed value above — do not reset it.
@@ -855,11 +893,59 @@ Respond with ONLY the JSON object.
                     'bollinger_15m': item.get('bollinger_15m'),
                     'macd_15m':      item.get('macd_15m'),
                 }
-                log.info(f"Brain: Analyzing {symbol} [{decision_mode.upper()}]...")
+                # Resolve ML availability up front: if 'ml' is requested but the
+                # model isn't loadable, transparently fall back to the code engine.
+                effective_mode = decision_mode
+                if decision_mode == "ml" and not self.ml_model.is_available():
+                    effective_mode = "code"
+                    log.warning(
+                        f"Brain: ml mode requested but model unavailable "
+                        f"({self.ml_model.load_error}); using code engine"
+                    )
+
+                log.info(f"Brain: Analyzing {symbol} [{effective_mode.upper()}]...")
 
                 candidate_strategy = item.get('strategy_name', strategy_now)
-                if decision_mode == "code":
-                    btc_bias_str = btc_bias_now if btc_bias_now else "NEUTRAL"
+                btc_bias_str = btc_bias_now if btc_bias_now else "NEUTRAL"
+
+                if effective_mode == "ml":
+                    analysis, signal_id, _p_win = shared_ml.build_ml_analysis(
+                        self.ml_model,
+                        symbol=symbol,
+                        price=current_price,
+                        rsi=item['rsi'],
+                        rvol=item['rvol'],
+                        candles_15m=item.get('candles_15m', []),
+                        candles_1h=item.get('candles_1h', []),
+                        candles_4h=item.get('candles_4h', []),
+                        indicators=indicators_dict,
+                        strategy=candidate_strategy,
+                        btc_bias=btc_bias_str,
+                        regime_ctx=regime_now,
+                        xs_momentum_rank=xs_ranks.get(symbol, 0.5),
+                    )
+                    # Persist ml-mode signal to DB for tracking
+                    try:
+                        with shared_db.get_connection() as conn:
+                            shared_db.init_schema(conn)
+                            shared_db.insert_signal(
+                                conn,
+                                signal_id=signal_id,
+                                symbol=symbol,
+                                stats={
+                                    "symbol": symbol, "price": current_price,
+                                    "rsi": item['rsi'], "rvol": item['rvol'],
+                                    "strategy": candidate_strategy, "decision_mode": "ml",
+                                    "ml_p_win": analysis.get("ml_p_win"),
+                                    "bot_version": BOT_VERSION,
+                                    "indicators": indicators_dict,
+                                },
+                                prompt="[ml_model]",
+                                response=analysis,
+                            )
+                    except Exception as e:
+                        log.error(f"Brain: Failed to persist ml signal {signal_id}: {e}")
+                elif effective_mode == "code":
                     analysis, signal_id = shared_decision.make_decision(
                         symbol=symbol,
                         price=current_price,
