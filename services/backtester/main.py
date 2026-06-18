@@ -448,12 +448,17 @@ def _compute_regime_from_slices(c4h_btc: list, c15_btc: list, sym_slices: dict) 
         confidence = 40
 
     # REVERSAL disabled: 0% WR across 13 trades in 360d backtest (BULL and RANGING both)
+    # RANGING + BTC bearish EMA: ADX<20 ≠ oscillating market — a slow bear bleed also has low ADX.
+    # Block entries when macro direction is bearish even in RANGING to avoid slow-bleed SL chains.
     if regime == "BULL_TRENDING":
         active_strategies, size_mult = ["CONSERVATIVE"], 1.0
     elif regime == "BEAR_TRENDING":
         active_strategies, size_mult = [], 0.5
     elif regime == "RANGING":
-        active_strategies, size_mult = ["CONSERVATIVE"], 0.75
+        if btc_4h_align in ('BEARISH', 'WEAKENING'):
+            active_strategies, size_mult = [], 0.5
+        else:
+            active_strategies, size_mult = ["CONSERVATIVE"], 0.75
     else:
         active_strategies, size_mult = ["CONSERVATIVE"], 0.75
 

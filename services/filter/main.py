@@ -250,6 +250,8 @@ class Filter:
         # AGGRESSIVE: 33% WR breakeven at 2:1 R:R; live WR 21% → removed
         # REVERSAL: 0% WR across 13 trades in 360d (both BULL and RANGING) → disabled
         # BEAR: no longs; all wins were TS exits, EV = 0.33×1.1 − 0.67×1.2 = −0.44 → removed
+        # RANGING + BTC bearish EMA: ADX<20 means low momentum, not oscillation — a slow bear
+        #   bleed also has ADX<20. Block entries when BTC 4h direction is bearish even at low ADX.
         if regime == "BULL_TRENDING":
             active_strategies = ["CONSERVATIVE"]
             size_mult = 1.0
@@ -257,8 +259,12 @@ class Filter:
             active_strategies = []
             size_mult = 0.5
         elif regime == "RANGING":
-            active_strategies = ["CONSERVATIVE"]
-            size_mult = 0.75
+            if btc_4h_align in ('BEARISH', 'WEAKENING'):
+                active_strategies = []
+                size_mult = 0.5
+            else:
+                active_strategies = ["CONSERVATIVE"]
+                size_mult = 0.75
         else:  # MIXED
             active_strategies = ["CONSERVATIVE"]
             size_mult = 0.75
