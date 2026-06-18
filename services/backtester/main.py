@@ -385,7 +385,7 @@ def _compute_regime_from_slices(c4h_btc: list, c15_btc: list, sym_slices: dict) 
     if len(c4h_btc) < 30:
         return {
             "regime": "MIXED", "confidence": 40,
-            "active_strategies": ["CONSERVATIVE", "REVERSAL"],
+            "active_strategies": ["CONSERVATIVE"],
             "position_size_multiplier": 0.75, "vol_regime": "NORMAL",
             "btc_4h_align": "MIXED", "adx_4h": 0.0, "breadth_bull_pct": 50.0,
         }
@@ -447,12 +447,13 @@ def _compute_regime_from_slices(c4h_btc: list, c15_btc: list, sym_slices: dict) 
         regime     = "MIXED"
         confidence = 40
 
+    # REVERSAL disabled: 0% WR across 13 trades in 360d backtest (BULL and RANGING both)
     if regime == "BULL_TRENDING":
-        active_strategies, size_mult = ["CONSERVATIVE", "REVERSAL"], 1.0
+        active_strategies, size_mult = ["CONSERVATIVE"], 1.0
     elif regime == "BEAR_TRENDING":
-        active_strategies, size_mult = [], 0.5  # No longs in bear — all wins were TS exits, not TP
+        active_strategies, size_mult = [], 0.5
     elif regime == "RANGING":
-        active_strategies, size_mult = ["REVERSAL"], 0.75
+        active_strategies, size_mult = ["CONSERVATIVE"], 0.75
     else:
         active_strategies, size_mult = ["CONSERVATIVE"], 0.75
 

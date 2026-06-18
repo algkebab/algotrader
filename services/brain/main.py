@@ -741,15 +741,9 @@ Respond with ONLY the JSON object.
             if btc_ctx:
                 btc_bias_now = self._get_btc_bias(btc_ctx)
                 if btc_bias_now == "STRONG_BEARISH":
-                    strategy_now_for_btc = self._get_strategy_name()
-                    if strategy_now_for_btc != "REVERSAL":
-                        log.info(
-                            "Brain: STRONG_BEARISH BTC — blocking momentum/conservative analysis; "
-                            "REVERSAL allowed (panic selling creates reversal setups)"
-                        )
-                        time.sleep(5)
-                        continue
-                    log.info("Brain: STRONG_BEARISH BTC — REVERSAL strategy proceeding")
+                    log.info("Brain: STRONG_BEARISH BTC — blocking all entries (no long setups in crash)")
+                    time.sleep(5)
+                    continue
             else:
                 btc_bias_now = "NEUTRAL"
 

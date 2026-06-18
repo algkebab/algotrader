@@ -246,22 +246,18 @@ class Filter:
             regime = "MIXED"
             confidence = 40
 
-        # Strategy gating per regime — tuned from backtest data (90d AUTO run):
-        # AGGRESSIVE at 2:1 R:R needs 33% WR to break even; live WR was 21% → removed
-        # REVERSAL in BEAR = 0% WR (market keeps falling through oversold levels) → removed
-        # CONSERVATIVE in RANGING = 16% WR (no trend = momentum SL magnet) → removed
+        # Strategy gating per regime — validated on 360d AUTO backtest:
+        # AGGRESSIVE: 33% WR breakeven at 2:1 R:R; live WR 21% → removed
+        # REVERSAL: 0% WR across 13 trades in 360d (both BULL and RANGING) → disabled
+        # BEAR: no longs; all wins were TS exits, EV = 0.33×1.1 − 0.67×1.2 = −0.44 → removed
         if regime == "BULL_TRENDING":
-            active_strategies = ["CONSERVATIVE", "REVERSAL"]
+            active_strategies = ["CONSERVATIVE"]
             size_mult = 1.0
         elif regime == "BEAR_TRENDING":
-            # No longs in bear — backtest shows all wins were TS exits (avg +1.1%), not TP;
-            # EV = 0.33×1.1 − 0.67×1.2 = −0.44 per trade.
             active_strategies = []
             size_mult = 0.5
         elif regime == "RANGING":
-            # REVERSAL only: mean-reversion from extremes works in sideways markets
-            # CONSERVATIVE removed: trend-following fails without a trend
-            active_strategies = ["REVERSAL"]
+            active_strategies = ["CONSERVATIVE"]
             size_mult = 0.75
         else:  # MIXED
             active_strategies = ["CONSERVATIVE"]
