@@ -249,7 +249,7 @@ class Monitor:
                     try:
                         opened_at = datetime.fromisoformat(trade["opened_at"].replace("Z", "+00:00"))
                         hours_open = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0
-                        if hours_open >= 24:
+                        if hours_open >= 48:
                             self.close_position(symbol, current_price, "TIME-STOP")
                             continue
                     except Exception:

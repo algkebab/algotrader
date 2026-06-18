@@ -318,6 +318,27 @@ class Filter:
         except Exception:
             return None
 
+    def _get_spread_pct(self, symbol: str) -> float | None:
+        """Bid-ask spread as % of ask price. Cached 60s. Returns None on error."""
+        cache_key = f"spread_pct:{symbol}"
+        cached = self.db.get(cache_key)
+        if cached is not None:
+            try:
+                return float(cached)
+            except (TypeError, ValueError):
+                pass
+        try:
+            ob = self._exchange_futures.fetch_order_book(symbol, limit=5)
+            best_bid = ob['bids'][0][0] if ob.get('bids') else None
+            best_ask = ob['asks'][0][0] if ob.get('asks') else None
+            if best_bid and best_ask and best_ask > 0:
+                spread = (best_ask - best_bid) / best_ask * 100
+                self.db.set(cache_key, str(round(spread, 6)), ex=60)
+                return spread
+        except Exception:
+            pass
+        return None
+
     def run(self):
         log.info("Filter: Analyzing Volume & RSI indicators...")
         PAUSED_KEY = shared_config.SYSTEM_KEY_TRADING_PAUSED
@@ -491,6 +512,15 @@ class Filter:
                                 f"extreme funding rate {funding:.4%}"
                             )
                             continue
+
+                    # 4b. Bid-ask spread gate: wide spread = thin market, bad execution quality.
+                    spread_pct = self._get_spread_pct(symbol)
+                    if spread_pct is not None and spread_pct > shared_config.MAX_SPREAD_PCT:
+                        log.debug(
+                            f"Filter: {symbol}/{strategy_name} skipped — "
+                            f"spread too wide {spread_pct:.3f}%"
+                        )
+                        continue
 
                     # 4. Pre-filter: skip full bearish EMA stack for momentum strategies.
                     if strategy_name != "REVERSAL" and ema_15m.get('alignment') == "BEARISH":

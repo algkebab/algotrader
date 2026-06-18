@@ -755,12 +755,28 @@ Respond with ONLY the JSON object.
 
             # Do not call OpenAI when at max open orders (no new orders would be placed)
             open_count = shared_db.get_open_order_count()
-            max_open = shared_db.get_max_open_orders()
+            db_max = shared_db.get_max_open_orders()
+
+            # Regime-based dynamic max: strong trends allow more positions,
+            # uncertainty and ranging markets throttle exposure.
+            regime_for_max = self._get_market_regime()
+            if regime_for_max:
+                rname = regime_for_max.get('regime', 'MIXED')
+                radx  = regime_for_max.get('adx_4h') or 0
+                if rname == 'BULL_TRENDING' and radx > 25:
+                    regime_max = shared_config.REGIME_MAX_POSITIONS['BULL_TRENDING_STRONG']
+                else:
+                    regime_max = shared_config.REGIME_MAX_POSITIONS.get(rname, 2)
+                max_open = min(db_max, regime_max)
+                if max_open != db_max:
+                    log.info(f"Brain: Regime {rname} (ADX={radx:.0f}) → effective max_open={max_open}")
+            else:
+                max_open = db_max
 
             # Under BEARISH_HEADWIND, halve the effective position limit to reduce
             # simultaneous correlated exposure (all alts will fall together with BTC)
             if btc_bias_now == "BEARISH_HEADWIND":
-                max_open = math.ceil(max_open / 2)
+                max_open = max(1, math.ceil(max_open / 2))
                 log.info(
                     f"Brain: BEARISH_HEADWIND BTC — reducing effective max_open "
                     f"to {max_open} (correlated risk management)"
@@ -804,9 +820,9 @@ Respond with ONLY the JSON object.
                     log.info(f"Brain: ELEVATED volatility — reducing effective max_open to {max_open}")
 
             for item in candidates:
-                # Re-check at max capacity before each item (avoids race: 10th order opened after batch start)
+                # Re-check live count each iteration (another process may have opened one)
+                # but keep max_open from the regime-computed value above — do not reset it.
                 open_count = shared_db.get_open_order_count()
-                max_open = shared_db.get_max_open_orders()
                 if open_count >= max_open:
                     log.info(f"Brain: Stopping (max open orders reached: {open_count}/{max_open})")
                     break
@@ -831,7 +847,7 @@ Respond with ONLY the JSON object.
                 # --- SMART CACHE END ---
 
                 # Re-check again right before calling AI (no API call when at capacity)
-                if shared_db.get_open_order_count() >= shared_db.get_max_open_orders():
+                if shared_db.get_open_order_count() >= max_open:
                     log.info(f"Brain: Skipping AI for {symbol} (max open orders reached)")
                     break
 
@@ -920,7 +936,7 @@ Respond with ONLY the JSON object.
                     final_signal['market_regime'] = regime_now.get('regime', 'MIXED')
 
                 # Never send a signal if at max open orders or already have open order for this symbol
-                if shared_db.get_open_order_count() >= shared_db.get_max_open_orders():
+                if shared_db.get_open_order_count() >= max_open:
                     log.info(f"Brain: Not sending signal for {symbol} (max open orders reached)")
                     continue
                 try:

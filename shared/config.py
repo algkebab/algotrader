@@ -65,3 +65,15 @@ PARTIAL_EXIT_2_FRAC = 0.30  # Close 30% of position
 
 # Funding rate gate (Binance perp market sentiment)
 FUNDING_RATE_BLOCK_LONG = 0.001  # Block longs when perp funding > 0.1% per 8h
+
+# Bid-ask spread filter
+MAX_SPREAD_PCT = 0.1  # Skip entry when spread > 0.1% (thin market, bad execution)
+
+# Dynamic max open orders by regime (Brain overrides DB setting within these bounds)
+REGIME_MAX_POSITIONS = {
+    "BULL_TRENDING_STRONG": 5,  # ADX > 25 — strong trend, full deployment
+    "BULL_TRENDING":        4,  # ADX ≤ 25 — trend present but weaker
+    "RANGING":              3,  # Mean-reversion only, fewer setups
+    "MIXED":                2,  # Uncertainty — preserve capital
+    "BEAR_TRENDING":        0,  # Sit out entirely
+}
