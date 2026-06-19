@@ -47,15 +47,23 @@ DEFAULT_SYMBOLS = [
 
 
 def _binance_get(path, params):
-    """Binance Futures public REST GET. Returns parsed JSON or []."""
+    """Binance Futures public REST GET. Returns parsed JSON list or []."""
     qs = "&".join(f"{k}={v}" for k, v in params.items())
     url = f"https://fapi.binance.com{path}?{qs}"
     try:
         with _urllib.urlopen(url, timeout=10) as resp:
-            return json.loads(resp.read())
+            data = json.loads(resp.read())
+            if isinstance(data, dict):
+                # Binance returns {"code": -XXXX, "msg": "..."} on error
+                print(f"  Binance API error {path}: {data.get('msg', data)}")
+                return []
+            return data
     except Exception as e:
         print(f"  Binance API error {path}: {e}")
         return []
+
+
+_30D_MS = 30 * 86_400_000  # Binance retains OI/basis history for 30 days only
 
 
 def _fetch_funding_history(sym_raw, since_ms):
@@ -76,8 +84,10 @@ def _fetch_funding_history(sym_raw, since_ms):
 
 
 def _fetch_oi_history(sym_raw, since_ms):
-    """Fetch 4h open-interest history. Returns [(ts_ms, oi), ...] ascending."""
-    out, cur = [], since_ms
+    """Fetch 4h open-interest history (30-day retention). Returns [(ts_ms, oi), ...] ascending."""
+    now_ms = int(time.time() * 1000)
+    cur = max(since_ms, now_ms - _30D_MS)
+    out = []
     while True:
         batch = _binance_get("/futures/data/openInterestHist",
                              {"symbol": sym_raw, "period": "4h",
@@ -94,8 +104,10 @@ def _fetch_oi_history(sym_raw, since_ms):
 
 
 def _fetch_basis_history(sym_raw, since_ms):
-    """Fetch 4h perp-basis history. Returns [(ts_ms, basis_rate), ...] ascending."""
-    out, cur = [], since_ms
+    """Fetch 4h perp-basis history (30-day retention). Returns [(ts_ms, basis_rate), ...] ascending."""
+    now_ms = int(time.time() * 1000)
+    cur = max(since_ms, now_ms - _30D_MS)
+    out = []
     while True:
         batch = _binance_get("/futures/data/basis",
                              {"symbol": sym_raw, "contractType": "PERPETUAL",
