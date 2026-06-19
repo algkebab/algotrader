@@ -196,7 +196,7 @@ class Brain:
 
         try:
             basis_data = _get("/futures/data/basis",
-                              {"symbol": sym_raw, "contractType": "PERPETUAL",
+                              {"pair": sym_raw, "contractType": "PERPETUAL",
                                "period": "4h", "limit": "2"})
             basis_hist = [(int(r["timestamp"]), float(r["basisRate"])) for r in basis_data]
         except Exception as e:

@@ -110,7 +110,7 @@ def _fetch_basis_history(sym_raw, since_ms):
     out = []
     while True:
         batch = _binance_get("/futures/data/basis",
-                             {"symbol": sym_raw, "contractType": "PERPETUAL",
+                             {"pair": sym_raw, "contractType": "PERPETUAL",
                               "period": "4h", "startTime": cur, "limit": 500})
         if not batch:
             break
