@@ -106,11 +106,11 @@ def test_features():
 
 def test_data_tuple_unpacking():
     print("\n== data dict tuple unpacking ==")
-    # Simulate what build_dataset stores: 5-element tuple (c15, c1h, c4h, funding, oi_hist)
+    # build_dataset stores a 5-element tuple: (c15, c1h, c4h, funding, oi_hist)
     c15 = synth_candles(50, 0, 15 * 60 * 1000)
     dummy_data = {"BTC/USDT": (c15, [], [], [], []), "ETH/USDT": (c15, [], [], [], [])}
     try:
-        for osym, (oc15, _, _, _, _) in dummy_data.items():
+        for _osym, (_oc15, _, _, _, _) in dummy_data.items():
             pass
         check(True, "5-element tuple unpacking succeeds")
     except ValueError as e:
@@ -249,12 +249,54 @@ def test_build_ml_analysis(c15, c1h, c4h, mpath, metapath):
     check(a3["verdict"] == "WAIT", "regime block forces WAIT (hard gate)")
 
 
+def test_vol_pipeline(c15):
+    print("\n== forward-vol regression pipeline ==")
+    import numpy as np
+    import lightgbm as lgb
+
+    # Forward-vol label must be non-negative and need enough future bars.
+    fv = F.forward_realized_vol(c15, horizon=16)
+    check(fv >= 0.0, f"forward_realized_vol non-negative ({fv:.4f})")
+    fv_short = F.forward_realized_vol(c15[:5], horizon=16)
+    check(fv_short == 0.0, "forward_realized_vol returns 0.0 on insufficient bars")
+
+    # Learnable synthetic regression: target depends on features + noise.
+    nfeat = len(F.FEATURE_NAMES)
+    X, y, base = [], [], []
+    rng = random.Random(11)
+    for _ in range(1500):
+        v = [rng.gauss(0, 1) for _ in range(nfeat)]
+        target = 0.8 * v[3] + 0.4 * v[5] + rng.gauss(0, 0.5)
+        X.append(v)
+        y.append(target)
+        base.append(v[3])  # a weak baseline correlated with target
+    Xn = np.array(X, dtype=float)
+    yn = np.array(y, dtype=float)
+
+    params = {"objective": "regression", "metric": "l2", "num_leaves": 15,
+              "max_depth": 4, "min_data_in_leaf": 50, "verbose": -1}
+    oof = np.full(len(yn), np.nan)
+    for tr, te in cv.purged_kfold_indices(len(yn), n_splits=5, label_horizon=10,
+                                          embargo_pct=0.02):
+        if not tr or not te:
+            continue
+        bst = lgb.train(params, lgb.Dataset(Xn[tr], label=yn[tr]), num_boost_round=100)
+        oof[te] = bst.predict(Xn[te])
+    valid = ~np.isnan(oof)
+    ss_res = float(np.sum((yn[valid] - oof[valid]) ** 2))
+    ss_tot = float(np.sum((yn[valid] - yn[valid].mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot
+    check(r2 > 0.3, f"synthetic regression OOF R2 {r2:.3f} > 0.3 (sanity)")
+
+
 def main():
     print("ML pipeline smoke test (offline, synthetic data)")
     c15, c1h, c4h = test_features()
+    test_data_tuple_unpacking()
     test_cross_validation()
     mpath, metapath = test_train_and_serve(c15, c1h, c4h)
     test_build_ml_analysis(c15, c1h, c4h, mpath, metapath)
+    test_vol_pipeline(c15)
 
     print("\n" + "=" * 50)
     if _FAILS:

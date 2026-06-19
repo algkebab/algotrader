@@ -96,6 +96,20 @@ def realized_volatility(candles: list, window: int = 20,
     return math.sqrt(mean_sq) * math.sqrt(bars_per_year)
 
 
+def forward_realized_vol(future_candles: list, horizon: int,
+                         bars_per_year: int = BARS_PER_YEAR_15M) -> float:
+    """Realised volatility over the NEXT `horizon` bars — a regression label.
+
+    This is intentionally forward-looking: pass the slice of candles that occur
+    AFTER the decision point (entry bar first). Used only for offline labelling,
+    never at serve time. Returns 0.0 if there aren't enough future bars.
+    """
+    if len(future_candles) < horizon + 1:
+        return 0.0
+    window = future_candles[:horizon + 1]
+    return realized_volatility(window, window=horizon, bars_per_year=bars_per_year)
+
+
 def rolling_realized_vol_series(candles: list, window: int = 20,
                                 bars_per_year: int = BARS_PER_YEAR_15M) -> list:
     """Series of rolling realised volatility, one value per window step.
