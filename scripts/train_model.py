@@ -84,7 +84,9 @@ def _fetch_funding_history(sym_raw, since_ms):
 
 
 def _fetch_oi_history(sym_raw, since_ms):
-    """Fetch 4h open-interest history (30-day retention). Returns [(ts_ms, oi), ...] ascending."""
+    """Fetch 4h open-interest history (30-day retention).
+
+    Returns [(ts_ms, oi), ...] ascending."""
     now_ms = int(time.time() * 1000)
     cur = max(since_ms, now_ms - _30D_MS)
     out = []
