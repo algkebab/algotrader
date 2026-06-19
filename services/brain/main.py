@@ -21,6 +21,9 @@ _root = os.path.abspath(os.path.join(_this_dir, "..", "..")) if os.path.basename
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
+import json as _json
+import urllib.request as _urllib
+
 from shared import config as shared_config
 from shared import db as shared_db
 from shared import decision as shared_decision
@@ -160,6 +163,47 @@ class Brain:
         for c in candidates:
             ranks.setdefault(c['symbol'], 0.5)
         return ranks
+
+    def _fetch_positioning(self, symbol: str) -> dict:
+        """Fetch current funding rate, open interest, and basis from Binance public API.
+
+        Called only in ML mode. Returns a positioning dict compatible with
+        shared.features.funding_and_positioning(), or {} on any failure.
+        """
+        sym_raw = symbol.replace("/", "")
+
+        def _get(path, params):
+            qs = "&".join(f"{k}={v}" for k, v in params.items())
+            url = f"https://fapi.binance.com{path}?{qs}"
+            with _urllib.urlopen(url, timeout=5) as r:
+                return _json.loads(r.read())
+
+        try:
+            fr_data = _get("/fapi/v1/fundingRate",
+                           {"symbol": sym_raw, "limit": "10"})
+            funding = [(int(r["fundingTime"]), float(r["fundingRate"])) for r in fr_data]
+        except Exception as e:
+            log.debug(f"Brain: funding fetch failed for {symbol}: {e}")
+            funding = []
+
+        try:
+            oi_data = _get("/futures/data/openInterestHist",
+                           {"symbol": sym_raw, "period": "4h", "limit": "3"})
+            oi_hist = [(int(r["timestamp"]), float(r["sumOpenInterest"])) for r in oi_data]
+        except Exception as e:
+            log.debug(f"Brain: OI fetch failed for {symbol}: {e}")
+            oi_hist = []
+
+        try:
+            basis_data = _get("/futures/data/basis",
+                              {"symbol": sym_raw, "contractType": "PERPETUAL",
+                               "period": "4h", "limit": "2"})
+            basis_hist = [(int(r["timestamp"]), float(r["basisRate"])) for r in basis_data]
+        except Exception as e:
+            log.debug(f"Brain: basis fetch failed for {symbol}: {e}")
+            basis_hist = []
+
+        return shared_features.funding_and_positioning(funding, oi_hist, basis_hist)
 
     def should_analyze(self, symbol, current_price):
         """
@@ -909,6 +953,7 @@ Respond with ONLY the JSON object.
                 btc_bias_str = btc_bias_now if btc_bias_now else "NEUTRAL"
 
                 if effective_mode == "ml":
+                    positioning = self._fetch_positioning(symbol)
                     analysis, signal_id, _p_win = shared_ml.build_ml_analysis(
                         self.ml_model,
                         symbol=symbol,
@@ -923,6 +968,7 @@ Respond with ONLY the JSON object.
                         btc_bias=btc_bias_str,
                         regime_ctx=regime_now,
                         xs_momentum_rank=xs_ranks.get(symbol, 0.5),
+                        positioning=positioning,
                     )
                     # Persist ml-mode signal to DB for tracking
                     try:

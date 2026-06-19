@@ -46,6 +46,11 @@ FEATURE_NAMES = [
     "rvol_ratio",       # current bar vol / 50-bar avg vol (relative volume)
     "xs_mom_rank",      # cross-sectional momentum rank in [0,1] (0.5 = neutral)
     "frac_diff",        # fractionally-differenced log price (stationary, keeps memory)
+    # --- positioning / market-structure features (not in OHLCV) ---
+    "funding_rate",     # latest 8h perpetual funding rate (raw, e.g. 0.0001)
+    "funding_bias",     # mean of last 6 funding rates — persistent sentiment direction
+    "oi_change_pct",    # % change in open interest over the last 4h period
+    "basis_rate",       # (futures mark price - spot index) / index — premium/discount
 ]
 
 # EMA alignment string -> numeric encoding (bullish positive, bearish negative)
@@ -238,6 +243,31 @@ def frac_diff_last(closes: list, d: float = 0.4, width: int = 50,
     return val
 
 
+def funding_and_positioning(
+    funding_rates: list,
+    oi_series: list,
+    basis_series: list,
+) -> dict:
+    """Compute positioning features from funding/OI/basis time series.
+
+    Each series is a list of (timestamp_ms, value_float) sorted ascending.
+    Returns neutral zeros on missing/failed data so the model degrades gracefully.
+    """
+    out = {"funding_rate": 0.0, "funding_bias": 0.0,
+           "oi_change_pct": 0.0, "basis_rate": 0.0}
+    if funding_rates:
+        recent = [r for _, r in funding_rates[-6:]]
+        out["funding_rate"] = recent[-1]
+        out["funding_bias"] = sum(recent) / len(recent)
+    if len(oi_series) >= 2:
+        oi_now = oi_series[-1][1]
+        oi_prev = oi_series[-2][1]
+        out["oi_change_pct"] = (oi_now - oi_prev) / oi_prev if oi_prev > 0 else 0.0
+    if basis_series:
+        out["basis_rate"] = basis_series[-1][1]
+    return out
+
+
 def cross_sectional_rank(value: float, peer_values: list) -> float:
     """Percentile rank of `value` within `peer_values` (inclusive), in [0,1].
     Returns 0.5 (neutral) when there are no peers. Used for cross-sectional
@@ -265,6 +295,7 @@ def build_features(
     indicators: dict = None,
     xs_momentum_rank: float = 0.5,
     frac_diff_d: float = 0.4,
+    positioning: dict = None,
 ) -> dict:
     """Assemble the full feature vector for one (symbol, timestamp).
 
@@ -319,6 +350,11 @@ def build_features(
         "xs_mom_rank": float(xs_momentum_rank),
         "frac_diff": frac_diff_last(closes, d=frac_diff_d),
     }
+    pos = positioning or {}
+    feats["funding_rate"] = float(pos.get("funding_rate", 0.0))
+    feats["funding_bias"] = float(pos.get("funding_bias", 0.0))
+    feats["oi_change_pct"] = float(pos.get("oi_change_pct", 0.0))
+    feats["basis_rate"] = float(pos.get("basis_rate", 0.0))
     return feats
 
 

@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import time
+import urllib.request as _urllib
 from datetime import datetime, timezone
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -43,6 +44,71 @@ DEFAULT_SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
     "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
 ]
+
+
+def _binance_get(path, params):
+    """Binance Futures public REST GET. Returns parsed JSON or []."""
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"https://fapi.binance.com{path}?{qs}"
+    try:
+        with _urllib.urlopen(url, timeout=10) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        print(f"  Binance API error {path}: {e}")
+        return []
+
+
+def _fetch_funding_history(sym_raw, since_ms):
+    """Fetch full funding-rate history. Returns [(ts_ms, rate), ...] ascending."""
+    out, cur = [], since_ms
+    while True:
+        batch = _binance_get("/fapi/v1/fundingRate",
+                             {"symbol": sym_raw, "startTime": cur, "limit": 1000})
+        if not batch:
+            break
+        for r in batch:
+            out.append((int(r["fundingTime"]), float(r["fundingRate"])))
+        if len(batch) < 1000:
+            break
+        cur = int(batch[-1]["fundingTime"]) + 1
+        time.sleep(0.1)
+    return sorted(out, key=lambda x: x[0])
+
+
+def _fetch_oi_history(sym_raw, since_ms):
+    """Fetch 4h open-interest history. Returns [(ts_ms, oi), ...] ascending."""
+    out, cur = [], since_ms
+    while True:
+        batch = _binance_get("/futures/data/openInterestHist",
+                             {"symbol": sym_raw, "period": "4h",
+                              "startTime": cur, "limit": 500})
+        if not batch:
+            break
+        for r in batch:
+            out.append((int(r["timestamp"]), float(r["sumOpenInterest"])))
+        if len(batch) < 500:
+            break
+        cur = int(batch[-1]["timestamp"]) + 1
+        time.sleep(0.1)
+    return sorted(out, key=lambda x: x[0])
+
+
+def _fetch_basis_history(sym_raw, since_ms):
+    """Fetch 4h perp-basis history. Returns [(ts_ms, basis_rate), ...] ascending."""
+    out, cur = [], since_ms
+    while True:
+        batch = _binance_get("/futures/data/basis",
+                             {"symbol": sym_raw, "contractType": "PERPETUAL",
+                              "period": "4h", "startTime": cur, "limit": 500})
+        if not batch:
+            break
+        for r in batch:
+            out.append((int(r["timestamp"]), float(r["basisRate"])))
+        if len(batch) < 500:
+            break
+        cur = int(batch[-1]["timestamp"]) + 1
+        time.sleep(0.1)
+    return sorted(out, key=lambda x: x[0])
 
 
 def _fetch_ohlcv_full(exchange, symbol, timeframe, since_ms, limit=1000):
@@ -103,12 +169,18 @@ def build_dataset(days, rr, horizon_bars, symbols):
         c15 = _fetch_ohlcv_full(exchange, sym, "15m", now_ms - (days + 2) * 86400000)
         c1h = _fetch_ohlcv_full(exchange, sym, "1h", now_ms - (days + 7) * 86400000)
         c4h = _fetch_ohlcv_full(exchange, sym, "4h", now_ms - (days + 30) * 86400000)
-        if c15 and len(c15) > 200:
-            data[sym] = (c15, c1h, c4h)
+        if not (c15 and len(c15) > 200):
+            continue
+        sym_raw = sym.replace("/", "")
+        since = now_ms - (days + 2) * 86400000
+        funding = _fetch_funding_history(sym_raw, since)
+        oi_hist = _fetch_oi_history(sym_raw, since)
+        basis_hist = _fetch_basis_history(sym_raw, since)
+        data[sym] = (c15, c1h, c4h, funding, oi_hist, basis_hist)
 
     X, y, ts_index = [], [], []
     # For cross-sectional rank we need each symbol's 16-bar momentum at each ts.
-    for sym, (c15, c1h, c4h) in data.items():
+    for sym, (c15, c1h, c4h, funding, oi_hist, basis_hist) in data.items():
         print(f"Labelling {sym} ({len(c15)} bars) ...")
         start_idx = next((i for i, c in enumerate(c15) if c[0] >= start_cut), 150)
         start_idx = max(start_idx, 150)
@@ -127,7 +199,7 @@ def build_dataset(days, rr, horizon_bars, symbols):
             # Cross-sectional momentum rank vs basket at this timestamp.
             my_mom = _mom16(w15)
             peers = []
-            for osym, (oc15, _, _) in data.items():
+            for osym, (oc15, _, _, _, _, _) in data.items():
                 if osym == sym:
                     continue
                 oslice = [c for c in oc15 if c[0] <= ts]
@@ -135,8 +207,16 @@ def build_dataset(days, rr, horizon_bars, symbols):
                     peers.append(_mom16(oslice))
             xs_rank = F.cross_sectional_rank(my_mom, peers) if peers else 0.5
 
+            # Positioning features (look-ahead-safe: only data at or before ts).
+            positioning = F.funding_and_positioning(
+                [r for r in funding if r[0] <= ts],
+                [r for r in oi_hist if r[0] <= ts],
+                [r for r in basis_hist if r[0] <= ts],
+            )
+
             feats = F.build_features(w15, w1h, w4h, rsi=rsi,
-                                     indicators=indicators, xs_momentum_rank=xs_rank)
+                                     indicators=indicators, xs_momentum_rank=xs_rank,
+                                     positioning=positioning)
             vec = F.features_to_vector(feats)
 
             # Triple-barrier label using ATR-based SL and R:R TP.

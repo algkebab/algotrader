@@ -147,6 +147,7 @@ def build_ml_analysis(
     btc_bias: str = "NEUTRAL",
     regime_ctx: dict = None,
     xs_momentum_rank: float = 0.5,
+    positioning: dict = None,
 ) -> tuple:
     """Produce an analysis dict (same schema as decision.make_decision) using the
     ML probability for the verdict. Returns (analysis, signal_id, p_win).
@@ -200,6 +201,7 @@ def build_ml_analysis(
     feats = F.build_features(
         candles_15m, candles_1h, candles_4h or [],
         rsi=rsi, indicators=ind, xs_momentum_rank=xs_momentum_rank,
+        positioning=positioning,
     )
     vector = F.features_to_vector(feats)
     p_win = model.predict_proba(vector)
