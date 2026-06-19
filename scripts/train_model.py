@@ -192,7 +192,7 @@ def build_dataset(days, rr, horizon_bars, symbols):
             # Cross-sectional momentum rank vs basket at this timestamp.
             my_mom = _mom16(w15)
             peers = []
-            for osym, (oc15, _, _, _, _, _) in data.items():
+            for osym, (oc15, _, _, _, _) in data.items():
                 if osym == sym:
                     continue
                 oslice = [c for c in oc15 if c[0] <= ts]

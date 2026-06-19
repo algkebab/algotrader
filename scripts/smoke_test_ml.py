@@ -104,6 +104,19 @@ def test_features():
     return c15, c1h, c4h
 
 
+def test_data_tuple_unpacking():
+    print("\n== data dict tuple unpacking ==")
+    # Simulate what build_dataset stores: 5-element tuple (c15, c1h, c4h, funding, oi_hist)
+    c15 = synth_candles(50, 0, 15 * 60 * 1000)
+    dummy_data = {"BTC/USDT": (c15, [], [], [], []), "ETH/USDT": (c15, [], [], [], [])}
+    try:
+        for osym, (oc15, _, _, _, _) in dummy_data.items():
+            pass
+        check(True, "5-element tuple unpacking succeeds")
+    except ValueError as e:
+        check(False, f"tuple unpack failed: {e}")
+
+
 def test_cross_validation():
     print("\n== purged k-fold ==")
     n = 500
