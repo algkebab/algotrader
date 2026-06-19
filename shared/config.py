@@ -38,7 +38,7 @@ SYSTEM_KEY_BALANCE_LAST_CHECK = "balance_last_check"
 SYSTEM_KEY_STRATEGY = "strategy"
 SYSTEM_KEY_TIMEZONE_OFFSET_MIN = "timezone_offset_min"
 SYSTEM_KEY_SIGNAL_WAIT = "signal_wait"
-SYSTEM_KEY_DECISION_MODE = "decision_mode"  # "gpt" (default) | "code"
+SYSTEM_KEY_DECISION_MODE = "decision_mode"  # "code" (default) | "ml" | "gpt"
 
 # --- Risk-Manager thresholds (overridable via env vars) ---
 RISK_DAILY_DRAWDOWN_PCT = 3.0      # pause if today's loss > 3% of balance

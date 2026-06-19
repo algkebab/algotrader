@@ -79,7 +79,7 @@ HELP_MESSAGE = f"""🛠 *Algotrader — Commands*
 📊 • *set symbols* <number> — Top N symbols by volume (e.g. set symbols {shared_config.MAX_SYMBOLS_DEFAULT}). Min {shared_config.MAX_SYMBOLS_MIN}, max {shared_config.MAX_SYMBOLS_MAX}. Default {shared_config.MAX_SYMBOLS_DEFAULT}.
 🛡️ • *strategy* <name> — Strategy: conservative, aggressive, reversal. Default: CONSERVATIVE.
 🕒 • *set timezone* <offset> — Local timezone offset vs UTC in hours (e.g. set timezone +2, set timezone -5, set timezone 5.5). Affects timestamps in bot messages only.
-🧠 • *set decision* <gpt|code> — Switch Brain between GPT (default) and code-based decision engine.
+🧠 • *set decision* <ml|code|gpt> — Switch Brain decision engine. Default: code. ml = LightGBM model (auto-falls back to code if not trained).
 📊 • *stats* <value> — Closed orders stats: today, yesterday, week, month, all. Default: today.
 📊 • *analytics* <period> — AI performance report: last, today, week, month. Win rate, PnL, insights, recommended tweaks.
 🔬 • *backtest* [days] — Run walk-forward backtest on current strategy (default 90 days).

@@ -44,6 +44,8 @@ _DEFAULT_DIR = _default_models_dir()
 DEFAULT_MODEL_PATH = os.path.join(_DEFAULT_DIR, "signal_model.txt")
 DEFAULT_META_PATH = os.path.join(_DEFAULT_DIR, "signal_model.meta.json")
 
+MIN_AUC = 0.52  # models below this have no meaningful edge over random
+
 
 class MLSignalModel:
     """Lazy-loaded LightGBM booster producing P(win) for a feature vector."""
@@ -81,6 +83,15 @@ class MLSignalModel:
                 self._load_error = (
                     "feature_names mismatch between model metadata and "
                     "shared.features.FEATURE_NAMES — retrain required"
+                )
+                self._booster = None
+                return
+            # Enforce AUC guard: refuse to serve a model with no real edge.
+            cv_auc = float((self._meta or {}).get("cv_auc", 1.0))
+            if cv_auc < MIN_AUC:
+                self._load_error = (
+                    f"CV AUC {cv_auc:.4f} < {MIN_AUC} — model has no edge; "
+                    "retrain or keep decision_mode=code"
                 )
                 self._booster = None
         except Exception as e:  # ImportError, corrupt file, etc.
