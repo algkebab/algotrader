@@ -103,26 +103,6 @@ def _fetch_oi_history(sym_raw, since_ms):
     return sorted(out, key=lambda x: x[0])
 
 
-def _fetch_basis_history(sym_raw, since_ms):
-    """Fetch 4h perp-basis history (30-day retention). Returns [(ts_ms, basis_rate), ...] ascending."""
-    now_ms = int(time.time() * 1000)
-    cur = max(since_ms, now_ms - _30D_MS)
-    out = []
-    while True:
-        batch = _binance_get("/futures/data/basis",
-                             {"pair": sym_raw, "contractType": "PERPETUAL",
-                              "period": "4h", "startTime": cur, "limit": 500})
-        if not batch:
-            break
-        for r in batch:
-            out.append((int(r["timestamp"]), float(r["basisRate"])))
-        if len(batch) < 500:
-            break
-        cur = int(batch[-1]["timestamp"]) + 1
-        time.sleep(0.1)
-    return sorted(out, key=lambda x: x[0])
-
-
 def _fetch_ohlcv_full(exchange, symbol, timeframe, since_ms, limit=1000):
     out = []
     cur = since_ms
@@ -187,12 +167,11 @@ def build_dataset(days, rr, horizon_bars, symbols):
         since = now_ms - (days + 2) * 86400000
         funding = _fetch_funding_history(sym_raw, since)
         oi_hist = _fetch_oi_history(sym_raw, since)
-        basis_hist = _fetch_basis_history(sym_raw, since)
-        data[sym] = (c15, c1h, c4h, funding, oi_hist, basis_hist)
+        data[sym] = (c15, c1h, c4h, funding, oi_hist)
 
     X, y, ts_index = [], [], []
     # For cross-sectional rank we need each symbol's 16-bar momentum at each ts.
-    for sym, (c15, c1h, c4h, funding, oi_hist, basis_hist) in data.items():
+    for sym, (c15, c1h, c4h, funding, oi_hist) in data.items():
         print(f"Labelling {sym} ({len(c15)} bars) ...")
         start_idx = next((i for i, c in enumerate(c15) if c[0] >= start_cut), 150)
         start_idx = max(start_idx, 150)
@@ -223,7 +202,6 @@ def build_dataset(days, rr, horizon_bars, symbols):
             positioning = F.funding_and_positioning(
                 [r for r in funding if r[0] <= ts],
                 [r for r in oi_hist if r[0] <= ts],
-                [r for r in basis_hist if r[0] <= ts],
             )
 
             feats = F.build_features(w15, w1h, w4h, rsi=rsi,

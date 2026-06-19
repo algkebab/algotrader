@@ -50,7 +50,6 @@ FEATURE_NAMES = [
     "funding_rate",     # latest 8h perpetual funding rate (raw, e.g. 0.0001)
     "funding_bias",     # mean of last 6 funding rates — persistent sentiment direction
     "oi_change_pct",    # % change in open interest over the last 4h period
-    "basis_rate",       # (futures mark price - spot index) / index — premium/discount
 ]
 
 # EMA alignment string -> numeric encoding (bullish positive, bearish negative)
@@ -246,15 +245,13 @@ def frac_diff_last(closes: list, d: float = 0.4, width: int = 50,
 def funding_and_positioning(
     funding_rates: list,
     oi_series: list,
-    basis_series: list,
 ) -> dict:
     """Compute positioning features from funding/OI/basis time series.
 
     Each series is a list of (timestamp_ms, value_float) sorted ascending.
     Returns neutral zeros on missing/failed data so the model degrades gracefully.
     """
-    out = {"funding_rate": 0.0, "funding_bias": 0.0,
-           "oi_change_pct": 0.0, "basis_rate": 0.0}
+    out = {"funding_rate": 0.0, "funding_bias": 0.0, "oi_change_pct": 0.0}
     if funding_rates:
         recent = [r for _, r in funding_rates[-6:]]
         out["funding_rate"] = recent[-1]
@@ -263,8 +260,6 @@ def funding_and_positioning(
         oi_now = oi_series[-1][1]
         oi_prev = oi_series[-2][1]
         out["oi_change_pct"] = (oi_now - oi_prev) / oi_prev if oi_prev > 0 else 0.0
-    if basis_series:
-        out["basis_rate"] = basis_series[-1][1]
     return out
 
 
@@ -354,7 +349,6 @@ def build_features(
     feats["funding_rate"] = float(pos.get("funding_rate", 0.0))
     feats["funding_bias"] = float(pos.get("funding_bias", 0.0))
     feats["oi_change_pct"] = float(pos.get("oi_change_pct", 0.0))
-    feats["basis_rate"] = float(pos.get("basis_rate", 0.0))
     return feats
 
 

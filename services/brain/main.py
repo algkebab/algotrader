@@ -194,16 +194,7 @@ class Brain:
             log.debug(f"Brain: OI fetch failed for {symbol}: {e}")
             oi_hist = []
 
-        try:
-            basis_data = _get("/futures/data/basis",
-                              {"pair": sym_raw, "contractType": "PERPETUAL",
-                               "period": "4h", "limit": "2"})
-            basis_hist = [(int(r["timestamp"]), float(r["basisRate"])) for r in basis_data]
-        except Exception as e:
-            log.debug(f"Brain: basis fetch failed for {symbol}: {e}")
-            basis_hist = []
-
-        return shared_features.funding_and_positioning(funding, oi_hist, basis_hist)
+        return shared_features.funding_and_positioning(funding, oi_hist)
 
     def should_analyze(self, symbol, current_price):
         """
