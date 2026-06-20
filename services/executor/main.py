@@ -166,6 +166,7 @@ class Executor:
                 signal_id=signal_id,
                 confidence=confidence,
                 position_size_multiplier=position_size_multiplier,
+                regime=regime,
             )
 
         except Exception as e:
@@ -183,7 +184,7 @@ class Executor:
         except Exception as e:
             log.warning(f"Executor: Failed to push trade_failed notification for {symbol}: {e}")
 
-    def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None, confidence=None, position_size_multiplier=1.0):
+    def _place_paper_order(self, symbol, stop_loss_pct=None, take_profit_pct=None, strategy_name=None, signal_id=None, confidence=None, position_size_multiplier=1.0, regime=None):
         """Write order to DB only; no exchange, no Redis active_trades.
         Position size is derived from Kelly sizing (win rate, drawdown, confidence)."""
         try:
