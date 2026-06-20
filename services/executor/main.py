@@ -63,6 +63,15 @@ class Executor:
         self.exchange.load_markets()
         log.info("Executor: Markets loaded")
 
+        # Separate public futures client for price lookups in paper mode.
+        # Always uses real Binance futures endpoint regardless of IS_TESTNET,
+        # so prices are available for all pairs (testnet lacks many symbols).
+        self._price_exchange = ccxt.binance({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
+        })
+        self._price_exchange.load_markets()
+
     def get_precision_amount(self, symbol, amount):
         """Adjusts the coin amount to the exchange's required precision."""
         self.exchange.load_markets()
@@ -249,7 +258,7 @@ class Executor:
                     return {"status": "error", "message": msg}
 
                 # Limit order simulation: post at bid price with tiny slippage (maker fill)
-                ticker = self.exchange.fetch_ticker(symbol)
+                ticker = self._price_exchange.fetch_ticker(symbol)
                 bid_price = float(ticker.get('bid') or ticker['last'])
                 entry_price = self.get_precision_price(symbol, bid_price * (1 + shared_config.LIMIT_ORDER_SLIPPAGE))
 
